@@ -1711,18 +1711,26 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
     var resJson = JSON.parse(response.getContentText());
     
     if (response.getResponseCode() == 200) {
-      if (resJson.candidates && resJson.candidates[0].content) {
+      var candidate = resJson.candidates && resJson.candidates[0];
+      if (candidate && candidate.content && candidate.content.parts) {
         updateAIUsage(apiKeyInfo.index, apiKeyInfo.usage);
-        
+
         // กรองเอาเฉพาะเนื้อหาคำตอบจริง (ข้ามส่วนที่เป็นกระบวนการคิดหรือ "thought": true)
-        var respParts = resJson.candidates[0].content.parts;
+        var respParts = candidate.content.parts;
         var aiText = "";
         for (var i = 0; i < respParts.length; i++) {
-          if (!respParts[i].thought) { 
+          if (!respParts[i].thought && respParts[i].text) {
             aiText += respParts[i].text;
           }
         }
+        if (!aiText.trim()) {
+          var finishReason = candidate.finishReason || "UNKNOWN";
+          throw new Error("AI ไม่ส่งคำตอบกลับมา (finishReason: " + finishReason + ")");
+        }
         return aiText.trim();
+      } else {
+        var finishReason = (resJson.candidates && resJson.candidates[0] && resJson.candidates[0].finishReason) || "NO_CONTENT";
+        throw new Error("Gemini ไม่ส่งเนื้อหากลับมา (finishReason: " + finishReason + ")");
       }
     } else {
       var errorMsg = resJson.error ? resJson.error.message : "Unknown error";
