@@ -171,6 +171,73 @@ function updateVersion() {
   return newVer;
 }
 
+// --- SESSION TOKEN SYSTEM (30-day admin sessions) ---
+
+var SESSION_EXPIRY_DAYS = 30;
+
+function generateSessionToken() {
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var token = '';
+  for (var i = 0; i < 64; i++) {
+    token += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return token;
+}
+
+function createSession(email, userObj) {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName("Sessions") || ss.insertSheet("Sessions");
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(["Token", "Email", "CreatedAt", "ExpiresAt", "LastUsed"]);
+    sheet.getRange(1, 1, 1, 5).setFontWeight("bold");
+  }
+  cleanupSessionsByEmail(sheet, email);
+  var token = generateSessionToken();
+  var now = new Date();
+  var expiry = new Date(now.getTime() + SESSION_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+  sheet.appendRow([token, email, now.toISOString(), expiry.toISOString(), now.toISOString()]);
+  return token;
+}
+
+function verifySessionToken(token) {
+  if (!token) return null;
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName("Sessions");
+  if (!sheet) return null;
+  var data = sheet.getDataRange().getValues();
+  var now = new Date();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === token) {
+      var expiry = new Date(data[i][3]);
+      if (now > expiry) {
+        sheet.deleteRow(i + 1);
+        return null;
+      }
+      sheet.getRange(i + 1, 5).setValue(now.toISOString());
+      return findAdminByEmail(data[i][1]);
+    }
+  }
+  return null;
+}
+
+function cleanupSessionsByEmail(sheet, email) {
+  var data = sheet.getDataRange().getValues();
+  for (var i = data.length - 1; i >= 1; i--) {
+    if (data[i][1] === email) sheet.deleteRow(i + 1);
+  }
+}
+
+function cleanupExpiredSessions() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName("Sessions");
+  if (!sheet) return;
+  var data = sheet.getDataRange().getValues();
+  var now = new Date();
+  for (var i = data.length - 1; i >= 1; i--) {
+    if (new Date(data[i][3]) < now) sheet.deleteRow(i + 1);
+  }
+}
+
 function doGet(e) {
     var action = e.parameter.action;
 
@@ -492,17 +559,51 @@ function doPost(e) {
             // ตรวจสอบฐานข้อมูลแอดมิน (Whitelisted Emails)
             var adminUser = findAdminByEmail(email);
             if (adminUser) {
-                // บันทึก Log เข้าระบบสำเร็จ
+                var sessionToken = createSession(email, adminUser);
                 writeAdminLog(adminUser.displayName, adminUser.role, "AUTH", "LOGIN_SSO", "Session", "Google SSO Login Success", "", "", "");
                 return ContentService.createTextOutput(JSON.stringify({
                     'result': 'success',
-                    'user': adminUser
+                    'user': adminUser,
+                    'sessionToken': sessionToken
                 })).setMimeType(ContentService.MimeType.JSON);
             } else {
                 writeAdminLog(email, "GUEST", "AUTH", "LOGIN_SSO_FAIL", "Session", "Google login blocked: Email not in whitelist", "", "", "");
                 return ContentService.createTextOutput(JSON.stringify({
                     'result': 'error',
                     'message': 'บัญชีผู้ใช้นี้ไม่มีอยู่ในสิทธิ์การแก้ไขระบบ กรุณาติดต่อผู้ดูแลเพื่อเพิ่มรายชื่ออีเมลของคุณ'
+                })).setMimeType(ContentService.MimeType.JSON);
+            }
+        }
+
+        if (action === 'deleteSession') {
+            var token = data.sessionToken;
+            if (token) {
+                var ss = SpreadsheetApp.openById(SHEET_ID);
+                var sheet = ss.getSheetByName("Sessions");
+                if (sheet) {
+                    var rows = sheet.getDataRange().getValues();
+                    for (var i = rows.length - 1; i >= 1; i--) {
+                        if (rows[i][0] === token) {
+                            sheet.deleteRow(i + 1);
+                            break;
+                        }
+                    }
+                }
+            }
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'verifySession') {
+            var userObj = verifySessionToken(data.sessionToken);
+            if (userObj) {
+                return ContentService.createTextOutput(JSON.stringify({
+                    'result': 'success',
+                    'user': userObj
+                })).setMimeType(ContentService.MimeType.JSON);
+            } else {
+                return ContentService.createTextOutput(JSON.stringify({
+                    'result': 'error',
+                    'message': 'session_expired'
                 })).setMimeType(ContentService.MimeType.JSON);
             }
         }
@@ -729,7 +830,9 @@ function doPost(e) {
         if (action === 'uploadImage') {
             // 1. ตรวจสอบสิทธิ์ Admin ทั้งแบบ Standard และ Google SSO
             var userObj = null;
-            if (data.googleIdToken) {
+            if (data.sessionToken) {
+                userObj = verifySessionToken(data.sessionToken);
+            } else if (data.googleIdToken) {
                 var payload = verifyGoogleToken(data.googleIdToken);
                 if (payload) userObj = findAdminByEmail(payload.email);
             } else {
@@ -870,7 +973,9 @@ function doPost(e) {
         if (action === 'askAIExpert') {
             // 1. ตรวจสอบสิทธิ์แอดมิน (Security Check)
             var userObj = null;
-            if (data.googleIdToken) {
+            if (data.sessionToken) {
+                userObj = verifySessionToken(data.sessionToken);
+            } else if (data.googleIdToken) {
                 var payload = verifyGoogleToken(data.googleIdToken);
                 if (payload) {
                     userObj = findAdminByEmail(payload.email);
@@ -881,7 +986,7 @@ function doPost(e) {
                     console.error("[AUTH] askAIExpert failed: Token verification returned null.");
                 }
             } else {
-                console.warn("[AUTH] askAIExpert failed: No googleIdToken provided in request payload.");
+                console.warn("[AUTH] askAIExpert failed: No sessionToken or googleIdToken provided in request payload.");
                 userObj = verifyAdmin(data.username, data.adminPass);
             }
 
@@ -921,7 +1026,9 @@ function doPost(e) {
         var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject'];
         if (adminActions.indexOf(action) > -1) {
             var userObj = null;
-            if (data.googleIdToken) {
+            if (data.sessionToken) {
+                userObj = verifySessionToken(data.sessionToken);
+            } else if (data.googleIdToken) {
                 var payload = verifyGoogleToken(data.googleIdToken);
                 if (payload) userObj = findAdminByEmail(payload.email);
             } else {
@@ -1034,52 +1141,84 @@ if (action === 'adminImport') {
     }
 
     try {
-        // --- ส่วนตรวจสอบข้อมูลซ้ำ ---
         var lastRow = targetSheet.getLastRow();
-        var existingKeys = new Set();
-        
-        if (lastRow > 0) {
-            var fullData = targetSheet.getDataRange().getValues();
-            for (var i = 0; i < fullData.length; i++) {
-                if (realSheetName === 'Structure') {
-                    // Structure ใช้ SubjectID (index 1) + Group (index 3)
-                    existingKeys.add(fullData[i][1] + "|" + fullData[i][3]);
+
+        if (realSheetName === 'Questions') {
+            // --- UPSERT: อัปเดตแถวที่มีอยู่, เพิ่มแถวใหม่ ---
+            var existing = lastRow > 1 ? targetSheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
+            var existingIds = existing.map(function(r) { return String(r[0]).trim(); });
+
+            var appended = 0, updated = 0;
+            var toAppend = [];
+            importData.forEach(function(row) {
+                var qId = String(row[0]).trim();
+                var idx = existingIds.indexOf(qId);
+                if (idx >= 0) {
+                    // sheet row = idx+2 (header is row 1, data starts at row 2)
+                    targetSheet.getRange(idx + 2, 1, 1, row.length).setValues([row]);
+                    updated++;
                 } else {
-                    // Questions และ Category ใช้ ID ตัวแรก (index 0)
-                    existingKeys.add(String(fullData[i][0]));
+                    toAppend.push(row);
+                    existingIds.push(qId); // กันซ้ำภายใน batch เดียวกัน
+                }
+            });
+            if (toAppend.length > 0) {
+                var newLastRow = targetSheet.getLastRow();
+                targetSheet.getRange(newLastRow + 1, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
+                appended = toAppend.length;
+            }
+
+            updateVersion();
+            writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName,
+                "Upserted Questions: " + appended + " added, " + updated + " updated", "",
+                "Added " + appended + ", Updated " + updated, metadata);
+
+            return ContentService.createTextOutput(JSON.stringify({
+                'result': 'success',
+                'count': appended + updated,
+                'added': appended,
+                'updated': updated,
+                'message': 'นำเข้าสำเร็จ: เพิ่ม ' + appended + ' แถว, อัปเดต ' + updated + ' แถว'
+            })).setMimeType(ContentService.MimeType.JSON);
+
+        } else {
+            // --- SKIP-DUPLICATE สำหรับ Structure และ Category (เดิม) ---
+            var existingKeys = new Set();
+            if (lastRow > 0) {
+                var fullData = targetSheet.getDataRange().getValues();
+                for (var i = 0; i < fullData.length; i++) {
+                    if (realSheetName === 'Structure') {
+                        existingKeys.add(fullData[i][1] + "|" + fullData[i][3]);
+                    } else {
+                        existingKeys.add(String(fullData[i][0]));
+                    }
                 }
             }
-        }
 
-        // กรองข้อมูลที่ซ้ำออก
-        var finalData = importData.filter(function(row) {
-            var key = "";
-            if (realSheetName === 'Structure') {
-                key = row[1] + "|" + row[3];
+            var finalData = importData.filter(function(row) {
+                var key = realSheetName === 'Structure' ? row[1] + "|" + row[3] : String(row[0]);
+                return !existingKeys.has(key);
+            });
+
+            if (finalData.length > 0) {
+                targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
+                updateVersion();
+                writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName, "Imported " + finalData.length + " new rows (Skipped " + (importData.length - finalData.length) + " duplicates)", "", "Added " + finalData.length + " rows", metadata);
+
+                return ContentService.createTextOutput(JSON.stringify({
+                    'result': 'success',
+                    'count': finalData.length,
+                    'skipped': importData.length - finalData.length,
+                    'message': 'นำเข้าสำเร็จ ' + finalData.length + ' แถว (ข้ามข้อมูลซ้ำ ' + (importData.length - finalData.length) + ' แถว)'
+                })).setMimeType(ContentService.MimeType.JSON);
             } else {
-                key = String(row[0]);
+                return ContentService.createTextOutput(JSON.stringify({
+                    'result': 'success',
+                    'count': 0,
+                    'skipped': importData.length,
+                    'message': 'ไม่มีข้อมูลใหม่ให้นำเข้า (ข้อมูลทั้งหมดมีอยู่แล้วในระบบ)'
+                })).setMimeType(ContentService.MimeType.JSON);
             }
-            return !existingKeys.has(key); // เอาเฉพาะที่ไม่มีใน Set
-        });
-
-        if (finalData.length > 0) {
-            targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
-            updateVersion();
-            writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName, "Imported " + finalData.length + " new rows (Skipped " + (importData.length - finalData.length) + " duplicates)", "", "Added " + finalData.length + " rows", metadata);
-            
-            return ContentService.createTextOutput(JSON.stringify({
-                'result': 'success',
-                'count': finalData.length,
-                'skipped': importData.length - finalData.length,
-                'message': 'นำเข้าสำเร็จ ' + finalData.length + ' แถว (ข้ามข้อมูลซ้ำ ' + (importData.length - finalData.length) + ' แถว)'
-            })).setMimeType(ContentService.MimeType.JSON);
-        } else {
-            return ContentService.createTextOutput(JSON.stringify({
-                'result': 'success',
-                'count': 0,
-                'skipped': importData.length,
-                'message': 'ไม่มีข้อมูลใหม่ให้นำเข้า (ข้อมูลทั้งหมดมีอยู่แล้วในระบบ)'
-            })).setMimeType(ContentService.MimeType.JSON);
         }
     } catch (err) {
         return ContentService.createTextOutput(JSON.stringify({
@@ -1994,7 +2133,9 @@ function findAdminByEmail(email) {
 }
 
 function verifyUser(data) {
-  if (data && data.googleIdToken) {
+  if (data && data.sessionToken) {
+    return verifySessionToken(data.sessionToken);
+  } else if (data && data.googleIdToken) {
     var payload = verifyGoogleToken(data.googleIdToken);
     if (payload) return findAdminByEmail(payload.email);
   } else if (data) {
@@ -2783,4 +2924,24 @@ function getOrCreateSubFolder(parentFolder, name) {
 function extractIdFromUrl(url) {
   var match = url.match(/\/d\/(.*?)\//) || url.match(/id=([^&]+)/) || url.match(/\/d\/([^\/\?]+)/);
   return (match && match[1]) ? match[1] : null;
+}
+
+// ลบแถวใน Questions ที่มี img = "require_img" (placeholder ที่ไม่ถูก patch ก่อน import)
+// ตั้ง Time Trigger รันทุกวัน 3-4 AM จาก Apps Script console
+function cleanupStaging() {
+  var doc = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = doc.getSheetByName('Questions');
+  if (!sheet) return;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+  var deleted = 0;
+  // วนลูปจากล่างขึ้นบนเพื่อไม่ให้ index เลื่อน
+  for (var i = lastRow; i >= 2; i--) {
+    var imgVal = String(sheet.getRange(i, 3).getValue()).trim();
+    if (imgVal === 'require_img') {
+      sheet.deleteRow(i);
+      deleted++;
+    }
+  }
+  console.log('cleanupStaging: deleted ' + deleted + ' require_img rows');
 }
