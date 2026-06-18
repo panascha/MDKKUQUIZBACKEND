@@ -826,6 +826,12 @@ function doPost(e) {
     var sheet = doc.getSheetByName("Report") || doc.insertSheet("Report");
     if (sheet.getLastRow() == 0) {
         sheet.appendRow(["From", "Category", "QuestionID", "Question", "Image", "Choices", "SuggestedAnswer", "ReportDetail", "Time", "Status", "AdminNote", "Done", "SuggestedExplain", "VoteCount"]);
+    } else {
+        var headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        if (headerRow.indexOf("SuggestedExplain") === -1) {
+            sheet.getRange(1, 13).setValue("SuggestedExplain");
+            sheet.getRange(1, 14).setValue("VoteCount");
+        }
     }
 
     var qImg = (data.questionImages && data.questionImages.indexOf("http") === 0) ? data.questionImages.split("///")[0] : "";
