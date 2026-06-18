@@ -1,7 +1,9 @@
 var SHEET_ID = '12rN8vcykEwgcPFK4LoOj18PEhj7JPhwMfz6uUkKrhJU';
 var DRIVE_FOLDER_ID = '1nzLH2ia2lL2TMxfrr6Kv-5fhsWwOWSCm'; 
 
-var VOTE_THRESHOLD_CONFIRM = 1; 
+var VOTE_THRESHOLD_CONFIRM = 1;
+
+var REPORT_VOTE_THRESHOLD = 5;
 
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
@@ -248,6 +250,7 @@ function doGet(e) {
     if (action == 'getStructure') return getStructureDataCached(e.parameter.subject);
     if (action == 'getQuestions') return getQuestionsDataCached(e.parameter.subject);
     if (action == 'getPendingVotes') return getPendingVotesData(e.parameter.qid);
+    if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid);
     if (action == 'getAllData') return getAllDataForAdminCached();
     if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject);
     if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject);
@@ -328,9 +331,31 @@ function getPendingVotesData(qid) {
     return ContentService.createTextOutput(JSON.stringify({
         votes: result,
         thresholds: {
-            confirm: VOTE_THRESHOLD_CONFIRM 
+            confirm: VOTE_THRESHOLD_CONFIRM
         }
     })).setMimeType(ContentService.MimeType.JSON);
+}
+
+function getPendingReportsData(qid) {
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName("Report");
+    var result = [];
+    if (sheet) {
+        var data = sheet.getDataRange().getValues();
+        for (var i = 1; i < data.length; i++) {
+            if (String(data[i][2]).trim() !== String(qid) || String(data[i][9]).trim() !== "Pending") continue;
+            result.push({
+                timestamp: data[i][8],
+                suggestedChoice: data[i][6],
+                suggestedExplain: data[i][12] || "",
+                reportDetail: data[i][7],
+                voteCount: parseInt(data[i][13]) || 0
+            });
+        }
+    }
+    result.sort(function(a, b) { return b.voteCount - a.voteCount; });
+    return ContentService.createTextOutput(JSON.stringify({ reports: result, threshold: REPORT_VOTE_THRESHOLD }))
+        .setMimeType(ContentService.MimeType.JSON);
 }
 
 
@@ -800,30 +825,52 @@ function doPost(e) {
         if (action === 'submitReport') {
     var sheet = doc.getSheetByName("Report") || doc.insertSheet("Report");
     if (sheet.getLastRow() == 0) {
-        sheet.appendRow(["From", "Category", "QuestionID", "Question", "Image", "Choices", "SuggestedAnswer", "ReportDetail", "Time", "Status", "AdminNote", "Done"]);
+        sheet.appendRow(["From", "Category", "QuestionID", "Question", "Image", "Choices", "SuggestedAnswer", "ReportDetail", "Time", "Status", "AdminNote", "Done", "SuggestedExplain", "VoteCount"]);
     }
 
     var qImg = (data.questionImages && data.questionImages.indexOf("http") === 0) ? data.questionImages.split("///")[0] : "";
     var ansSug = data.suggestedChoice || "";
-    
+
     sheet.appendRow([
-        data.from || "User", 
-        data.category || "", 
+        data.from || "User",
+        data.category || "",
         data.questionId || "",
-        data.question || "", 
-        qImg, 
-        data.allChoices || "", 
-        ansSug, 
-        data.report || "", 
-        new Date().toISOString(), 
-        "Pending", 
-        "", 
-        "FALSE"
+        data.question || "",
+        qImg,
+        data.allChoices || "",
+        ansSug,
+        data.report || "",
+        new Date().toISOString(),
+        "Pending",
+        "",
+        "FALSE",
+        data.suggestedExplain || "",
+        1
     ]);
 
-    updateVersion(); 
+    updateVersion();
     return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
 }
+
+        // 3b. REPORT VOTE SYSTEM
+        if (action === 'voteOnReport') {
+            var reportSheet = doc.getSheetByName("Report");
+            if (!reportSheet) {
+                return ContentService.createTextOutput(JSON.stringify({result:'error', message:'Report sheet not found'})).setMimeType(ContentService.MimeType.JSON);
+            }
+            var rv = reportSheet.getDataRange().getValues();
+            var targetTs = String(data.reportTimestamp || "").trim();
+            var delta = parseInt(data.delta) || 1;
+            for (var i = 1; i < rv.length; i++) {
+                if (String(rv[i][8]).trim() === targetTs) {
+                    var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
+                    reportSheet.getRange(i + 1, 14).setValue(newVotes);
+                    processReports(doc);
+                    return ContentService.createTextOutput(JSON.stringify({result:'success', newVoteCount: newVotes})).setMimeType(ContentService.MimeType.JSON);
+                }
+            }
+            return ContentService.createTextOutput(JSON.stringify({result:'error', message:'Report not found'})).setMimeType(ContentService.MimeType.JSON);
+        }
 
         // 4. IMAGE CRUD ACTIONS
 
@@ -1994,6 +2041,72 @@ function processVotes() {
         updateVersion();
         sortCategorySheet();
     }
+}
+
+function processReports(doc) {
+    var reportSheet = doc.getSheetByName("Report");
+    var qSheet = doc.getSheetByName("Questions");
+    if (!reportSheet || !qSheet) return;
+    var rv = reportSheet.getDataRange().getValues();
+    var qv = qSheet.getDataRange().getValues();
+    var qIdMap = {};
+    for (var i = 1; i < qv.length; i++) qIdMap[qv[i][0]] = i + 1;
+
+    var changed = false;
+    for (var i = 1; i < rv.length; i++) {
+        if (String(rv[i][9]).trim() !== "Pending") continue;
+        var voteCount = parseInt(rv[i][13]) || 0;
+        if (voteCount < REPORT_VOTE_THRESHOLD) continue;
+
+        var qId = rv[i][2];
+        var suggestedAns = String(rv[i][6] || "").trim();
+        var suggestedExplain = String(rv[i][12] || "").trim();
+        var qRowIndex = qIdMap[qId];
+        if (!qRowIndex) continue;
+
+        // Safety: suggestedChoice must exactly match an existing choice (no free-text)
+        var choicesArray = String(qv[qRowIndex-1][3] || "").split("///").map(function(s){return s.trim();}).filter(Boolean);
+        if (choicesArray.indexOf(suggestedAns) === -1) continue;
+
+        var questionText = String(qv[qRowIndex-1][1] || "");
+        applyReportCorrection(qSheet, qRowIndex, suggestedAns, suggestedExplain, questionText, choicesArray);
+
+        reportSheet.getRange(i+1, 10).setValue("AutoResolved");
+        reportSheet.getRange(i+1, 11).setValue("Auto-applied by community vote (" + voteCount + "/" + REPORT_VOTE_THRESHOLD + ")");
+        changed = true;
+    }
+    if (changed) updateVersion();
+}
+
+function applyReportCorrection(qSheet, qRowIndex, newAnswer, suggestedExplain, questionText, choicesArray) {
+    qSheet.getRange(qRowIndex, 5).setValue(newAnswer);
+    var newExplain = suggestedExplain || "";
+    try {
+        var apiKeyInfo = getAvailableAIKey("Gemini");
+        if (apiKeyInfo) {
+            var prompt = buildExplainPrompt(questionText, choicesArray, newAnswer);
+            var aiText = callGeminiAI(prompt, apiKeyInfo, null);
+            newExplain = aiText.replace(/\r?\n/g, " ").trim();
+        }
+    } catch(e) {
+        console.warn("Gemini explain failed: " + e.message);
+    }
+    qSheet.getRange(qRowIndex, 6).setValue(newExplain);
+}
+
+function buildExplainPrompt(questionText, choicesArray, correctAnswer) {
+    var choicesText = choicesArray.map(function(c, i) {
+        var display = (c.startsWith('http') || c.startsWith('<svg')) ? '[รูปภาพ]' : c;
+        return String.fromCharCode(65 + i) + ". " + display;
+    }).join("\n");
+    return "คุณเป็นอาจารย์แพทย์ผู้เชี่ยวชาญ กรุณาเขียนคำอธิบายเฉลยข้อสอบแพทย์ต่อไปนี้เป็น paragraph เดียวต่อเนื่อง " +
+        "(ห้ามใช้ bullet points หรือขึ้นบรรทัดใหม่) โดยใช้ภาษาไทยผสมคำศัพท์ทางการแพทย์ภาษาอังกฤษ ห้ามใช้ภาษาอังกฤษล้วน\n\n" +
+        "โจทย์: " + questionText + "\n\n" +
+        "ตัวเลือก:\n" + choicesText + "\n\n" +
+        "เฉลยที่ถูกต้อง: " + correctAnswer + "\n\n" +
+        "คำอธิบายต้องครอบคลุม: 1) Key concept/การวินิจฉัย 2) เหตุผลที่เฉลยถูก พร้อมชี้ clues จากโจทย์ " +
+        "3) อธิบายว่าทำไมตัวเลือกที่ผิดแต่ละข้อถึงผิด 4) Clinical pearl ถ้ามี\n\n" +
+        "เขียนเป็น paragraph เดียว ห้ามมี newline ในคำตอบ:";
 }
 
 function updateQuestionCategory(qSheet, qIdMap, qId, categoryToAdd) {
