@@ -120,7 +120,7 @@ function onSheetEdit(e) {
   var sheet = e.source.getActiveSheet();
   var sheetName = sheet.getName();
 
-  var watchSheets = ['Questions', 'Structure', 'Category', 'Admins', 'Report', 'Votes'];
+  var watchSheets = ['Questions', 'Structure', 'Category', 'Admins', 'Report', 'Votes', 'Announcements'];
   if (watchSheets.indexOf(sheetName) > -1) {
     updateVersion();
   }
@@ -240,6 +240,31 @@ function cleanupExpiredSessions() {
   }
 }
 
+function getOrCreateAnnouncementsSheet(ss) {
+  var sheet = ss.getSheetByName("Announcements");
+  if (!sheet) {
+    sheet = ss.insertSheet("Announcements");
+    sheet.appendRow(["Id", "Text", "Type", "Active", "Order"]);
+    sheet.getRange(1, 1, 1, 5).setFontWeight("bold").setBackground("#d9ead3");
+    // Add default values
+    sheet.appendRow([
+      "ANN_1", 
+      "<strong><i class=\"fas fa-bullhorn\"></i> ยินดีต้อนรับสู่ MDKKUQUIZ!</strong> ระบบคลังข้อสอบและวิเคราะห์จุดอ่อนสำหรับเตรียมตัวสอบ", 
+      "info", 
+      "TRUE", 
+      1
+    ]);
+    sheet.appendRow([
+      "ANN_2", 
+      "<strong style=\"color: #ea580c;\"><i class=\"fas fa-star\"></i> อัปเดตใหม่!</strong> ระบบแก้ไขข้อสอบ & Rich Explanation พร้อมระบบ AI Assistant เรียบร้อยแล้ว", 
+      "warning", 
+      "TRUE", 
+      2
+    ]);
+  }
+  return sheet;
+}
+
 function doGet(e) {
     var action = e.parameter.action;
 
@@ -276,6 +301,8 @@ function getAllDataForAdmin() {
         return safeAdmin;
     });
 
+    getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
+
     var data = {
         questions: JSON.parse(getQuestionsData('', ss).getContent()), // ส่ง ss เข้าไปด้วย
         structure: getSheetDataJSON('Structure', ss),
@@ -283,7 +310,8 @@ function getAllDataForAdmin() {
         report: getSheetDataJSON('Report', ss),
         votes: getSheetDataJSON('Votes', ss),
         logs: getSheetDataJSON('Logs', ss),
-        admins: adminsSafe
+        admins: adminsSafe,
+        announcements: getSheetDataJSON('Announcements', ss)
     };
     return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
 }
@@ -392,9 +420,13 @@ function getStructureData(filterSubject) {
             });
         }
     }
+    getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
+    var announcementsData = getSheetDataJSON('Announcements', ss);
+
     return ContentService.createTextOutput(JSON.stringify({
         subjects: structData,
-        category: categoryData
+        category: categoryData,
+        announcements: announcementsData
     })).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -1076,7 +1108,7 @@ function doPost(e) {
         }
 
         // 5. ADMIN ACTIONS
-        var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject'];
+        var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement'];
         if (adminActions.indexOf(action) > -1) {
             var userObj = null;
             if (data.sessionToken) {
@@ -1100,6 +1132,56 @@ function doPost(e) {
             var metadata = data.metadata || "";
 
             var sheet;
+
+            // --- ADD ANNOUNCEMENT ---
+            if (action === 'addAnnouncement') {
+                sheet = doc.getSheetByName("Announcements");
+                sheet.appendRow([
+                    data.data.Id,
+                    data.data.Text,
+                    data.data.Type,
+                    data.data.Active,
+                    data.data.Order
+                ]);
+                updateVersion();
+                writeAdminLog(user, userRole, "ANNOUNCEMENT", "ADD", data.data.Id, "Added Announcement", "", data.data.Text, metadata);
+                return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
+            }
+
+            // --- EDIT ANNOUNCEMENT ---
+            if (action === 'editAnnouncement') {
+                sheet = doc.getSheetByName("Announcements");
+                var rows = sheet.getDataRange().getValues();
+                for (var i = 1; i < rows.length; i++) {
+                    if (rows[i][0] == data.data.Id) {
+                        var oldText = rows[i][1];
+                        sheet.getRange(i + 1, 2, 1, 4).setValues([[
+                            data.data.Text,
+                            data.data.Type,
+                            data.data.Active,
+                            data.data.Order
+                        ]]);
+                        updateVersion();
+                        writeAdminLog(user, userRole, "ANNOUNCEMENT", "EDIT", data.data.Id, "Updated Announcement", oldText, data.data.Text, metadata);
+                        return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
+                    }
+                }
+            }
+
+            // --- DELETE ANNOUNCEMENT ---
+            if (action === 'deleteAnnouncement') {
+                sheet = doc.getSheetByName("Announcements");
+                var rows = sheet.getDataRange().getValues();
+                for (var i = 1; i < rows.length; i++) {
+                    if (rows[i][0] == data.data.Id) {
+                        var oldText = rows[i][1];
+                        sheet.deleteRow(i + 1);
+                        updateVersion();
+                        writeAdminLog(user, userRole, "ANNOUNCEMENT", "DELETE", data.data.Id, "Deleted Announcement", oldText, "DELETED", metadata);
+                        return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
+                    }
+                }
+            }
             
             // --- EDIT QUESTION ---
             if (action === 'editQuestion') {
