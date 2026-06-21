@@ -890,25 +890,27 @@ function doPost(e) {
     return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
 }
 
-        // 3b. REPORT VOTE SYSTEM
-        if (action === 'voteOnReport') {
-            var reportSheet = doc.getSheetByName("Report");
-            if (!reportSheet) {
-                return ContentService.createTextOutput(JSON.stringify({result:'error', message:'Report sheet not found'})).setMimeType(ContentService.MimeType.JSON);
-            }
-            var rv = reportSheet.getDataRange().getValues();
-            var targetTs = String(data.reportTimestamp || "").trim();
-            var delta = parseInt(data.delta) || 1;
-            for (var i = 1; i < rv.length; i++) {
-                if (String(rv[i][8]).trim() === targetTs) {
-                    var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
-                    reportSheet.getRange(i + 1, 14).setValue(newVotes);
-                    processReports(doc);
-                    return ContentService.createTextOutput(JSON.stringify({result:'success', newVoteCount: newVotes})).setMimeType(ContentService.MimeType.JSON);
-                }
-            }
-            return ContentService.createTextOutput(JSON.stringify({result:'error', message:'Report not found'})).setMimeType(ContentService.MimeType.JSON);
+      // 3b. REPORT VOTE SYSTEM
+      if (action === 'voteOnReport') {
+        var reportSheet = doc.getSheetByName("Report");
+        if (!reportSheet) {
+          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report sheet not found' })).setMimeType(ContentService.MimeType.JSON);
         }
+        var rv = reportSheet.getDataRange().getValues();
+        var targetTs = String(data.reportTimestamp || "").trim();
+        var delta = parseInt(data.delta) || 1;
+        for (var i = 1; i < rv.length; i++) {
+          // แปลงค่าออบเจกต์ Date ในเซลล์ให้เป็นรูปแบบ ISO String ก่อนสืบค้นและจับคู่
+          var sTime = rv[i][8] instanceof Date ? rv[i][8].toISOString() : String(rv[i][8]);
+          if (sTime.trim() === targetTs) {
+            var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
+            reportSheet.getRange(i + 1, 14).setValue(newVotes);
+            processReports(doc);
+            return ContentService.createTextOutput(JSON.stringify({ result: 'success', newVoteCount: newVotes })).setMimeType(ContentService.MimeType.JSON);
+          }
+        }
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report not found' })).setMimeType(ContentService.MimeType.JSON);
+      }
 
         // 4. IMAGE CRUD ACTIONS
 
