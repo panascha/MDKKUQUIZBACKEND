@@ -97,16 +97,83 @@ function getQuestionsDataCached(filterSubject, ss) {
 function getAllDataForAdminCached() {
   var v = getVersionCached();
   var cacheKey = "admin_all_data_" + v;
-  
+
   var cachedStr = getLargeCache(cacheKey);
   if (cachedStr != null) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
-  
+
   var response = getAllDataForAdmin();
   var responseStr = response.getContent();
   putLargeCache(cacheKey, responseStr, 300); // Cache complete dataset for 5 minutes
   return response;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NEW: ADVANCED CACHED SHEET LOADERS (Bypasses Sheets API contention)
+// ────────────────────────────────────────────────────────────────────
+
+function getCategorySheetDataCached(ss) {
+  var v = getVersionCached();
+  var cacheKey = "category_sheet_raw_" + v;
+  var cached = getLargeCache(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
+  var catSheet = ss.getSheetByName('Category');
+  if (!catSheet) return [];
+  var rows = catSheet.getDataRange().getValues();
+  putLargeCache(cacheKey, JSON.stringify(rows), 1800); // 30 minutes
+  return rows;
+}
+
+function getStructureSheetDataCached(ss) {
+  var v = getVersionCached();
+  var cacheKey = "structure_sheet_raw_" + v;
+  var cached = getLargeCache(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
+  var structSheet = ss.getSheetByName('Structure');
+  if (!structSheet) return [];
+  var rows = structSheet.getDataRange().getValues();
+  putLargeCache(cacheKey, JSON.stringify(rows), 1800); // 30 minutes
+  return rows;
+}
+
+function getAllQuestionsCached(ss) {
+  var v = getVersionCached();
+  var cacheKey = "all_questions_raw_" + v;
+  var cached = getLargeCache(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
+  var qSheet = ss.getSheetByName('Questions');
+  var qLastRow = qSheet.getLastRow();
+  if (qLastRow <= 1) return [];
+
+  var qData = qSheet.getRange(2, 1, qLastRow - 1, 7).getValues();
+  putLargeCache(cacheKey, JSON.stringify(qData), 1800); // 30 minutes
+  return qData;
+}
+
+function getCategoryToSubjectMapCached(ss) {
+  var v = getVersionCached();
+  var cacheKey = "cat_to_subj_map_" + v;
+  var cached = getLargeCache(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  var catRows = getCategorySheetDataCached(ss);
+  var categoryToSubjectMap = {};
+  for (var i = 1; i < catRows.length; i++) {
+    categoryToSubjectMap[String(catRows[i][0]).trim()] = String(catRows[i][1]).trim().toUpperCase();
+  }
+  putLargeCache(cacheKey, JSON.stringify(categoryToSubjectMap), 1800); // 30 minutes
+  return categoryToSubjectMap;
 }
 
 /* 
@@ -130,12 +197,13 @@ function onSheetEdit(e) {
     var range = e.range;
     var startCol = range.getColumn();
     var endCol = range.getLastColumn();
-    
+
     // ตรวจสอบว่าช่วงที่มีการแก้ไขครอบคลุมคอลัมน์ที่ 7 หรือไม่
     if (startCol <= 7 && endCol >= 7) {
       var startRow = Math.max(2, range.getRow()); // ข้ามหัวตาราง (Header)
       var endRow = range.getLastRow();
-      
+      var sortedNeeded = false; // Flag to trace if any extraction happened
+
       for (var r = startRow; r <= endRow; r++) {
         var qId = sheet.getRange(r, 1).getValue().toString().trim();
         var catRaw = sheet.getRange(r, 7).getValue().toString().trim();
@@ -149,12 +217,18 @@ function onSheetEdit(e) {
             }
             // ถ้าระบุอย่างน้อย 2 หมวดหมู่ ให้รันระบบคัดแยกกลุ่ม (Extracted) ทันที
             if (categories.length >= 2) {
-              autoCreateSplitCategories(qId, categories);
+              autoCreateSplitCategories(qId, categories, true); // Pass skipSort = true to bypass repetitive sorting
+              sortedNeeded = true;
             }
           } catch (err) {
             console.error("Split error in onSheetEdit for row " + r + ": " + err.message);
           }
         }
+      }
+
+      // Perform a single, complete sort at the end of bulk operation
+      if (sortedNeeded) {
+        sortCategorySheet();
       }
     }
   }
@@ -339,140 +413,159 @@ function getSheetDataJSON(sheetName, ss) {
 }
 
 function getPendingVotesData(qid) {
-    var ss = SpreadsheetApp.openById(SHEET_ID);
-    var voteSheet = ss.getSheetByName("Votes");
-    var result = [];
-    if (voteSheet) {
-        var data = voteSheet.getDataRange().getValues();
-        for (var i = 1; i < data.length; i++) {
-            var status = data[i][5];
-            if (data[i][0] == qid && (status == "Pending" || status == "Approved")) { 
-                result.push({
-                    categoryId: data[i][2],
-                    count: data[i][3],
-                    status: status 
-                });
-            }
-        }
+  var v = getVersionCached();
+  var cacheKey = "pending_votes_" + v + "_" + qid;
+  var cached = getLargeCache(cacheKey);
+  if (cached != null) {
+    return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var voteSheet = ss.getSheetByName("Votes");
+  var result = [];
+  if (voteSheet) {
+    var data = voteSheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      var status = data[i][5];
+      if (data[i][0] == qid && (status == "Pending" || status == "Approved")) {
+        result.push({
+          categoryId: data[i][2],
+          count: data[i][3],
+          status: status
+        });
+      }
     }
-    
-    return ContentService.createTextOutput(JSON.stringify({
-        votes: result,
-        thresholds: {
-            confirm: VOTE_THRESHOLD_CONFIRM
-        }
-    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var responseObj = {
+    votes: result,
+    thresholds: {
+      confirm: VOTE_THRESHOLD_CONFIRM
+    }
+  };
+  var responseStr = JSON.stringify(responseObj);
+  putLargeCache(cacheKey, responseStr, 300); // Cache for 5 minutes
+  return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
 }
 
 function getPendingReportsData(qid) {
-    var ss = SpreadsheetApp.openById(SHEET_ID);
-    var sheet = ss.getSheetByName("Report");
-    var result = [];
-    if (sheet) {
-        var data = sheet.getDataRange().getValues();
-        for (var i = 1; i < data.length; i++) {
-            if (String(data[i][2]).trim() !== String(qid) || String(data[i][9]).trim() !== "Pending") continue;
-            result.push({
-                timestamp: data[i][8],
-                suggestedChoice: data[i][6],
-                suggestedExplain: data[i][12] || "",
-                reportDetail: data[i][7],
-                voteCount: parseInt(data[i][13]) || 0
-            });
-        }
+  var v = getVersionCached();
+  var cacheKey = "pending_reports_" + v + "_" + qid;
+  var cached = getLargeCache(cacheKey);
+  if (cached != null) {
+    return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName("Report");
+  var result = [];
+  if (sheet) {
+    var data = sheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][2]).trim() !== String(qid) || String(data[i][9]).trim() !== "Pending") continue;
+      result.push({
+        timestamp: data[i][8],
+        suggestedChoice: data[i][6],
+        suggestedExplain: data[i][12] || "",
+        reportDetail: data[i][7],
+        voteCount: parseInt(data[i][13]) || 0
+      });
     }
-    result.sort(function(a, b) { return b.voteCount - a.voteCount; });
-    return ContentService.createTextOutput(JSON.stringify({ reports: result, threshold: REPORT_VOTE_THRESHOLD }))
-        .setMimeType(ContentService.MimeType.JSON);
+  }
+  result.sort(function (a, b) { return b.voteCount - a.voteCount; });
+
+  var responseObj = { reports: result, threshold: REPORT_VOTE_THRESHOLD };
+  var responseStr = JSON.stringify(responseObj);
+  putLargeCache(cacheKey, responseStr, 300); // Cache for 5 minutes
+  return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
 }
 
+function getAnnouncementsDataCached(ss) {
+  var v = getVersionCached();
+  var cacheKey = "announcements_data_raw_" + v;
+  var cached = getLargeCache(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
+  getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
+  var data = getSheetDataJSON('Announcements', ss);
+  putLargeCache(cacheKey, JSON.stringify(data), 1800); // 30 minutes
+  return data;
+}
 
 function getStructureData(filterSubject) {
-    var ss = SpreadsheetApp.openById(SHEET_ID);
-    var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
 
-    var structSheet = ss.getSheetByName('Structure');
-    var structData = [];
-    if (structSheet) {
-        var rows = structSheet.getDataRange().getValues();
-        for (var i = 1; i < rows.length; i++) {
-            if (cleanFilter !== "" && String(rows[i][1]).trim().toUpperCase() !== cleanFilter) continue;
-            structData.push({
-                year: rows[i][0],
-                subjectId: rows[i][1],
-                subjectName: rows[i][2],
-                accordionGroup: rows[i][3]
-            });
-        }
-    }
+  var rows = getStructureSheetDataCached(ss);
+  var structData = [];
+  for (var i = 1; i < rows.length; i++) {
+    if (cleanFilter !== "" && String(rows[i][1]).trim().toUpperCase() !== cleanFilter) continue;
+    structData.push({
+      year: rows[i][0],
+      subjectId: rows[i][1],
+      subjectName: rows[i][2],
+      accordionGroup: rows[i][3]
+    });
+  }
 
-    var categorySheet = ss.getSheetByName('Category');
-    var categoryData = [];
-    if (categorySheet) {
-        var rows = categorySheet.getDataRange().getValues();
-        for (var i = 1; i < rows.length; i++) {
-            if (cleanFilter !== "" && String(rows[i][1]).trim().toUpperCase() !== cleanFilter) continue;
-            categoryData.push({
-                categoryId: rows[i][0],
-                subjectRef: rows[i][1],
-                accordionGroup: rows[i][2],
-                categoryName: rows[i][3]
-            });
-        }
-    }
-    getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
-    var announcementsData = getSheetDataJSON('Announcements', ss);
+  var catRows = getCategorySheetDataCached(ss);
+  var categoryData = [];
+  for (var i = 1; i < catRows.length; i++) {
+    if (cleanFilter !== "" && String(catRows[i][1]).trim().toUpperCase() !== cleanFilter) continue;
+    categoryData.push({
+      categoryId: catRows[i][0],
+      subjectRef: catRows[i][1],
+      accordionGroup: catRows[i][2],
+      categoryName: catRows[i][3]
+    });
+  }
 
-    return ContentService.createTextOutput(JSON.stringify({
-        subjects: structData,
-        category: categoryData,
-        announcements: announcementsData
-    })).setMimeType(ContentService.MimeType.JSON);
+  var announcementsData = getAnnouncementsDataCached(ss); // Optimized to use cache!
+
+  return ContentService.createTextOutput(JSON.stringify({
+    subjects: structData,
+    category: categoryData,
+    announcements: announcementsData
+  })).setMimeType(ContentService.MimeType.JSON);
 }
 
 function getQuestionsData(filterSubject, ss) {
-    if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
-    var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
+  var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
 
-    var catSheet = ss.getSheetByName('Category');
-    var catData = catSheet.getRange(2, 1, Math.max(1, catSheet.getLastRow() - 1), 2).getValues();
-    var categoryToSubjectMap = {};
-    catData.forEach(function(row) {
-        categoryToSubjectMap[String(row[0]).trim()] = String(row[1]).trim().toUpperCase();
+  var categoryToSubjectMap = getCategoryToSubjectMapCached(ss);
+
+  var qData = getAllQuestionsCached(ss);
+  if (qData.length === 0) return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
+
+  var questions = qData.map(function (row) {
+    var categories = [];
+    try {
+      var catRaw = row[6].toString().trim();
+      if (catRaw !== "") {
+        categories = (catRaw.indexOf("[") > -1) ? JSON.parse(catRaw.replace(/'/g, '"')) : [catRaw];
+      }
+    } catch (err) { categories = ["Uncategorized"]; }
+
+    return {
+      questionId: row[0],
+      problem: row[1],
+      img: row[2],
+      choices: row[3],
+      answer: row[4],
+      explain: row[5],
+      category: categories
+    };
+  }).filter(function (q) {
+    if (cleanFilter === "") return true;
+    return q.category.some(function (catId) {
+      return (categoryToSubjectMap[catId] || "") === cleanFilter;
     });
+  });
 
-    var qSheet = ss.getSheetByName('Questions');
-    var lastRow = qSheet.getLastRow();
-    if (lastRow <= 1) return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
-    
-    var data = qSheet.getRange(2, 1, lastRow - 1, 7).getValues();
-
-    var questions = data.map(function(row) {
-        var categories = [];
-        try {
-            var catRaw = row[6].toString().trim();
-            if (catRaw !== "") {
-                categories = (catRaw.indexOf("[") > -1) ? JSON.parse(catRaw.replace(/'/g, '"')) : [catRaw];
-            }
-        } catch (err) { categories = ["Uncategorized"]; }
-
-        return {
-            questionId: row[0],
-            problem: row[1],
-            img: row[2],
-            choices: row[3],
-            answer: row[4],
-            explain: row[5],
-            category: categories
-        };
-    }).filter(function(q) {
-        if (cleanFilter === "") return true;
-        return q.category.some(function(catId) {
-            return (categoryToSubjectMap[catId] || "") === cleanFilter;
-        });
-    });
-
-    return ContentService.createTextOutput(JSON.stringify(questions)).setMimeType(ContentService.MimeType.JSON);
+  return ContentService.createTextOutput(JSON.stringify(questions)).setMimeType(ContentService.MimeType.JSON);
 }
 
 function getChangedSinceTimestamp(sinceStr, filterSubject) {
@@ -481,22 +574,28 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
 
   // --- Build Category → Subject map ---
-  var catSheet = ss.getSheetByName('Category');
-  var catData = catSheet.getDataRange().getValues();
-  var catToSubjectMap = {};
-  for (var i = 1; i < catData.length; i++) {
-    catToSubjectMap[String(catData[i][0]).trim()] = 
-      String(catData[i][1]).trim().toUpperCase();
+  var catToSubjectMap = getCategoryToSubjectMapCached(ss);
+
+  // --- Scan Logs sheet using cached or fresh data ---
+  var logDataJson = getLargeCache("logs_data_cache");
+  var logData;
+  if (logDataJson) {
+    logData = JSON.parse(logDataJson);
+  } else {
+    var logSheet = ss.getSheetByName('Logs');
+    if (logSheet && logSheet.getLastRow() > 1) {
+      logData = logSheet.getDataRange().getValues();
+      putLargeCache("logs_data_cache", JSON.stringify(logData), 15); // Cache for 15 seconds
+    } else {
+      logData = [];
+    }
   }
 
-  // --- Scan Logs sheet using epoch millisecond safely ---
-  var logSheet = ss.getSheetByName('Logs');
-  var changedIds = {}; // Use object for faster key lookup and ES5 compatibility
+  var changedIds = {};
 
-  if (logSheet && logSheet.getLastRow() > 1) {
-    var logData = logSheet.getDataRange().getValues();
+  if (logData.length > 1) {
     for (var i = 1; i < logData.length; i++) {
-      var logTime = new Date(logData[i][0]).getTime(); // Use getTime() to prevent timezone discrepancy
+      var logTime = new Date(logData[i][0]).getTime();
       var actionGroup = String(logData[i][3]);
       var targetId = String(logData[i][5]).trim();
 
@@ -516,16 +615,8 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
     })).setMimeType(ContentService.MimeType.JSON);
   }
 
-  // --- Fetch changed rows from Questions sheet ---
-  var qSheet = ss.getSheetByName('Questions');
-  var qLastRow = qSheet.getLastRow();
-  if (qLastRow <= 1) {
-    return ContentService.createTextOutput(JSON.stringify({
-      changed: [], serverTime: new Date().getTime(), count: 0
-    })).setMimeType(ContentService.MimeType.JSON);
-  }
-
-  var qData = qSheet.getRange(2, 1, qLastRow - 1, 7).getValues();
+  // --- Fetch changed rows from cached Questions instead of sheet ---
+  var qData = getAllQuestionsCached(ss);
   var changedQuestions = [];
 
   for (var i = 0; i < qData.length; i++) {
@@ -543,7 +634,7 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
     } catch (e) { categories = ["Uncategorized"]; }
 
     if (cleanFilter !== "") {
-      var inSubject = categories.some(function(catId) {
+      var inSubject = categories.some(function (catId) {
         return (catToSubjectMap[catId] || "") === cleanFilter;
       });
       if (!inSubject) continue;
@@ -551,19 +642,19 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
 
     changedQuestions.push({
       questionId: qData[i][0],
-      problem:    qData[i][1],
-      img:        qData[i][2],
-      choices:    qData[i][3],
-      answer:     qData[i][4],
-      explain:    qData[i][5],
-      category:   categories
+      problem: qData[i][1],
+      img: qData[i][2],
+      choices: qData[i][3],
+      answer: qData[i][4],
+      explain: qData[i][5],
+      category: categories
     });
   }
 
   return ContentService.createTextOutput(JSON.stringify({
-    changed:    changedQuestions,
+    changed: changedQuestions,
     serverTime: new Date().getTime(),
-    count:      changedQuestions.length
+    count: changedQuestions.length
   })).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -815,43 +906,44 @@ function doPost(e) {
             }
         }
 
-        // 2. VOTE SYSTEM
-        if (action === 'submitVote') {
-            var voteSheet = doc.getSheetByName("Votes") || doc.insertSheet("Votes");
-            var voteData = voteSheet.getDataRange().getValues();
-            var suggestedCategory = data.suggestedCategory || [];
-            var delta = data.delta || 1; // รับค่าความเปลี่ยนแปลง (ถ้าไม่มีส่งมาให้เป็น +1)
-            var timestamp = new Date();
+      // 2. VOTE SYSTEM
+      if (action === 'submitVote') {
+        var voteSheet = doc.getSheetByName("Votes") || doc.insertSheet("Votes");
+        var voteData = voteSheet.getDataRange().getValues();
+        var suggestedCategory = data.suggestedCategory || [];
+        var delta = data.delta || 1; // รับค่าความเปลี่ยนแปลง (ถ้าไม่มีส่งมาให้เป็น +1)
+        var timestamp = new Date();
 
-            suggestedCategory.forEach(function(category) {
-                var foundRowIndex = -1;
-                for (var j = 1; j < voteData.length; j++) {
-                    if (voteData[j][0] == data.questionId && voteData[j][2] == category) {
-                        foundRowIndex = j + 1;
-                        break;
-                    }
-                }
-                
-                if (foundRowIndex !== -1) {
-                    var currentVote = parseInt(voteSheet.getRange(foundRowIndex, 4).getValue()) || 0;
-                    var newVote = currentVote + delta;
-                    
-                    if (newVote < 0) {
-                        // ถ้าคะแนนต่ำกว่า 0 ให้ลบแถวทิ้งเลย
-                        voteSheet.deleteRow(foundRowIndex);
-                    } else {
-                        // อัปเดตคะแนนใหม่
-                        voteSheet.getRange(foundRowIndex, 4).setValue(newVote);
-                        voteSheet.getRange(foundRowIndex, 5).setValue(timestamp);
-                    }
-                } else if (delta > 0) {
-                    // กรณีเพิ่มหัวข้อใหม่ (เริ่มที่ 1 คะแนน)
-                    voteSheet.appendRow([data.questionId, data.questionText, category, 1, timestamp, "Pending"]);
-                }
-            });
-            processVotes();
-            return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-        }
+        suggestedCategory.forEach(function (category) {
+          var foundRowIndex = -1;
+          for (var j = 1; j < voteData.length; j++) {
+            if (voteData[j][0] == data.questionId && voteData[j][2] == category) {
+              foundRowIndex = j + 1;
+              break;
+            }
+          }
+
+          if (foundRowIndex !== -1) {
+            var currentVote = parseInt(voteSheet.getRange(foundRowIndex, 4).getValue()) || 0;
+            var newVote = currentVote + delta;
+
+            if (newVote < 0) {
+              // ถ้าคะแนนต่ำกว่า 0 ให้ลบแถวทิ้งเลย
+              voteSheet.deleteRow(foundRowIndex);
+            } else {
+              // อัปเดตคะแนนใหม่
+              voteSheet.getRange(foundRowIndex, 4).setValue(newVote);
+              voteSheet.getRange(foundRowIndex, 5).setValue(timestamp);
+            }
+          } else if (delta > 0) {
+            // กรณีเพิ่มหัวข้อใหม่ (เริ่มที่ 1 คะแนน)
+            voteSheet.appendRow([data.questionId, data.questionText, category, 1, timestamp, "Pending"]);
+          }
+        });
+        updateVersion(); // Force version update so cache is invalidated!
+        processVotes();
+        return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+      }
 
         // 3. REPORT SYSTEM
         if (action === 'submitReport') {
@@ -905,6 +997,7 @@ function doPost(e) {
           if (sTime.trim() === targetTs) {
             var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
             reportSheet.getRange(i + 1, 14).setValue(newVotes);
+            updateVersion(); // Force version update so cache is invalidated!
             processReports(doc);
             return ContentService.createTextOutput(JSON.stringify({ result: 'success', newVoteCount: newVotes })).setMimeType(ContentService.MimeType.JSON);
           }
@@ -2379,41 +2472,52 @@ function uploadToDrive(base64Data, filename, mimeType) {
 }
 
 function getPendingReportCount(filterSubject) {
-    var ss = SpreadsheetApp.openById(SHEET_ID);
-    var sheet = ss.getSheetByName("Report");
-    if (!sheet) return ContentService.createTextOutput(JSON.stringify({ count: 0, samples: [] })).setMimeType(ContentService.MimeType.JSON);
+  var v = getVersionCached();
+  var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";
+  var cacheKey = "pending_report_count_" + v + "_" + cleanFilter;
+  var cached = getLargeCache(cacheKey);
+  if (cached != null) {
+    return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
+  }
 
-    var data = sheet.getDataRange().getValues();
-    var pendingCount = 0;
-    var samples = [];
-    var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName("Report");
+  if (!sheet) {
+    var responseStr = JSON.stringify({ count: 0, samples: [] });
+    return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
+  }
 
-    // Column Index: 0=From(Subject), 1=Category, 2=Question, ..., 8=Status
-    for (var i = 1; i < data.length; i++) {
-        var subjectRef = String(data[i][0]).trim().toUpperCase();
-        var status = String(data[i][9]).trim(); // Status column
+  var data = sheet.getDataRange().getValues();
+  var pendingCount = 0;
+  var samples = [];
 
-        if ((status === "Pending" || status === "") && (cleanFilter === "" || subjectRef === cleanFilter)) {
-            pendingCount++;
-            
-            // เก็บตัวอย่างโจทย์ 2 ข้อแรกเพื่อไปโชว์
-            if (samples.length < 2) {
-                samples.push({
-                    category: data[i][1],
-                    question: data[i][3].substring(0, 80) + "..." // ตัดคำให้สั้น
-                });
-            }
-        }
+  for (var i = 1; i < data.length; i++) {
+    var subjectRef = String(data[i][0]).trim().toUpperCase();
+    var status = String(data[i][9]).trim();
+
+    if ((status === "Pending" || status === "") && (cleanFilter === "all" || subjectRef === cleanFilter)) {
+      pendingCount++;
+
+      if (samples.length < 2) {
+        samples.push({
+          category: data[i][1],
+          question: data[i][3].substring(0, 80) + "..."
+        });
+      }
     }
+  }
 
-    return ContentService.createTextOutput(JSON.stringify({
-        count: pendingCount,
-        samples: samples,
-        subject: cleanFilter || "ALL"
-    })).setMimeType(ContentService.MimeType.JSON);
+  var responseObj = {
+    count: pendingCount,
+    samples: samples,
+    subject: cleanFilter === "all" ? "ALL" : cleanFilter
+  };
+  var responseStr = JSON.stringify(responseObj);
+  putLargeCache(cacheKey, responseStr, 300); // 5 minutes cache
+  return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
 }
 
-function autoCreateSplitCategories(questionId, categories) {
+function autoCreateSplitCategories(questionId, categories, skipSort) {
   if (!categories || categories.length < 2) return;
 
   // 1. กรอง "by AI" ออก และตรวจสอบว่ามาจาก Subject เดียวกันหรือไม่
@@ -2422,7 +2526,7 @@ function autoCreateSplitCategories(questionId, categories) {
 
   const firstCatId = validCats[0];
   const subjectId = firstCatId.split('_')[0]; // เช่น GI
-  
+
   // ตรวจสอบว่าทุกอันขึ้นต้นด้วย Subject เดียวกัน
   const sameSubject = validCats.every(c => c.startsWith(subjectId));
   if (!sameSubject) return;
@@ -2435,16 +2539,16 @@ function autoCreateSplitCategories(questionId, categories) {
   // 3. Mapping หมวดหมู่ 6 กลุ่ม
   let splitSuffix = "";
   let groupKey = "";
-  
+
   const upperLect = lectureCatId.toUpperCase();
-  
+
   if (upperLect.includes("_ANA_")) { groupKey = "ANA"; splitSuffix = "ANATOMY (Extracted)"; }
   else if (upperLect.includes("_PHY_") || upperLect.includes("_PHYSIO_") || upperLect.includes("_BIOCHEM_")) { groupKey = "PHYSIO and BIOCHEM"; splitSuffix = "PHYSIO and BIOCHEM (Extracted)"; }
   else if (upperLect.includes("_PARASITO_") || upperLect.includes("_MICRO_")) { groupKey = "PARASITO and MICRO"; splitSuffix = "PARASITO and MICRO (Extracted)"; }
   else if (upperLect.includes("_PATHO_")) { groupKey = "PATHO"; splitSuffix = "PATHO (Extracted)"; }
   else if (upperLect.includes("_PHARM_") || upperLect.includes("_PHARMACO_")) { groupKey = "PHARM"; splitSuffix = "PHARM (Extracted)"; }
-  else if (upperLect.includes("_IMAGE_") || upperLect.includes("_RADIO_")|| upperLect.includes("_CLINICAL_")) { groupKey = "RADIO and CLINICAL"; splitSuffix = "RADIO and CLINICAL (Extracted)"; }
-  
+  else if (upperLect.includes("_IMAGE_") || upperLect.includes("_RADIO_") || upperLect.includes("_CLINICAL_")) { groupKey = "RADIO and CLINICAL"; splitSuffix = "RADIO and CLINICAL (Extracted)"; }
+
   if (!groupKey) return; // ถ้าไม่ตรงกับ 6 กลุ่มที่กำหนด ไม่ต้องทำต่อ
 
   // 4. สร้าง ID และชื่อใหม่
@@ -2473,7 +2577,7 @@ function autoCreateSplitCategories(questionId, categories) {
   let structExists = false;
   for (let i = 1; i < structValues.length; i++) {
     if (structValues[i][1] === subjectId && structValues[i][3] === newAccordionGroup) {
-      structExists = true; 
+      structExists = true;
       break;
     }
   }
@@ -2481,8 +2585,8 @@ function autoCreateSplitCategories(questionId, categories) {
   if (!structExists) {
     // ดึง Year จากอันเดิมมาใส่ (ถ้าหาเจอ)
     let year = "0";
-    for(let i=1; i<structValues.length; i++) {
-      if(structValues[i][1] === subjectId) { year = structValues[i][0]; break; }
+    for (let i = 1; i < structValues.length; i++) {
+      if (structValues[i][1] === subjectId) { year = structValues[i][0]; break; }
     }
     structSheet.appendRow([year, subjectId, subjectId, newAccordionGroup]);
   }
@@ -2495,7 +2599,7 @@ function autoCreateSplitCategories(questionId, categories) {
       let currentCats = [];
       try {
         currentCats = JSON.parse(qData[i][6].replace(/'/g, '"'));
-      } catch(e) { currentCats = [qData[i][6]]; }
+      } catch (e) { currentCats = [qData[i][6]]; }
 
       if (!currentCats.includes(newSplitCatId)) {
         currentCats.push(newSplitCatId);
@@ -2504,7 +2608,11 @@ function autoCreateSplitCategories(questionId, categories) {
       break;
     }
   }
-  sortCategorySheet();
+
+  // บังคับข้ามการจัดเรียงหากทำงานอยู่ภายใต้คำสั่งประมวลผลเป็นกลุ่ม (Deferred Sorting)
+  if (!skipSort) {
+    sortCategorySheet();
+  }
 }
 
 /**
@@ -2700,10 +2808,16 @@ function runManualSplitExtraction() {
   );
 }
 
-function sortCategorySheet() {
-  var ss = SpreadsheetApp.openById(SHEET_ID);
+function sortCategorySheet(ss) {
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName("Category");
   if (!sheet) return;
+
+  // บังคับล้างลบแคชของ Category และตารางจัดกลุ่มความสัมพันธ์ในทันทีก่อนเรียงลำดับใหม่
+  var cache = CacheService.getScriptCache();
+  var v = getVersionCached();
+  cache.remove("category_sheet_raw_" + v);
+  cache.remove("cat_to_subj_map_" + v);
 
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return;
@@ -2711,14 +2825,12 @@ function sortCategorySheet() {
   var range = sheet.getRange(2, 1, lastRow - 1, 4);
   var data = range.getValues();
 
-  // --- 1. ดึงเลขปีจาก CategoryID ---
-  var extractYear = function(id) {
+  var extractYear = function (id) {
     var match = String(id).match(/\d+/);
     return match ? parseInt(match[0]) : 0;
   };
 
-  // --- 2. ลำดับวิชาภายใน (Anatomy -> Physio -> ... -> Clinical) ---
-  var getSubSubjectPriority = function(group, id, name) {
+  var getSubSubjectPriority = function (group, id, name) {
     var text = (String(group) + " " + String(id) + " " + String(name)).toUpperCase();
     if (text.includes("_ANA_")) return 1;
     if (text.includes("_PHYSIO") || text.includes("BIOCHEM_")) return 2;
@@ -2729,60 +2841,47 @@ function sortCategorySheet() {
     return 7;
   };
 
-  // --- 3. ดึงตัวเลขต่อท้ายแบบ Dynamic (FMT1, MCQ2, etc.) ---
-  var getNumberSuffix = function(group, id, keyword) {
+  var getNumberSuffix = function (group, id, keyword) {
     var text = (String(group) + " " + String(id)).toUpperCase();
     var regex = new RegExp(keyword.toUpperCase() + "(\\d+)");
     var match = text.match(regex);
-    if (match) return parseInt(match[1]); 
-    return 0; 
+    if (match) return parseInt(match[1]);
+    return 0;
   };
 
-  // --- 4. ลำดับกลุ่มหลัก (ยึด AccordionGroup เป็นหลัก) ---
-  var getGroupPriority = function(group, id) {
+  var getGroupPriority = function (group, id) {
     var g = String(group).toUpperCase();
     var i = String(id).toUpperCase();
 
     if (g.includes("FMT")) return 10;
-    if (g.includes("EXTRACTED") || i.includes("EXTRACTED")) return 30; // เช็คก่อน MCQ
+    if (g.includes("EXTRACTED") || i.includes("EXTRACTED")) return 30;
     if (g.includes("MCQ") || i.includes("MCQ")) return 20;
     if (g.includes("BY AI")) return 50;
     if (g.includes("LEC")) return 40;
-    
+
     return 99;
   };
 
-  // --- 5. เริ่มการ Sort ---
-  data.sort(function(a, b) {
-    // 1. เรียงตาม Subject หลัก (เช่น GI, MS, GU)
+  data.sort(function (a, b) {
     var subA = String(a[1]);
     var subB = String(b[1]);
     if (subA !== subB) return subA.localeCompare(subB);
 
-    // 2. ดึงลำดับกลุ่มหลัก (FMT > MCQ > Extracted > LEC > AI)
     var prioA = getGroupPriority(a[2], a[0]);
     var prioB = getGroupPriority(b[2], b[0]);
-    
-    // ถ้ากลุ่มต่างกัน ให้เรียงตาม Priority กลุ่ม (เช่น MCQ มาก่อน Extracted)
+
     if (prioA !== prioB) return prioA - prioB;
 
-    // --- กรณีที่เป็นกลุ่มเดียวกัน (เช่น Extracted เหมือนกัน หรือ LEC เหมือนกัน) ---
-
-    // 3. ถ้าเป็นกลุ่ม Extracted (30), LEC (40) หรือ AI (50) 
-    // ให้เรียงตาม "หมวดวิชาย่อย" (Anatomy -> Clinical) ก่อน
     if (prioA === 30 || prioA === 40 || prioA === 50) {
       var sRankA = getSubSubjectPriority(a[2], a[0], a[3]);
       var sRankB = getSubSubjectPriority(b[2], b[0], b[3]);
       if (sRankA !== sRankB) return sRankA - sRankB;
     }
 
-    // 4. หลังจากเรียงหมวดวิชาย่อยแล้ว (หรือถ้าเป็นกลุ่ม MCQ/FMT) 
-    // ให้เรียงตาม "ปีของข้อสอบ" จากมากไปน้อย (52 -> 51 -> 50)
     var yearA = extractYear(a[0]);
     var yearB = extractYear(b[0]);
     if (yearA !== yearB) return yearB - yearA;
 
-    // 5. กรณีกลุ่ม FMT หรือ MCQ ให้เรียงตามเลขชุด (ถ้าปีเดียวกัน)
     if (prioA === 10 || prioA === 20) {
       var keyword = (prioA === 10) ? "FMT" : "MCQ";
       var nA = getNumberSuffix(a[2], a[0], keyword);
@@ -2790,10 +2889,13 @@ function sortCategorySheet() {
       if (nA !== nB) return nA - nB;
     }
 
-    return 0; 
+    return 0;
   });
-  updateVersion();
+
+  // บังคับ Flush ข้อมูลลงชีตหลักให้เรียบร้อยก่อนเขียนทับ เพื่อความปลอดภัยของข้อมูล
+  SpreadsheetApp.flush();
   range.setValues(data);
+  updateVersion();
 }
 function verifyAllSingleCategoryVotes() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
