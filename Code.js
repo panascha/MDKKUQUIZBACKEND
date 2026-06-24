@@ -31,6 +31,32 @@ function getVersionCached() {
   return v;
 }
 
+function getVotesVersionCached() {
+  var cache = CacheService.getScriptCache();
+  var v = cache.get("v_votes_cache");
+  if (v == null) {
+    v = PropertiesService.getScriptProperties().getProperty('v_votes') || "0";
+    try {
+      cache.put("v_votes_cache", v, 60); // Cache votes version for 60 seconds
+    } catch (e) {
+      console.warn("Votes version cache write error: " + e.message);
+    }
+  }
+  return v;
+}
+
+function updateVotesVersion() {
+  var cache = PropertiesService.getScriptProperties();
+  var newVer = new Date().getTime().toString();
+  cache.setProperty('v_votes', newVer);
+  try {
+    CacheService.getScriptCache().put("v_votes_cache", newVer, 60);
+  } catch (e) {
+    console.warn("Votes version cache put failed: " + e.message);
+  }
+  return newVer;
+}
+
 function putLargeCache(key, value, ttl) {
   if (!value) return;
   var cache = CacheService.getScriptCache();
@@ -187,22 +213,26 @@ function onSheetEdit(e) {
   var sheet = e.source.getActiveSheet();
   var sheetName = sheet.getName();
 
-  var watchSheets = ['Questions', 'Structure', 'Category', 'Admins', 'Report', 'Votes', 'Announcements'];
-  if (watchSheets.indexOf(sheetName) > -1) {
+  var watchSheetsQuestions = ['Questions', 'Structure', 'Category', 'Admins', 'Announcements'];
+  var watchSheetsVotes = ['Report', 'Votes'];
+
+  if (watchSheetsQuestions.indexOf(sheetName) > -1) {
     updateVersion();
   }
+  if (watchSheetsVotes.indexOf(sheetName) > -1) {
+    updateVotesVersion();
+  }
 
-  // ระบบตรวจสอบอัตโนมัติเมื่อคอลัมน์ Category (G / คอลัมน์ที่ 7) ของชีต Questions มีการแก้ไข
+  // ระบบตรวจสอบอัตโนมัติเมื่อคอลัมน์ Category (G) ของชีต Questions มีการแก้ไข
   if (sheetName === 'Questions') {
     var range = e.range;
     var startCol = range.getColumn();
     var endCol = range.getLastColumn();
 
-    // ตรวจสอบว่าช่วงที่มีการแก้ไขครอบคลุมคอลัมน์ที่ 7 หรือไม่
     if (startCol <= 7 && endCol >= 7) {
       var startRow = Math.max(2, range.getRow()); // ข้ามหัวตาราง (Header)
       var endRow = range.getLastRow();
-      var sortedNeeded = false; // Flag to trace if any extraction happened
+      var sortedNeeded = false;
 
       for (var r = startRow; r <= endRow; r++) {
         var qId = sheet.getRange(r, 1).getValue().toString().trim();
@@ -215,9 +245,8 @@ function onSheetEdit(e) {
             } else {
               categories = [catRaw];
             }
-            // ถ้าระบุอย่างน้อย 2 หมวดหมู่ ให้รันระบบคัดแยกกลุ่ม (Extracted) ทันที
             if (categories.length >= 2) {
-              autoCreateSplitCategories(qId, categories, true); // Pass skipSort = true to bypass repetitive sorting
+              autoCreateSplitCategories(qId, categories, true);
               sortedNeeded = true;
             }
           } catch (err) {
@@ -226,7 +255,6 @@ function onSheetEdit(e) {
         }
       }
 
-      // Perform a single, complete sort at the end of bulk operation
       if (sortedNeeded) {
         sortCategorySheet();
       }
@@ -413,7 +441,7 @@ function getSheetDataJSON(sheetName, ss) {
 }
 
 function getPendingVotesData(qid) {
-  var v = getVersionCached();
+  var v = getVotesVersionCached();
   var cacheKey = "pending_votes_" + v + "_" + qid;
   var cached = getLargeCache(cacheKey);
   if (cached != null) {
@@ -449,7 +477,7 @@ function getPendingVotesData(qid) {
 }
 
 function getPendingReportsData(qid) {
-  var v = getVersionCached();
+  var v = getVotesVersionCached();
   var cacheKey = "pending_reports_" + v + "_" + qid;
   var cached = getLargeCache(cacheKey);
   if (cached != null) {
@@ -583,9 +611,27 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
     logData = JSON.parse(logDataJson);
   } else {
     var logSheet = ss.getSheetByName('Logs');
-    if (logSheet && logSheet.getLastRow() > 1) {
-      logData = logSheet.getDataRange().getValues();
-      putLargeCache("logs_data_cache", JSON.stringify(logData), 15); // Cache for 15 seconds
+    if (logSheet) {
+      var lastRow = logSheet.getLastRow();
+      if (lastRow > 1) {
+        // Optimistically read only the last 1000 rows first (milliseconds read)
+        var numRowsToRead = Math.min(1000, lastRow - 1);
+        var startRow = lastRow - numRowsToRead + 1;
+        var sampleData = logSheet.getRange(startRow, 1, numRowsToRead, 10).getValues();
+
+        var oldestSampleTime = sampleData.length > 0 ? new Date(sampleData[0][0]).getTime() : 0;
+
+        if (sinceMs > 0 && oldestSampleTime <= sinceMs) {
+          // Excellent! The last 1000 rows fully cover the timeframe since 'sinceMs'
+          logData = [[]].concat(sampleData); // Prepend dummy header to match 1-based index offsets
+        } else {
+          // Fallback to full read only if client has no sinceMs or is extremely outdated
+          logData = logSheet.getDataRange().getValues();
+        }
+        putLargeCache("logs_data_cache", JSON.stringify(logData), 15); // Cache for 15s to block stamps
+      } else {
+        logData = [];
+      }
     } else {
       logData = [];
     }
@@ -940,7 +986,7 @@ function doPost(e) {
             voteSheet.appendRow([data.questionId, data.questionText, category, 1, timestamp, "Pending"]);
           }
         });
-        updateVersion(); // Force version update so cache is invalidated!
+        updateVotesVersion(); // Decoupled: only updates votes version
         processVotes();
         return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
       }
@@ -978,7 +1024,7 @@ function doPost(e) {
         1
     ]);
 
-    updateVersion();
+          updateVotesVersion(); // Decoupled: only updates votes version
     return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -997,7 +1043,7 @@ function doPost(e) {
           if (sTime.trim() === targetTs) {
             var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
             reportSheet.getRange(i + 1, 14).setValue(newVotes);
-            updateVersion(); // Force version update so cache is invalidated!
+            updateVotesVersion(); // Decoupled: only updates votes version
             processReports(doc);
             return ContentService.createTextOutput(JSON.stringify({ result: 'success', newVoteCount: newVotes })).setMimeType(ContentService.MimeType.JSON);
           }
@@ -2472,7 +2518,7 @@ function uploadToDrive(base64Data, filename, mimeType) {
 }
 
 function getPendingReportCount(filterSubject) {
-  var v = getVersionCached();
+  var v = getVotesVersionCached();
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";
   var cacheKey = "pending_report_count_" + v + "_" + cleanFilter;
   var cached = getLargeCache(cacheKey);
