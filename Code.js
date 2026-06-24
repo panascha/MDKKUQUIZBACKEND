@@ -60,15 +60,16 @@ function updateVotesVersion() {
 function putLargeCache(key, value, ttl) {
   if (!value) return;
   var cache = CacheService.getScriptCache();
-  var chunkSize = 90 * 1024; // ~90KB safe buffer
+  // Downsized to 25KB character slices to protect against multi-byte (Thai) UTF-8 expansion (up to 3x bytes per char)
+  var chunkSize = 25 * 1024;
   var chunks = Math.ceil(value.length / chunkSize);
-  
+
   try {
     cache.put(key + "_chunks", String(chunks), ttl);
     for (var i = 0; i < chunks; i++) {
       cache.put(key + "_chunk_" + i, value.substring(i * chunkSize, (i + 1) * chunkSize), ttl);
     }
-  } catch(e) {
+  } catch (e) {
     console.warn("putLargeCache failed for key " + key + ": " + e.message);
   }
 }
@@ -710,1000 +711,974 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
    =========================================
 */
 function doPost(e) {
-    var lock = LockService.getScriptLock();
-    lock.tryLock(30000);
+  try {
+    var doc = SpreadsheetApp.openById(SHEET_ID);
+    var contents = e.postData.contents;
+    var data = JSON.parse(contents);
+    var action = data.action;
 
-    try {
-        var doc = SpreadsheetApp.openById(SHEET_ID);
-        var contents = e.postData.contents;
-        var data = JSON.parse(contents);
-        var action = data.action;
+    // ----------------------------------------------------
+    // LOCK-FREE GROUP (Processes instantly, no write queue overhead)
+    // ----------------------------------------------------
+    if (action === 'verifySession') {
+      var userObj = verifySessionToken(data.sessionToken);
+      if (userObj) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'success',
+          'user': userObj
+        })).setMimeType(ContentService.MimeType.JSON);
+      } else {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
 
-        // ----------------------------------------------------
-        // NEW: USER ACTIVITY LOGGING (สำหรับหน้า Quiz)
-        // ----------------------------------------------------
-        if (action === 'logUserActivity') {
-            writeUserActivity(data.data);
-            return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-        }
+    if (action === 'askAIExpert') {
+      var userObj = null;
+      if (data.sessionToken) {
+        userObj = verifySessionToken(data.sessionToken);
+      } else if (data.googleIdToken) {
+        var payload = verifyGoogleToken(data.googleIdToken);
+        if (payload) userObj = findAdminByEmail(payload.email);
+      } else {
+        userObj = verifyAdmin(data.username, data.adminPass);
+      }
 
-        // ----------------------------------------------------
-        // NEW: GOOGLE SSO AUTHENTICATION
-        // ----------------------------------------------------
-        if (action === 'checkGoogleAuth') {
-            var tokenPayload = verifyGoogleToken(data.idToken);
-            if (!tokenPayload) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'Token ไม่ถูกต้องหรือหมดอายุการใช้งาน'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
+      if (!userObj) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'Session หมดอายุ กรุณาล็อกอินใหม่'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
 
-            var email = tokenPayload.email;
-            var hd = tokenPayload.hd; // โดเมนของ Google Workspace (เช่น kkumail.com)
+      var provider = data.provider || "Gemini";
+      var apiKeyInfo = getAvailableAIKey(provider);
 
-            // ยืนยันว่าต้องเป็นอีเมลเครือข่ายมหาวิทยาลัยขอนแก่น (KKU)
-            if (hd !== "kkumail.com" && hd !== "kku.ac.th") {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'ต้องใช้บัญชี @kkumail.com หรือ @kku.ac.th ของทางมหาวิทยาลัยเท่านั้น'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
+      if (!apiKeyInfo) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error', 'message': 'ขณะนี้ไม่มี API Key ที่พร้อมใช้งาน (โควต้าเต็มทุก Key หรือยังไม่ได้ตั้งค่า)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
 
-            // ตรวจสอบฐานข้อมูลแอดมิน (Whitelisted Emails)
-            var adminUser = findAdminByEmail(email);
-            if (adminUser) {
-                var sessionToken = createSession(email, adminUser);
-                writeAdminLog(adminUser.displayName, adminUser.role, "AUTH", "LOGIN_SSO", "Session", "Google SSO Login Success", "", "", "");
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'user': adminUser,
-                    'sessionToken': sessionToken
-                })).setMimeType(ContentService.MimeType.JSON);
-            } else {
-                writeAdminLog(email, "GUEST", "AUTH", "LOGIN_SSO_FAIL", "Session", "Google login blocked: Email not in whitelist", "", "", "");
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'บัญชีผู้ใช้นี้ไม่มีอยู่ในสิทธิ์การแก้ไขระบบ กรุณาติดต่อผู้ดูแลเพื่อเพิ่มรายชื่ออีเมลของคุณ'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-        }
+      try {
+        var aiResponse = callGeminiAI(data.prompt, apiKeyInfo, data.images);
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'success',
+          'answer': aiResponse,
+          'quota': (apiKeyInfo.usage + 1) + "/" + apiKeyInfo.limit
+        })).setMimeType(ContentService.MimeType.JSON);
+      } catch (err) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error', 'message': err.message
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
 
+    // Helper function for mapping batch logs to rows
+    function toActivityRow(entry) {
+      return [
+        entry.timestamp ? new Date(entry.timestamp) : new Date(),
+        entry.session || "N/A",
+        entry.action || "",
+        entry.target || "",
+        entry.result || "",
+        entry.timeSpent || 0,
+        entry.metadata || ""
+      ];
+    }
+
+    // ----------------------------------------------------
+    // LOCALIZED LOCK GROUP (Locks briefly for writes, tryLock 15s)
+    // ----------------------------------------------------
+    var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'batchLog', 'deleteSession'];
+    if (localizedActions.indexOf(action) > -1) {
+      var lock = LockService.getScriptLock();
+      var acquired = lock.tryLock(15000);
+      if (!acquired) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
         if (action === 'deleteSession') {
-            var token = data.sessionToken;
-            if (token) {
-                var ss = SpreadsheetApp.openById(SHEET_ID);
-                var sheet = ss.getSheetByName("Sessions");
-                if (sheet) {
-                    var rows = sheet.getDataRange().getValues();
-                    for (var i = rows.length - 1; i >= 1; i--) {
-                        if (rows[i][0] === token) {
-                            sheet.deleteRow(i + 1);
-                            break;
-                        }
-                    }
+          var token = data.sessionToken;
+          if (token) {
+            var ss = SpreadsheetApp.openById(SHEET_ID);
+            var sheet = ss.getSheetByName("Sessions");
+            if (sheet) {
+              var rows = sheet.getDataRange().getValues();
+              for (var i = rows.length - 1; i >= 1; i--) {
+                if (rows[i][0] === token) {
+                  sheet.deleteRow(i + 1);
+                  break;
                 }
+              }
             }
-            return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
 
-        if (action === 'verifySession') {
-            var userObj = verifySessionToken(data.sessionToken);
-            if (userObj) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'user': userObj
-                })).setMimeType(ContentService.MimeType.JSON);
-            } else {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'session_expired'
-                })).setMimeType(ContentService.MimeType.JSON);
+        if (action === 'batchLog') {
+          var logs = data.logs || [];
+          if (logs.length > 0) {
+            var activitySheet = doc.getSheetByName("UserActivity") || doc.insertSheet("UserActivity");
+            if (activitySheet.getLastRow() === 0) {
+              activitySheet.appendRow(["Timestamp", "SessionID", "Action", "TargetID", "Result", "TimeSpent", "Metadata"]);
+              activitySheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#e6f7ff");
             }
+            var rowsToAppend = logs.map(function (entry) { return toActivityRow(entry); });
+            activitySheet.getRange(activitySheet.getLastRow() + 1, 1, rowsToAppend.length, 7).setValues(rowsToAppend);
+          }
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
 
-        // ----------------------------------------------------
-        // 1. REGISTER ADMIN
-        // ----------------------------------------------------
-        if (action === 'registerAdmin') {
-            var sheet = doc.getSheetByName("Admins");
-            var users = sheet.getDataRange().getValues();
-            
-            for (var i = 1; i < users.length; i++) {
-                if (users[i][0] == data.userData.Username) { 
-                    return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Username นี้ถูกใช้ไปแล้ว' })).setMimeType(ContentService.MimeType.JSON);
-                }
-                if (users[i][8] == data.userData.StudentID) { 
-                    return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'รหัสนักศึกษานี้ลงทะเบียนแล้ว' })).setMimeType(ContentService.MimeType.JSON);
-                }
+        if (action === 'submitVote') {
+          var voteSheet = doc.getSheetByName("Votes") || doc.insertSheet("Votes");
+          var voteData = voteSheet.getDataRange().getValues();
+          var suggestedCategory = data.suggestedCategory || [];
+          var delta = data.delta || 1;
+          var timestamp = new Date();
+
+          suggestedCategory.forEach(function (category) {
+            var foundRowIndex = -1;
+            for (var j = 1; j < voteData.length; j++) {
+              if (voteData[j][0] == data.questionId && voteData[j][2] == category) {
+                foundRowIndex = j + 1;
+                break;
+              }
             }
 
-            var avatarUrl = "https://api.dicebear.com/7.x/avataaars/svg?seed=" + data.userData.Username; 
-            if (data.userData.AvatarBase64) {
-               try {
-                 avatarUrl = uploadToDrive(data.userData.AvatarBase64, data.userData.Username + "_avatar.png", "image/png");
-               } catch(err) {
-                 return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Upload รูปไม่สำเร็จ: ' + err.message })).setMimeType(ContentService.MimeType.JSON);
-               }
+            if (foundRowIndex !== -1) {
+              var currentVote = parseInt(voteSheet.getRange(foundRowIndex, 4).getValue()) || 0;
+              var newVote = currentVote + delta;
+
+              if (newVote < 0) {
+                voteSheet.deleteRow(foundRowIndex);
+              } else {
+                voteSheet.getRange(foundRowIndex, 4).setValue(newVote);
+                voteSheet.getRange(foundRowIndex, 5).setValue(timestamp);
+              }
+            } else if (delta > 0) {
+              voteSheet.appendRow([data.questionId, data.questionText, category, 1, timestamp, "Pending"]);
             }
+          });
+          updateVotesVersion();
+          processVotes();
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
 
-            // var hashedPassword = hashPasswordInternal(data.userData.Password); // (Optional: ถ้าจะ hash ฝั่ง server)
+        if (action === 'submitReport') {
+          var sheet = doc.getSheetByName("Report") || doc.insertSheet("Report");
+          if (sheet.getLastRow() == 0) {
+            sheet.appendRow(["From", "Category", "QuestionID", "Question", "Image", "Choices", "SuggestedAnswer", "ReportDetail", "Time", "Status", "AdminNote", "Done", "SuggestedExplain", "VoteCount"]);
+          } else {
+            var headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+            if (headerRow.indexOf("SuggestedExplain") === -1) {
+              sheet.getRange(1, 13).setValue("SuggestedExplain");
+              sheet.getRange(1, 14).setValue("VoteCount");
+            }
+          }
 
-            sheet.appendRow([
-                data.userData.Username,
-                data.userData.Password,
-                data.userData.DisplayName,
-                avatarUrl,
-                data.userData.Role || "Admin",
-                data.userData.KKUMail,
-                data.userData.Prefix,
-                data.userData.FullName,
-                data.userData.StudentID,
-                data.userData.Year,
-                data.userData.Contact
-            ]);
+          var qImg = (data.questionImages && data.questionImages.indexOf("http") === 0) ? data.questionImages.split("///")[0] : "";
+          var ansSug = data.suggestedChoice || "";
 
+          sheet.appendRow([
+            data.from || "User",
+            data.category || "",
+            data.questionId || "",
+            data.question || "",
+            qImg,
+            data.allChoices || "",
+            ansSug,
+            data.report || "",
+            new Date().toISOString(),
+            "Pending",
+            "",
+            "FALSE",
+            data.suggestedExplain || "",
+            1
+          ]);
+
+          updateVotesVersion();
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'voteOnReport') {
+          var reportSheet = doc.getSheetByName("Report");
+          if (!reportSheet) {
+            return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report sheet not found' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var rv = reportSheet.getDataRange().getValues();
+          var targetTs = String(data.reportTimestamp || "").trim();
+          var delta = parseInt(data.delta) || 1;
+          for (var i = 1; i < rv.length; i++) {
+            var sTime = rv[i][8] instanceof Date ? rv[i][8].toISOString() : String(rv[i][8]);
+            if (sTime.trim() === targetTs) {
+              var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
+              reportSheet.getRange(i + 1, 14).setValue(newVotes);
+              updateVotesVersion();
+              processReports(doc);
+              return ContentService.createTextOutput(JSON.stringify({ result: 'success', newVoteCount: newVotes })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report not found' })).setMimeType(ContentService.MimeType.JSON);
+        }
+      } finally {
+        lock.releaseLock();
+      }
+    }
+
+    // ----------------------------------------------------
+    // ADMIN LOCK GROUP (Admin and write operations, tryLock 25s)
+    // ----------------------------------------------------
+    var adminLock = LockService.getScriptLock();
+    var adminAcquired = adminLock.tryLock(25000);
+    if (!adminAcquired) {
+      return ContentService.createTextOutput(JSON.stringify({
+        'result': 'error',
+        'message': 'ระบบหลังบ้านทำงานหนักเนื่องจากมีการเขียนซ้อนกัน (Admin Lock Timeout)'
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    try {
+      if (action === 'checkGoogleAuth') {
+        var tokenPayload = verifyGoogleToken(data.idToken);
+        if (!tokenPayload) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'Token ไม่ถูกต้องหรือหมดอายุการใช้งาน'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        var email = tokenPayload.email;
+        var hd = tokenPayload.hd;
+
+        if (hd !== "kkumail.com" && hd !== "kku.ac.th") {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'ต้องใช้บัญชี @kkumail.com หรือ @kku.ac.th ของทางมหาวิทยาลัยเท่านั้น'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        var adminUser = findAdminByEmail(email);
+        if (adminUser) {
+          var sessionToken = createSession(email, adminUser);
+          writeAdminLog(adminUser.displayName, adminUser.role, "AUTH", "LOGIN_SSO", "Session", "Google SSO Login Success", "", "", "");
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success',
+            'user': adminUser,
+            'sessionToken': sessionToken
+          })).setMimeType(ContentService.MimeType.JSON);
+        } else {
+          writeAdminLog(email, "GUEST", "AUTH", "LOGIN_SSO_FAIL", "Session", "Google login blocked: Email not in whitelist", "", "", "");
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'บัญชีผู้ใช้นี้ไม่มีอยู่ในสิทธิ์การแก้ไขระบบ กรุณาติดต่อผู้ดูแลเพื่อเพิ่มรายชื่ออีเมลของคุณ'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+
+      if (action === 'registerAdmin') {
+        var sheet = doc.getSheetByName("Admins");
+        var users = sheet.getDataRange().getValues();
+
+        for (var i = 1; i < users.length; i++) {
+          if (users[i][0] == data.userData.Username) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Username นี้ถูกใช้ไปแล้ว' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          if (users[i][8] == data.userData.StudentID) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'รหัสนักศึกษานี้ลงทะเบียนแล้ว' })).setMimeType(ContentService.MimeType.JSON);
+          }
+        }
+
+        var avatarUrl = "https://api.dicebear.com/7.x/avataaars/svg?seed=" + data.userData.Username;
+        if (data.userData.AvatarBase64) {
+          try {
+            avatarUrl = uploadToDrive(data.userData.AvatarBase64, data.userData.Username + "_avatar.png", "image/png");
+          } catch (err) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Upload รูปไม่สำเร็จ: ' + err.message })).setMimeType(ContentService.MimeType.JSON);
+          }
+        }
+
+        sheet.appendRow([
+          data.userData.Username,
+          data.userData.Password,
+          data.userData.DisplayName,
+          avatarUrl,
+          data.userData.Role || "Admin",
+          data.userData.KKUMail,
+          data.userData.Prefix,
+          data.userData.FullName,
+          data.userData.StudentID,
+          data.userData.Year,
+          data.userData.Contact
+        ]);
+
+        updateVersion();
+        writeAdminLog("System", "SYSTEM", "AUTH", "REGISTER", data.userData.Username, "New Admin Registered", "", "", "");
+
+        return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      if (action === 'resetPassword') {
+        var sheet = doc.getSheetByName("Admins");
+        var users = sheet.getDataRange().getValues();
+        var found = false;
+
+        for (var i = 1; i < users.length; i++) {
+          if (users[i][0] == data.verifyData.Username &&
+            users[i][5] == data.verifyData.KKUMail &&
+            users[i][8] == data.verifyData.StudentID &&
+            users[i][7] == data.verifyData.FullName) {
+
+            sheet.getRange(i + 1, 2).setValue(data.newPassword);
             updateVersion();
-            writeAdminLog("System", "SYSTEM", "AUTH", "REGISTER", data.userData.Username, "New Admin Registered", "", "", "");
-
-            return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+            writeAdminLog(data.verifyData.Username, "USER", "AUTH", "RESET_PWD", "Self", "Password Changed via Verification", "", "", "");
+            found = true;
+            break;
+          }
         }
 
-        // ----------------------------------------------------
-        // 2. RESET PASSWORD
-        // ----------------------------------------------------
-        if (action === 'resetPassword') {
-            var sheet = doc.getSheetByName("Admins");
-            var users = sheet.getDataRange().getValues();
-            var found = false;
-            
-            for (var i = 1; i < users.length; i++) {
-                if (users[i][0] == data.verifyData.Username &&
-                    users[i][5] == data.verifyData.KKUMail &&
-                    users[i][8] == data.verifyData.StudentID &&
-                    users[i][7] == data.verifyData.FullName) {
-                    
-                    sheet.getRange(i + 1, 2).setValue(data.newPassword);
-                    updateVersion();
-                    writeAdminLog(data.verifyData.Username, "USER", "AUTH", "RESET_PWD", "Self", "Password Changed via Verification", "", "", "");
-                    found = true;
-                    break;
-                }
-            }
-            
-            if (found) {
-                return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
-            } else {
-                return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ข้อมูลยืนยันตัวตนไม่ถูกต้อง' })).setMimeType(ContentService.MimeType.JSON);
-            }
+        if (found) {
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        } else {
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ข้อมูลยืนยันตัวตนไม่ถูกต้อง' })).setMimeType(ContentService.MimeType.JSON);
         }
+      }
 
-        // 1. LOGIN CHECK
-        if (action === 'checkAuth') {
-            var userObj = verifyAdmin(data.username, data.password);
-            if (userObj) {
-                // Log Login Success
-                writeAdminLog(userObj.username, userObj.role, "AUTH", "LOGIN", "Session", "Login Success", "", "", data.metadata || "");
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'user': userObj
-                })).setMimeType(ContentService.MimeType.JSON);
-            } else {
-                // Log Login Failed
-                writeAdminLog(data.username || "Unknown", "GUEST", "AUTH", "LOGIN_FAIL", "Session", "Login Failed", "", "", data.metadata || "");
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'Username หรือ Password ไม่ถูกต้อง'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
+      if (action === 'checkAuth') {
+        var userObj = verifyAdmin(data.username, data.password);
+        if (userObj) {
+          writeAdminLog(userObj.username, userObj.role, "AUTH", "LOGIN", "Session", "Login Success", "", "", data.metadata || "");
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success',
+            'user': userObj
+          })).setMimeType(ContentService.MimeType.JSON);
+        } else {
+          writeAdminLog(data.username || "Unknown", "GUEST", "AUTH", "LOGIN_FAIL", "Session", "Login Failed", "", "", data.metadata || "");
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'Username หรือ Password ไม่ถูกต้อง'
+          })).setMimeType(ContentService.MimeType.JSON);
         }
+      }
 
-        if (action === 'updateAdminProfile') {
-            try {
-                var ss = SpreadsheetApp.getActiveSpreadsheet();
-                var sheet = ss.getSheetByName("Admins");
-                if (!sheet) throw new Error("ไม่พบแผ่นงาน 'Admins'");
+      if (action === 'updateAdminProfile') {
+        try {
+          var ss = SpreadsheetApp.openById(SHEET_ID);
+          var sheet = ss.getSheetByName("Admins");
+          if (!sheet) throw new Error("ไม่พบแผ่นงาน 'Admins'");
 
-                var values = sheet.getDataRange().getValues();
-                var targetUsername = data.targetUsername ? data.targetUsername.toString().trim() : "";
-                var foundRow = -1;
-                var oldProfileData = {};
+          var values = sheet.getDataRange().getValues();
+          var targetUsername = data.targetUsername ? data.targetUsername.toString().trim() : "";
+          var foundRow = -1;
+          var oldProfileData = {};
 
-                for (var i = 1; i < values.length; i++) {
-                    if (values[i][0].toString().trim().toLowerCase() === targetUsername.toLowerCase()) {
-                        foundRow = i + 1;
-                        // เก็บค่าเก่า
-                        oldProfileData = {
-                            displayName: values[i][2],
-                            avatarUrl: values[i][3],
-                            prefix: values[i][6],
-                            fullName: values[i][7],
-                            year: values[i][9],
-                            contact: values[i][10]
-                        };
-                        break;
-                    }
-                }
-
-                if (foundRow !== -1) {
-                    var u = data.updateData;
-                    if (u.displayName !== undefined) sheet.getRange(foundRow, 3).setValue(u.displayName);
-                    if (u.avatarUrl !== undefined)   sheet.getRange(foundRow, 4).setValue(u.avatarUrl);
-                    if (u.prefix !== undefined)      sheet.getRange(foundRow, 7).setValue(u.prefix);
-                    if (u.fullName !== undefined)    sheet.getRange(foundRow, 8).setValue(u.fullName);
-                    if (u.year !== undefined)        sheet.getRange(foundRow, 10).setValue(u.year);
-                    if (u.contact !== undefined)     sheet.getRange(foundRow, 11).setValue(u.contact);
-
-                    updateVersion();
-                    writeAdminLog(data.username || targetUsername, "ADMIN", "PROFILE", "UPDATE", targetUsername, "Updated profile details", oldProfileData, u, "");
-
-                    return ContentService.createTextOutput(JSON.stringify({
-                        'result': 'success',
-                        'message': 'Profile updated successfully'
-                    })).setMimeType(ContentService.MimeType.JSON);
-                } else {
-                    throw new Error("ไม่พบชื่อผู้ใช้: " + targetUsername);
-                }
-            } catch (error) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': error.toString()
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-        }
-
-      // 2. VOTE SYSTEM
-      if (action === 'submitVote') {
-        var voteSheet = doc.getSheetByName("Votes") || doc.insertSheet("Votes");
-        var voteData = voteSheet.getDataRange().getValues();
-        var suggestedCategory = data.suggestedCategory || [];
-        var delta = data.delta || 1; // รับค่าความเปลี่ยนแปลง (ถ้าไม่มีส่งมาให้เป็น +1)
-        var timestamp = new Date();
-
-        suggestedCategory.forEach(function (category) {
-          var foundRowIndex = -1;
-          for (var j = 1; j < voteData.length; j++) {
-            if (voteData[j][0] == data.questionId && voteData[j][2] == category) {
-              foundRowIndex = j + 1;
+          for (var i = 1; i < values.length; i++) {
+            if (values[i][0].toString().trim().toLowerCase() === targetUsername.toLowerCase()) {
+              foundRow = i + 1;
+              oldProfileData = {
+                displayName: values[i][2],
+                avatarUrl: values[i][3],
+                prefix: values[i][6],
+                fullName: values[i][7],
+                year: values[i][9],
+                contact: values[i][10]
+              };
               break;
             }
           }
 
-          if (foundRowIndex !== -1) {
-            var currentVote = parseInt(voteSheet.getRange(foundRowIndex, 4).getValue()) || 0;
-            var newVote = currentVote + delta;
+          if (foundRow !== -1) {
+            var u = data.updateData;
+            if (u.displayName !== undefined) sheet.getRange(foundRow, 3).setValue(u.displayName);
+            if (u.avatarUrl !== undefined) sheet.getRange(foundRow, 4).setValue(u.avatarUrl);
+            if (u.prefix !== undefined) sheet.getRange(foundRow, 7).setValue(u.prefix);
+            if (u.fullName !== undefined) sheet.getRange(foundRow, 8).setValue(u.fullName);
+            if (u.year !== undefined) sheet.getRange(foundRow, 10).setValue(u.year);
+            if (u.contact !== undefined) sheet.getRange(foundRow, 11).setValue(u.contact);
 
-            if (newVote < 0) {
-              // ถ้าคะแนนต่ำกว่า 0 ให้ลบแถวทิ้งเลย
-              voteSheet.deleteRow(foundRowIndex);
-            } else {
-              // อัปเดตคะแนนใหม่
-              voteSheet.getRange(foundRowIndex, 4).setValue(newVote);
-              voteSheet.getRange(foundRowIndex, 5).setValue(timestamp);
-            }
-          } else if (delta > 0) {
-            // กรณีเพิ่มหัวข้อใหม่ (เริ่มที่ 1 คะแนน)
-            voteSheet.appendRow([data.questionId, data.questionText, category, 1, timestamp, "Pending"]);
+            updateVersion();
+            writeAdminLog(data.username || targetUsername, "ADMIN", "PROFILE", "UPDATE", targetUsername, "Updated profile details", oldProfileData, u, "");
+
+            return ContentService.createTextOutput(JSON.stringify({
+              'result': 'success',
+              'message': 'Profile updated successfully'
+            })).setMimeType(ContentService.MimeType.JSON);
+          } else {
+            throw new Error("ไม่พบชื่อผู้ใช้: " + targetUsername);
           }
-        });
-        updateVotesVersion(); // Decoupled: only updates votes version
-        processVotes();
-        return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        } catch (error) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': error.toString()
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
       }
 
-        // 3. REPORT SYSTEM
-        if (action === 'submitReport') {
-    var sheet = doc.getSheetByName("Report") || doc.insertSheet("Report");
-    if (sheet.getLastRow() == 0) {
-        sheet.appendRow(["From", "Category", "QuestionID", "Question", "Image", "Choices", "SuggestedAnswer", "ReportDetail", "Time", "Status", "AdminNote", "Done", "SuggestedExplain", "VoteCount"]);
-    } else {
-        var headerRow = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-        if (headerRow.indexOf("SuggestedExplain") === -1) {
-            sheet.getRange(1, 13).setValue("SuggestedExplain");
-            sheet.getRange(1, 14).setValue("VoteCount");
+      if (action === 'uploadImage') {
+        var userObj = null;
+        if (data.sessionToken) {
+          userObj = verifySessionToken(data.sessionToken);
+        } else if (data.googleIdToken) {
+          var payload = verifyGoogleToken(data.googleIdToken);
+          if (payload) userObj = findAdminByEmail(payload.email);
+        } else {
+          userObj = verifyAdmin(data.username, data.adminPass);
         }
-    }
 
-    var qImg = (data.questionImages && data.questionImages.indexOf("http") === 0) ? data.questionImages.split("///")[0] : "";
-    var ansSug = data.suggestedChoice || "";
-
-    sheet.appendRow([
-        data.from || "User",
-        data.category || "",
-        data.questionId || "",
-        data.question || "",
-        qImg,
-        data.allChoices || "",
-        ansSug,
-        data.report || "",
-        new Date().toISOString(),
-        "Pending",
-        "",
-        "FALSE",
-        data.suggestedExplain || "",
-        1
-    ]);
-
-          updateVotesVersion(); // Decoupled: only updates votes version
-    return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-}
-
-      // 3b. REPORT VOTE SYSTEM
-      if (action === 'voteOnReport') {
-        var reportSheet = doc.getSheetByName("Report");
-        if (!reportSheet) {
-          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report sheet not found' })).setMimeType(ContentService.MimeType.JSON);
+        if (!userObj) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'token_expired'
+          })).setMimeType(ContentService.MimeType.JSON);
         }
-        var rv = reportSheet.getDataRange().getValues();
-        var targetTs = String(data.reportTimestamp || "").trim();
-        var delta = parseInt(data.delta) || 1;
-        for (var i = 1; i < rv.length; i++) {
-          // แปลงค่าออบเจกต์ Date ในเซลล์ให้เป็นรูปแบบ ISO String ก่อนสืบค้นและจับคู่
-          var sTime = rv[i][8] instanceof Date ? rv[i][8].toISOString() : String(rv[i][8]);
-          if (sTime.trim() === targetTs) {
-            var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
-            reportSheet.getRange(i + 1, 14).setValue(newVotes);
-            updateVotesVersion(); // Decoupled: only updates votes version
-            processReports(doc);
-            return ContentService.createTextOutput(JSON.stringify({ result: 'success', newVoteCount: newVotes })).setMimeType(ContentService.MimeType.JSON);
-          }
+
+        try {
+          var subject = data.data.subject;
+          var year = data.data.year;
+          var fileUrl = uploadQuestionImageToDrive(data.data.base64, data.data.questionId, data.data.type, subject, year);
+          writeAdminLog(userObj.username, userObj.role, "IMAGE", "UPLOAD", data.data.questionId, "Uploaded new " + data.data.type + " image", "", fileUrl, "");
+
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success',
+            'url': fileUrl
+          })).setMimeType(ContentService.MimeType.JSON);
+
+        } catch (err) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'Drive Upload Error: ' + err.message
+          })).setMimeType(ContentService.MimeType.JSON);
         }
-        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report not found' })).setMimeType(ContentService.MimeType.JSON);
       }
 
-        // 4. IMAGE CRUD ACTIONS
-
-        if (action === 'uploadImage') {
-            // 1. ตรวจสอบสิทธิ์ Admin ทั้งแบบ Standard และ Google SSO
-            var userObj = null;
-            if (data.sessionToken) {
-                userObj = verifySessionToken(data.sessionToken);
-            } else if (data.googleIdToken) {
-                var payload = verifyGoogleToken(data.googleIdToken);
-                if (payload) userObj = findAdminByEmail(payload.email);
-            } else {
-                userObj = verifyAdmin(data.username, data.adminPass);
-            }
-
-            if (!userObj) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'token_expired'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            try {
-              var subject = data.data.subject; 
-              var year = data.data.year;
-
-                // 2. เรียกใช้ฟังก์ชันอัพโหลดที่มีอยู่แล้วในระบบ (ส่วนที่ 3 ของไฟล์คุณ)
-              var fileUrl = uploadQuestionImageToDrive(data.data.base64, data.data.questionId, data.data.type, subject, year);                
-                // 3. บันทึก Log
-                writeAdminLog(userObj.username, userObj.role, "IMAGE", "UPLOAD", data.data.questionId, "Uploaded new " + data.data.type + " image", "", fileUrl, "");
-
-                // 4. ส่ง URL กลับไปให้หน้าเว็บ
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'url': fileUrl
-                })).setMimeType(ContentService.MimeType.JSON);
-
-            } catch (err) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'Drive Upload Error: ' + err.message
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
+      if (action === 'deleteImage') {
+        var userObj = verifyUser(data);
+        if (!userObj) {
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Session หมดอายุ หรือไม่ได้รับอนุญาตให้เข้าถึง' })).setMimeType(ContentService.MimeType.JSON);
         }
 
-        if (action === 'deleteImage') {
-            var userObj = verifyUser(data);
-            if (!userObj) {
-                return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Session หมดอายุ หรือไม่ได้รับอนุญาตให้เข้าถึง' })).setMimeType(ContentService.MimeType.JSON);
+        try {
+          var fileUrl = data.data.url;
+          var currentQid = String(data.data.currentQid || "").trim();
+
+          var match = fileUrl.match(/id=([^&]+)/) || fileUrl.match(/\/d\/([^\/]+)/);
+          if (!match) throw new Error("ไม่สามารถระบุ ID ของไฟล์จาก URL นี้ได้");
+          var fileId = match[1];
+
+          var qSheet = doc.getSheetByName("Questions");
+          var qData = qSheet.getDataRange().getValues();
+          var otherUsages = [];
+
+          for (var i = 1; i < qData.length; i++) {
+            var qid = String(qData[i][0]).trim();
+            if (qid === currentQid) continue;
+
+            var imgCol = String(qData[i][2]);
+            var choiceCol = String(qData[i][3]);
+
+            if (imgCol.indexOf(fileId) !== -1 || choiceCol.indexOf(fileId) !== -1) {
+              otherUsages.push({ qid: qid, type: imgCol.indexOf(fileId) !== -1 ? 'Main' : 'Choice' });
             }
+          }
 
-            try {
-                var fileUrl = data.data.url;
-                var currentQid = String(data.data.currentQid || "").trim(); 
-                
-                // 1. สกัด ID ไฟล์ (ปรับ Regex ให้ครอบคลุม)
-                var match = fileUrl.match(/id=([^&]+)/) || fileUrl.match(/\/d\/([^\/]+)/);
-                if (!match) throw new Error("ไม่สามารถระบุ ID ของไฟล์จาก URL นี้ได้");
-                var fileId = match[1];
+          if (otherUsages.length > 0) {
+            var nextOwner = otherUsages[0];
+            var file = DriveApp.getFileById(fileId);
+            var timestamp = new Date().getTime();
+            var originalName = file.getName();
+            var ext = originalName.substring(originalName.lastIndexOf('.')) || ".png";
+            var newName = "Q_" + nextOwner.qid + "_" + nextOwner.type + "_" + timestamp + ext;
+            file.setName(newName);
 
-                // 2. ตรวจสอบการใช้งานในข้ออื่น
-                var qSheet = doc.getSheetByName("Questions");
-                var qData = qSheet.getDataRange().getValues();
-                var otherUsages = []; 
-                
-                for(var i=1; i<qData.length; i++) {
-                    var qid = String(qData[i][0]).trim();
-                    if (qid === currentQid) continue; // ข้ามข้อตัวเอง
+            writeAdminLog(userObj.username, userObj.role, "IMAGE", "TRANSFER", fileId, "ภาพยังถูกใช้โดยข้อ " + nextOwner.qid + " จึงแค่เปลี่ยนชื่อไฟล์", "", "", "");
 
-                    var imgCol = String(qData[i][2]);
-                    var choiceCol = String(qData[i][3]);
+            return ContentService.createTextOutput(JSON.stringify({
+              'result': 'success', 'message': 'ปลดลิงก์สำเร็จ (ไฟล์ยังคงอยู่เพราะข้อ ' + nextOwner.qid + ' ใช้งานอยู่)'
+            })).setMimeType(ContentService.MimeType.JSON);
 
-                    if(imgCol.indexOf(fileId) !== -1 || choiceCol.indexOf(fileId) !== -1) {
-                        otherUsages.push({ qid: qid, type: imgCol.indexOf(fileId) !== -1 ? 'Main' : 'Choice' });
-                    }
-                }
+          } else {
+            var resultMessage = deleteImageToRecycleBin(fileUrl, userObj.username);
+            writeAdminLog(userObj.username, userObj.role, "IMAGE", "DELETE", fileId, "ย้ายรูปลง Recycle Bin", "", "TRASHED", "");
 
-                // 3. จัดการใน Drive
-                if (otherUsages.length > 0) {
-                    // กรณีมีคนอื่นใช้: แค่เปลี่ยนชื่อเพื่อโอนกรรมสิทธิ์
-                    var nextOwner = otherUsages[0];
-                    var file = DriveApp.getFileById(fileId);
-                    var timestamp = new Date().getTime();
-                    var originalName = file.getName();
-                    var ext = originalName.substring(originalName.lastIndexOf('.')) || ".png";
-                    var newName = "Q_" + nextOwner.qid + "_" + nextOwner.type + "_" + timestamp + ext;
-                    file.setName(newName);
+            return ContentService.createTextOutput(JSON.stringify({
+              'result': 'success', 'message': resultMessage
+            })).setMimeType(ContentService.MimeType.JSON);
+          }
 
-                    writeAdminLog(userObj.username, userObj.role, "IMAGE", "TRANSFER", fileId, "ภาพยังถูกใช้โดยข้อ " + nextOwner.qid + " จึงแค่เปลี่ยนชื่อไฟล์", "", "", "");
-
-                    return ContentService.createTextOutput(JSON.stringify({
-                        'result': 'success', 'message': 'ปลดลิงก์สำเร็จ (ไฟล์ยังคงอยู่เพราะข้อ ' + nextOwner.qid + ' ใช้งานอยู่)'
-                    })).setMimeType(ContentService.MimeType.JSON);
-
-                } else {
-                    // กรณีไม่มีคนใช้: ย้ายลง Recycle Bin
-                    // 🔥 ตรวจสอบฟังก์ชันด้านล่างนี้ว่ามีอยู่จริงและทำงานได้
-                    var resultMessage = deleteImageToRecycleBin(fileUrl, userObj.username);
-                    
-                    writeAdminLog(userObj.username, userObj.role, "IMAGE", "DELETE", fileId, "ย้ายรูปลง Recycle Bin", "", "TRASHED", "");
-
-                    return ContentService.createTextOutput(JSON.stringify({
-                        'result': 'success', 'message': resultMessage
-                    })).setMimeType(ContentService.MimeType.JSON);
-                }
-
-            } catch (err) {
-                return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ลบรูปภาพขัดข้อง: ' + err.message })).setMimeType(ContentService.MimeType.JSON);
-            }
+        } catch (err) {
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ลบรูปภาพขัดข้อง: ' + err.message })).setMimeType(ContentService.MimeType.JSON);
         }
+      }
 
-        if (action === 'restoreImage') {
-            // 1. ตรวจสอบสิทธิ์
-            var userObj = verifyUser(data.username, data.adminPass);
-            if (!userObj) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'Session หมดอายุ หรือสิทธิ์ไม่ถูกต้อง กรุณาล็อกอินใหม่'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            try {
-                // 2. เรียกใช้ฟังก์ชันกู้คืนรูปภาพ
-                var fileUrl = data.data.url;
-                var resultMessage = restoreImageFromRecycleBin(fileUrl);
-                
-                // 3. บันทึก Log
-                writeAdminLog(userObj.username, userObj.role, "IMAGE", "RESTORE", fileUrl, "Restored image from Recycle Bin", "TRASHED", "RESTORED", "");
-
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'url': fileUrl,
-                    'message': resultMessage
-                })).setMimeType(ContentService.MimeType.JSON);
-
-            } catch (err) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'ไม่สามารถกู้คืนรูปภาพได้ (อาจจะไม่มีอยู่ในถังขยะแล้ว): ' + err.message
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-        }
-
-        // ==========================================
-        // ACTION: AI Assistant
-        // ==========================================
-        if (action === 'askAIExpert') {
-            // 1. ตรวจสอบสิทธิ์แอดมิน (Security Check)
-            var userObj = null;
-            if (data.sessionToken) {
-                userObj = verifySessionToken(data.sessionToken);
-            } else if (data.googleIdToken) {
-                var payload = verifyGoogleToken(data.googleIdToken);
-                if (payload) {
-                    userObj = findAdminByEmail(payload.email);
-                    if (!userObj) {
-                        console.warn("[AUTH] askAIExpert failed: Email '" + payload.email + "' is verified but not found in Admins whitelist sheet.");
-                    }
-                } else {
-                    console.error("[AUTH] askAIExpert failed: Token verification returned null.");
-                }
-            } else {
-                console.warn("[AUTH] askAIExpert failed: No sessionToken or googleIdToken provided in request payload.");
-                userObj = verifyAdmin(data.username, data.adminPass);
-            }
-
-            if (!userObj) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error', 
-                    'message': 'Session หมดอายุ กรุณาล็อกอินใหม่'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            // 2. หา API Key ที่ว่างอยู่
-            var provider = data.provider || "Gemini";
-            var apiKeyInfo = getAvailableAIKey(provider);
-            
-            if (!apiKeyInfo) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error', 'message': 'ขณะนี้ไม่มี API Key ที่พร้อมใช้งาน (โควต้าเต็มทุก Key หรือยังไม่ได้ตั้งค่า)'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            // 3. เรียกใช้งาน AI พร้อมส่งรูปภาพประกอบ (ถ้ามี)
-            try {
-                var aiResponse = callGeminiAI(data.prompt, apiKeyInfo, data.images);
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success', 
-                    'answer': aiResponse,
-                    'quota': (apiKeyInfo.usage + 1) + "/" + apiKeyInfo.limit
-                })).setMimeType(ContentService.MimeType.JSON);
-            } catch (err) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error', 'message': err.message
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-        }
-
-        // 5. ADMIN ACTIONS
-        var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement'];
-        if (adminActions.indexOf(action) > -1) {
-            var userObj = null;
-            if (data.sessionToken) {
-                userObj = verifySessionToken(data.sessionToken);
-            } else if (data.googleIdToken) {
-                var payload = verifyGoogleToken(data.googleIdToken);
-                if (payload) userObj = findAdminByEmail(payload.email);
-            } else {
-                userObj = verifyAdmin(data.username, data.adminPass);
-            }
-            
-            if (!userObj) {
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'error',
-                    'message': 'token_expired'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            var user = userObj.displayName || "Unknown Admin";
-            var userRole = userObj.role || "Admin";
-            var metadata = data.metadata || "";
-
-            var sheet;
-
-            // --- ADD ANNOUNCEMENT ---
-            if (action === 'addAnnouncement') {
-                sheet = doc.getSheetByName("Announcements");
-                sheet.appendRow([
-                    data.data.Id,
-                    data.data.Text,
-                    data.data.Type,
-                    data.data.Active,
-                    data.data.Order
-                ]);
-                updateVersion();
-                writeAdminLog(user, userRole, "ANNOUNCEMENT", "ADD", data.data.Id, "Added Announcement", "", data.data.Text, metadata);
-                return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            // --- EDIT ANNOUNCEMENT ---
-            if (action === 'editAnnouncement') {
-                sheet = doc.getSheetByName("Announcements");
-                var rows = sheet.getDataRange().getValues();
-                for (var i = 1; i < rows.length; i++) {
-                    if (rows[i][0] == data.data.Id) {
-                        var oldText = rows[i][1];
-                        sheet.getRange(i + 1, 2, 1, 4).setValues([[
-                            data.data.Text,
-                            data.data.Type,
-                            data.data.Active,
-                            data.data.Order
-                        ]]);
-                        updateVersion();
-                        writeAdminLog(user, userRole, "ANNOUNCEMENT", "EDIT", data.data.Id, "Updated Announcement", oldText, data.data.Text, metadata);
-                        return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-                    }
-                }
-            }
-
-            // --- DELETE ANNOUNCEMENT ---
-            if (action === 'deleteAnnouncement') {
-                sheet = doc.getSheetByName("Announcements");
-                var rows = sheet.getDataRange().getValues();
-                for (var i = 1; i < rows.length; i++) {
-                    if (rows[i][0] == data.data.Id) {
-                        var oldText = rows[i][1];
-                        sheet.deleteRow(i + 1);
-                        updateVersion();
-                        writeAdminLog(user, userRole, "ANNOUNCEMENT", "DELETE", data.data.Id, "Deleted Announcement", oldText, "DELETED", metadata);
-                        return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-                    }
-                }
-            }
-            
-            // --- EDIT QUESTION ---
-            if (action === 'editQuestion') {
-                sheet = doc.getSheetByName("Questions");
-                var rows = sheet.getDataRange().getValues();
-                var headers = rows[0]; // เก็บ Header ไว้ map ข้อมูลเก่า
-                
-                for (var i = 1; i < rows.length; i++) {
-                    if (rows[i][0] == data.data.id) {
-                        // 1. Capture Old Data
-                        var oldRowData = {};
-                        for(var k=0; k<headers.length; k++){
-                           oldRowData[headers[k]] = rows[i][k];
-                        }
-
-                        // 2. Perform Update
-                        var catToSave = Array.isArray(data.data.category) ? JSON.stringify(data.data.category) : data.data.category;
-                        sheet.getRange(i + 1, 2, 1, 6).setValues([
-                            [data.data.problem, data.data.img, data.data.choices, data.data.answer, data.data.explain, catToSave]
-                        ]);
-
-                        try {
-  const catsForSplit = Array.isArray(data.data.category) ? data.data.category : JSON.parse(catToSave);
-  autoCreateSplitCategories(data.data.id, catsForSplit);
-} catch(e) { console.log("Split error in editQuestion: " + e); }
-
-                        updateVersion();
-
-                        // 3. Log
-                        writeAdminLog(user, userRole, "QUESTION", "EDIT", data.data.id, "Question Updated", oldRowData, data.data, metadata);
-
-                        return ContentService.createTextOutput(JSON.stringify({
-                            'result': 'success'
-                        })).setMimeType(ContentService.MimeType.JSON);
-                    }
-                }
-            }
-
-            // --- DELETE QUESTION ---
-            if (action === 'deleteQuestion') {
-                sheet = doc.getSheetByName("Questions");
-                var rows = sheet.getDataRange().getValues();
-                var headers = rows[0];
-
-                for (var i = 1; i < rows.length; i++) {
-                    if (rows[i][0] == data.data.id) {
-                        // 1. Capture Old Data
-                        var oldRowData = {};
-                        for(var k=0; k<headers.length; k++){
-                           oldRowData[headers[k]] = rows[i][k];
-                        }
-
-                        // 2. Perform Delete
-                        sheet.deleteRow(i + 1);
-
-                        updateVersion();
-
-                        // 3. Log
-                        writeAdminLog(user, userRole, "QUESTION", "DELETE", data.data.id, "Question Deleted", oldRowData, "DELETED", metadata);
-
-                        return ContentService.createTextOutput(JSON.stringify({
-                            'result': 'success'
-                        })).setMimeType(ContentService.MimeType.JSON);
-                    }
-                }
-            }
-
-if (action === 'adminImport') {
-    var sheetMap = {
-        'struct': 'Structure',
-        'category': 'Category',
-        'ques': 'Questions'
-    };
-
-    var payload = data.data; 
-    var realSheetName = sheetMap[payload.sheetName] || payload.sheetName;
-    var targetSheet = doc.getSheetByName(realSheetName);
-
-    if (!targetSheet) {
-        return ContentService.createTextOutput(JSON.stringify({
+      if (action === 'restoreImage') {
+        var userObj = verifyUser(data.username, data.adminPass);
+        if (!userObj) {
+          return ContentService.createTextOutput(JSON.stringify({
             'result': 'error',
-            'message': 'ไม่พบแผ่นงาน: ' + realSheetName
-        })).setMimeType(ContentService.MimeType.JSON);
-    }
+            'message': 'Session หมดอายุ หรือสิทธิ์ไม่ถูกต้อง กรุณาล็อกอินใหม่'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
 
-    var importData = payload.data;
-    if (!importData || importData.length === 0) {
-        return ContentService.createTextOutput(JSON.stringify({
+        try {
+          var fileUrl = data.data.url;
+          var resultMessage = restoreImageFromRecycleBin(fileUrl);
+          writeAdminLog(userObj.username, userObj.role, "IMAGE", "RESTORE", fileUrl, "Restored image from Recycle Bin", "TRASHED", "RESTORED", "");
+
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success',
+            'url': fileUrl,
+            'message': resultMessage
+          })).setMimeType(ContentService.MimeType.JSON);
+
+        } catch (err) {
+          return ContentService.createTextOutput(JSON.stringify({
             'result': 'error',
-            'message': 'ข้อมูลว่างเปล่า'
-        })).setMimeType(ContentService.MimeType.JSON);
-    }
+            'message': 'ไม่สามารถกู้คืนรูปภาพได้ (อาจจะไม่มีอยู่ในถังขยะแล้ว): ' + err.message
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
 
-    try {
-        var lastRow = targetSheet.getLastRow();
+      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement'];
+      if (adminActions.indexOf(action) > -1) {
+        var userObj = null;
+        if (data.sessionToken) {
+          userObj = verifySessionToken(data.sessionToken);
+        } else if (data.googleIdToken) {
+          var payload = verifyGoogleToken(data.googleIdToken);
+          if (payload) userObj = findAdminByEmail(payload.email);
+        } else {
+          userObj = verifyAdmin(data.username, data.adminPass);
+        }
 
-        if (realSheetName === 'Questions') {
-            // --- UPSERT: อัปเดตแถวที่มีอยู่, เพิ่มแถวใหม่ ---
-            var existing = lastRow > 1 ? targetSheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
-            var existingIds = existing.map(function(r) { return String(r[0]).trim(); });
+        if (!userObj) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'token_expired'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
 
-            var appended = 0, updated = 0;
-            var toAppend = [];
-            importData.forEach(function(row) {
+        var user = userObj.displayName || "Unknown Admin";
+        var userRole = userObj.role || "Admin";
+        var metadata = data.metadata || "";
+
+        var sheet;
+
+        if (action === 'addAnnouncement') {
+          sheet = doc.getSheetByName("Announcements");
+          sheet.appendRow([
+            data.data.Id,
+            data.data.Text,
+            data.data.Type,
+            data.data.Active,
+            data.data.Order
+          ]);
+          updateVersion();
+          writeAdminLog(user, userRole, "ANNOUNCEMENT", "ADD", data.data.Id, "Added Announcement", "", data.data.Text, metadata);
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'editAnnouncement') {
+          sheet = doc.getSheetByName("Announcements");
+          var rows = sheet.getDataRange().getValues();
+          for (var i = 1; i < rows.length; i++) {
+            if (rows[i][0] == data.data.Id) {
+              var oldText = rows[i][1];
+              sheet.getRange(i + 1, 2, 1, 4).setValues([[
+                data.data.Text,
+                data.data.Type,
+                data.data.Active,
+                data.data.Order
+              ]]);
+              updateVersion();
+              writeAdminLog(user, userRole, "ANNOUNCEMENT", "EDIT", data.data.Id, "Updated Announcement", oldText, data.data.Text, metadata);
+              return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+        }
+
+        if (action === 'deleteAnnouncement') {
+          sheet = doc.getSheetByName("Announcements");
+          var rows = sheet.getDataRange().getValues();
+          for (var i = 1; i < rows.length; i++) {
+            if (rows[i][0] == data.data.Id) {
+              var oldText = rows[i][1];
+              sheet.deleteRow(i + 1);
+              updateVersion();
+              writeAdminLog(user, userRole, "ANNOUNCEMENT", "DELETE", data.data.Id, "Deleted Announcement", oldText, "DELETED", metadata);
+              return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+        }
+
+        if (action === 'editQuestion') {
+          sheet = doc.getSheetByName("Questions");
+          var rows = sheet.getDataRange().getValues();
+          var headers = rows[0];
+
+          for (var i = 1; i < rows.length; i++) {
+            if (rows[i][0] == data.data.id) {
+              var oldRowData = {};
+              for (var k = 0; k < headers.length; k++) {
+                oldRowData[headers[k]] = rows[i][k];
+              }
+
+              var catToSave = Array.isArray(data.data.category) ? JSON.stringify(data.data.category) : data.data.category;
+              sheet.getRange(i + 1, 2, 1, 6).setValues([
+                [data.data.problem, data.data.img, data.data.choices, data.data.answer, data.data.explain, catToSave]
+              ]);
+
+              try {
+                const catsForSplit = Array.isArray(data.data.category) ? data.data.category : JSON.parse(catToSave);
+                autoCreateSplitCategories(data.data.id, catsForSplit);
+              } catch (e) { console.log("Split error in editQuestion: " + e); }
+
+              updateVersion();
+              writeAdminLog(user, userRole, "QUESTION", "EDIT", data.data.id, "Question Updated", oldRowData, data.data, metadata);
+
+              return ContentService.createTextOutput(JSON.stringify({
+                'result': 'success'
+              })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+        }
+
+        if (action === 'deleteQuestion') {
+          sheet = doc.getSheetByName("Questions");
+          var rows = sheet.getDataRange().getValues();
+          var headers = rows[0];
+
+          for (var i = 1; i < rows.length; i++) {
+            if (rows[i][0] == data.data.id) {
+              var oldRowData = {};
+              for (var k = 0; k < headers.length; k++) {
+                oldRowData[headers[k]] = rows[i][k];
+              }
+
+              sheet.deleteRow(i + 1);
+              updateVersion();
+              writeAdminLog(user, userRole, "QUESTION", "DELETE", data.data.id, "Question Deleted", oldRowData, "DELETED", metadata);
+
+              return ContentService.createTextOutput(JSON.stringify({
+                'result': 'success'
+              })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+        }
+
+        if (action === 'adminImport') {
+          var sheetMap = {
+            'struct': 'Structure',
+            'category': 'Category',
+            'ques': 'Questions'
+          };
+
+          var payload = data.data;
+          var realSheetName = sheetMap[payload.sheetName] || payload.sheetName;
+          var targetSheet = doc.getSheetByName(realSheetName);
+
+          if (!targetSheet) {
+            return ContentService.createTextOutput(JSON.stringify({
+              'result': 'error',
+              'message': 'ไม่พบแผ่นงาน: ' + realSheetName
+            })).setMimeType(ContentService.MimeType.JSON);
+          }
+
+          var importData = payload.data;
+          if (!importData || importData.length === 0) {
+            return ContentService.createTextOutput(JSON.stringify({
+              'result': 'error',
+              'message': 'ข้อมูลว่างเปล่า'
+            })).setMimeType(ContentService.MimeType.JSON);
+          }
+
+          try {
+            var lastRow = targetSheet.getLastRow();
+
+            if (realSheetName === 'Questions') {
+              var existing = lastRow > 1 ? targetSheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
+              var existingIds = existing.map(function (r) { return String(r[0]).trim(); });
+
+              var appended = 0, updated = 0;
+              var toAppend = [];
+              importData.forEach(function (row) {
                 var qId = String(row[0]).trim();
                 var idx = existingIds.indexOf(qId);
                 if (idx >= 0) {
-                    // sheet row = idx+2 (header is row 1, data starts at row 2)
-                    targetSheet.getRange(idx + 2, 1, 1, row.length).setValues([row]);
-                    updated++;
+                  targetSheet.getRange(idx + 2, 1, 1, row.length).setValues([row]);
+                  updated++;
                 } else {
-                    toAppend.push(row);
-                    existingIds.push(qId); // กันซ้ำภายใน batch เดียวกัน
+                  toAppend.push(row);
+                  existingIds.push(qId);
                 }
-            });
-            if (toAppend.length > 0) {
+              });
+              if (toAppend.length > 0) {
                 var newLastRow = targetSheet.getLastRow();
                 targetSheet.getRange(newLastRow + 1, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
                 appended = toAppend.length;
-            }
+              }
 
-            updateVersion();
-            writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName,
+              updateVersion();
+              writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName,
                 "Upserted Questions: " + appended + " added, " + updated + " updated", "",
                 "Added " + appended + ", Updated " + updated, metadata);
 
-            return ContentService.createTextOutput(JSON.stringify({
+              return ContentService.createTextOutput(JSON.stringify({
                 'result': 'success',
                 'count': appended + updated,
                 'added': appended,
                 'updated': updated,
                 'message': 'นำเข้าสำเร็จ: เพิ่ม ' + appended + ' แถว, อัปเดต ' + updated + ' แถว'
-            })).setMimeType(ContentService.MimeType.JSON);
+              })).setMimeType(ContentService.MimeType.JSON);
 
-        } else {
-            // --- SKIP-DUPLICATE สำหรับ Structure และ Category (เดิม) ---
-            var existingKeys = new Set();
-            if (lastRow > 0) {
+            } else {
+              var existingKeys = new Set();
+              if (lastRow > 0) {
                 var fullData = targetSheet.getDataRange().getValues();
                 for (var i = 0; i < fullData.length; i++) {
-                    if (realSheetName === 'Structure') {
-                        existingKeys.add(fullData[i][1] + "|" + fullData[i][3]);
-                    } else {
-                        existingKeys.add(String(fullData[i][0]));
-                    }
+                  if (realSheetName === 'Structure') {
+                    existingKeys.add(fullData[i][1] + "|" + fullData[i][3]);
+                  } else {
+                    existingKeys.add(String(fullData[i][0]));
+                  }
                 }
-            }
+              }
 
-            var finalData = importData.filter(function(row) {
+              var finalData = importData.filter(function (row) {
                 var key = realSheetName === 'Structure' ? row[1] + "|" + row[3] : String(row[0]);
                 return !existingKeys.has(key);
-            });
+              });
 
-            if (finalData.length > 0) {
+              if (finalData.length > 0) {
                 targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
                 updateVersion();
                 writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName, "Imported " + finalData.length + " new rows (Skipped " + (importData.length - finalData.length) + " duplicates)", "", "Added " + finalData.length + " rows", metadata);
 
                 return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'count': finalData.length,
-                    'skipped': importData.length - finalData.length,
-                    'message': 'นำเข้าสำเร็จ ' + finalData.length + ' แถว (ข้ามข้อมูลซ้ำ ' + (importData.length - finalData.length) + ' แถว)'
+                  'result': 'success',
+                  'count': finalData.length,
+                  'skipped': importData.length - finalData.length,
+                  'message': 'นำเข้าสำเร็จ ' + finalData.length + ' แถว (ข้ามข้อมูลซ้ำ ' + (importData.length - finalData.length) + ' แถว)'
                 })).setMimeType(ContentService.MimeType.JSON);
-            } else {
+              } else {
                 return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'count': 0,
-                    'skipped': importData.length,
-                    'message': 'ไม่มีข้อมูลใหม่ให้นำเข้า (ข้อมูลทั้งหมดมีอยู่แล้วในระบบ)'
+                  'result': 'success',
+                  'count': 0,
+                  'skipped': importData.length,
+                  'message': 'ไม่มีข้อมูลใหม่ให้นำเข้า (ข้อมูลทั้งหมดมีอยู่แล้วในระบบ)'
                 })).setMimeType(ContentService.MimeType.JSON);
+              }
             }
+          } catch (err) {
+            return ContentService.createTextOutput(JSON.stringify({
+              'result': 'error',
+              'message': 'GS Error: ' + err.toString()
+            })).setMimeType(ContentService.MimeType.JSON);
+          }
         }
-    } catch (err) {
-        return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'GS Error: ' + err.toString()
-        })).setMimeType(ContentService.MimeType.JSON);
-    }
-}
 
-            if (action === 'updateReportStatus') {
-    sheet = doc.getSheetByName("Report");
-    var rows = sheet.getDataRange().getValues();
-    for (var i = 1; i < rows.length; i++) {
-        var sTime = rows[i][8] instanceof Date ? rows[i][8].toISOString() : String(rows[i][8]);
-        
-        if (sTime === String(data.data.timestamp)) {
-            var oldStatus = rows[i][9];
-            
-            sheet.getRange(i + 1, 10, 1, 3).setValues([
+        if (action === 'updateReportStatus') {
+          sheet = doc.getSheetByName("Report");
+          var rows = sheet.getDataRange().getValues();
+          for (var i = 1; i < rows.length; i++) {
+            var sTime = rows[i][8] instanceof Date ? rows[i][8].toISOString() : String(rows[i][8]);
+
+            if (sTime === String(data.data.timestamp)) {
+              var oldStatus = rows[i][9];
+
+              sheet.getRange(i + 1, 10, 1, 3).setValues([
                 [data.data.status, data.data.adminNote, data.data.done]
-            ]);
+              ]);
 
-            updateVersion();
+              updateVersion();
+              writeAdminLog(user, userRole, "REPORT", "UPDATE", "Report_Row_" + (i + 1), "Updated Report Status", oldStatus, data.data.status, metadata);
 
-            writeAdminLog(user, userRole, "REPORT", "UPDATE", "Report_Row_" + (i+1), "Updated Report Status", oldStatus, data.data.status, metadata);
-
-            return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
-        }
-    }
-}
-
-            if (action === 'deleteCategory') {
-                var sheet = doc.getSheetByName("Category");
-                var rows = sheet.getDataRange().getValues();
-                for (var i = 1; i < rows.length; i++) {
-                    if (rows[i][0] == data.data.CategoryID) {
-                        var catNameOld = rows[i][3];
-                        sheet.deleteRow(i + 1);
-                        updateVersion();
-                        writeAdminLog(user, userRole, "CATEGORY", "DELETE", data.data.CategoryID, "Category Deleted", catNameOld, "DELETED", metadata);
-                        return ContentService.createTextOutput(JSON.stringify({
-                            'result': 'success'
-                        })).setMimeType(ContentService.MimeType.JSON);
-                    }
-                }
+              return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
             }
-            if (action === 'updateCategory') {
-                var sheet = doc.getSheetByName("Category");
-                var rows = sheet.getDataRange().getValues();
-                for (var i = 1; i < rows.length; i++) {
-                    if (rows[i][0] == data.data.CategoryID) {
-                        var oldName = rows[i][3];
-                        sheet.getRange(i + 1, 4).setValue(data.data.CategoryName); 
-                        updateVersion();
-                        writeAdminLog(user, userRole, "CATEGORY", "EDIT", data.data.CategoryID, "Renamed Category", oldName, data.data.CategoryName, metadata);
-                        return ContentService.createTextOutput(JSON.stringify({
-                            'result': 'success'
-                        })).setMimeType(ContentService.MimeType.JSON);
-                    }
-                }
-            }
-
-            // Accordion Group CRUD
-            if (action === 'deleteGroup') {
-                var sheet = doc.getSheetByName("Category");
-                var rows = sheet.getDataRange().getValues();
-                var deletedCount = 0;
-                for (var i = rows.length - 1; i >= 1; i--) {
-                    if (rows[i][1] == data.data.SubjectRef && rows[i][2] == data.data.AccordionGroup) {
-                        sheet.deleteRow(i + 1);
-                        deletedCount++;
-                    }
-                }
-                
-                var structSheet = doc.getSheetByName("Structure");
-                var sRows = structSheet.getDataRange().getValues();
-                for (var i = sRows.length - 1; i >= 1; i--) {
-                    if (sRows[i][1] == data.data.SubjectRef && sRows[i][3] == data.data.AccordionGroup) {
-                        structSheet.deleteRow(i + 1);
-                    }
-                }
-
-                updateVersion();
-                writeAdminLog(user, userRole, "GROUP", "DELETE", data.data.SubjectRef + "_" + data.data.AccordionGroup, "Deleted Group & " + deletedCount + " categories", "", "DELETED", metadata);
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-            
-            if (action === 'updateAccordionGroup') {
-                var oldGroup = data.data.OldAccordionGroup;
-                var newGroup = data.data.NewAccordionGroup;
-                var subjectId = data.data.SubjectRef;
-                var updatedCount = 0;
-
-                var catSheet = doc.getSheetByName("Category");
-                var cRows = catSheet.getDataRange().getValues();
-                for (var i = 1; i < cRows.length; i++) {
-                    if (cRows[i][1] == subjectId && cRows[i][2] == oldGroup) {
-                        catSheet.getRange(i + 1, 3).setValue(newGroup); 
-                        updatedCount++;
-                    }
-                }
-                
-                var structSheet = doc.getSheetByName("Structure");
-                var sRows = structSheet.getDataRange().getValues();
-                for (var i = 1; i < sRows.length; i++) {
-                    if (sRows[i][1] == subjectId && sRows[i][3] == oldGroup) {
-                        structSheet.getRange(i + 1, 4).setValue(newGroup); 
-                    }
-                }
-                
-                updateVersion();
-                writeAdminLog(user, userRole, "GROUP", "EDIT", subjectId + "_" + oldGroup, "Renamed Group", oldGroup, newGroup, metadata);
-                return ContentService.createTextOutput(JSON.stringify({
-                    'result': 'success',
-                    'message': 'Updated ' + updatedCount + ' categories'
-                })).setMimeType(ContentService.MimeType.JSON);
-            }
-            
-            if (action === 'addSubject') {
-                sheet = doc.getSheetByName("Structure");
-                sheet.appendRow([data.data.Year, data.data.SubjectID, data.data.SubjectName, "GENERAL"]);
-                updateVersion();
-                writeAdminLog(user, userRole, "SUBJECT", "ADD", data.data.SubjectID, "Added Subject", "", data.data.SubjectName, metadata);
-                return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            if (action === 'updateSubject') {
-                sheet = doc.getSheetByName("Structure");
-                var rows = sheet.getDataRange().getValues();
-                for (var i = 1; i < rows.length; i++) {
-                    if (rows[i][1] == data.data.SubjectID) {
-                        var oldName = rows[i][2];
-                        sheet.getRange(i + 1, 1).setValue(data.data.Year);
-                        sheet.getRange(i + 1, 3).setValue(data.data.SubjectName);
-                        updateVersion();
-                        writeAdminLog(user, userRole, "SUBJECT", "EDIT", data.data.SubjectID, "Updated Subject Info", oldName, data.data.SubjectName, metadata);
-                        return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-                    }
-                }
-            }
-
-            if (action === 'deleteSubject') {
-                var subjectId = data.data.SubjectID;
-                var structSheet = doc.getSheetByName("Structure");
-                var sRows = structSheet.getDataRange().getValues();
-                for (var i = sRows.length - 1; i >= 1; i--) {
-                    if (sRows[i][1] == subjectId) structSheet.deleteRow(i + 1);
-                }
-                var catSheet = doc.getSheetByName("Category");
-                var cRows = catSheet.getDataRange().getValues();
-                for (var i = cRows.length - 1; i >= 1; i--) {
-                    if (cRows[i][1] == subjectId) catSheet.deleteRow(i + 1);
-                }
-                updateVersion();
-                writeAdminLog(user, userRole, "SUBJECT", "DELETE", subjectId, "Deleted Subject & Related Data", "", "DELETED", metadata);
-                return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-            }
-
-            if (action === 'addCategory') {
-                sheet = doc.getSheetByName("Category");
-                sheet.appendRow([data.data.CategoryID, data.data.SubjectRef, data.data.AccordionGroup, data.data.CategoryName]);
-                
-                var structSheet = doc.getSheetByName("Structure");
-                var sRows = structSheet.getDataRange().getValues();
-                var groupExists = false;
-                for (var i = 1; i < sRows.length; i++) {
-                    if (sRows[i][1] == data.data.SubjectRef && sRows[i][3] == data.data.AccordionGroup) {
-                        groupExists = true;
-                        break;
-                    }
-                }
-                
-                if (!groupExists) {
-                    var year = "";
-                    var subjectName = "";
-                    for (var i = 1; i < sRows.length; i++) {
-                        if (sRows[i][1] == data.data.SubjectRef) {
-                            year = sRows[i][0];
-                            subjectName = sRows[i][2];
-                            break;
-                        }
-                    }
-                    if (subjectName) {
-                        structSheet.appendRow([year, data.data.SubjectRef, subjectName, data.data.AccordionGroup]);
-                    }
-                }
-                
-                updateVersion();
-                sortCategorySheet();
-                writeAdminLog(user, userRole, "CATEGORY", "ADD", data.data.CategoryID, "Added Category", "", data.data.CategoryName, metadata);
-                return ContentService.createTextOutput(JSON.stringify({'result': 'success'})).setMimeType(ContentService.MimeType.JSON);
-            }
+          }
         }
 
-        return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'Action "' + action + '" not found or logic failed'
-        })).setMimeType(ContentService.MimeType.JSON);
+        if (action === 'deleteCategory') {
+          var sheet = doc.getSheetByName("Category");
+          var rows = sheet.getDataRange().getValues();
+          for (var i = 1; i < rows.length; i++) {
+            if (rows[i][0] == data.data.CategoryID) {
+              var catNameOld = rows[i][3];
+              sheet.deleteRow(i + 1);
+              updateVersion();
+              writeAdminLog(user, userRole, "CATEGORY", "DELETE", data.data.CategoryID, "Category Deleted", catNameOld, "DELETED", metadata);
+              return ContentService.createTextOutput(JSON.stringify({
+                'result': 'success'
+              })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+        }
 
-    } catch (e) {
-        return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': e.toString()
-        })).setMimeType(ContentService.MimeType.JSON);
+        if (action === 'updateCategory') {
+          var sheet = doc.getSheetByName("Category");
+          var rows = sheet.getDataRange().getValues();
+          for (var i = 1; i < rows.length; i++) {
+            if (rows[i][0] == data.data.CategoryID) {
+              var oldName = rows[i][3];
+              sheet.getRange(i + 1, 4).setValue(data.data.CategoryName);
+              updateVersion();
+              writeAdminLog(user, userRole, "CATEGORY", "EDIT", data.data.CategoryID, "Renamed Category", oldName, data.data.CategoryName, metadata);
+              return ContentService.createTextOutput(JSON.stringify({
+                'result': 'success'
+              })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+        }
+
+        if (action === 'deleteGroup') {
+          var sheet = doc.getSheetByName("Category");
+          var rows = sheet.getDataRange().getValues();
+          var deletedCount = 0;
+          for (var i = rows.length - 1; i >= 1; i--) {
+            if (rows[i][1] == data.data.SubjectRef && rows[i][2] == data.data.AccordionGroup) {
+              sheet.deleteRow(i + 1);
+              deletedCount++;
+            }
+          }
+
+          var structSheet = doc.getSheetByName("Structure");
+          var sRows = structSheet.getDataRange().getValues();
+          for (var i = sRows.length - 1; i >= 1; i--) {
+            if (sRows[i][1] == data.data.SubjectRef && sRows[i][3] == data.data.AccordionGroup) {
+              structSheet.deleteRow(i + 1);
+            }
+          }
+
+          updateVersion();
+          writeAdminLog(user, userRole, "GROUP", "DELETE", data.data.SubjectRef + "_" + data.data.AccordionGroup, "Deleted Group & " + deletedCount + " categories", "", "DELETED", metadata);
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'updateAccordionGroup') {
+          var oldGroup = data.data.OldAccordionGroup;
+          var newGroup = data.data.NewAccordionGroup;
+          var subjectId = data.data.SubjectRef;
+          var updatedCount = 0;
+
+          var catSheet = doc.getSheetByName("Category");
+          var cRows = catSheet.getDataRange().getValues();
+          for (var i = 1; i < cRows.length; i++) {
+            if (cRows[i][1] == subjectId && cRows[i][2] == oldGroup) {
+              catSheet.getRange(i + 1, 3).setValue(newGroup);
+              updatedCount++;
+            }
+          }
+
+          var structSheet = doc.getSheetByName("Structure");
+          var sRows = structSheet.getDataRange().getValues();
+          for (var i = 1; i < sRows.length; i++) {
+            if (sRows[i][1] == subjectId && sRows[i][3] == oldGroup) {
+              structSheet.getRange(i + 1, 4).setValue(newGroup);
+            }
+          }
+
+          updateVersion();
+          writeAdminLog(user, userRole, "GROUP", "EDIT", subjectId + "_" + oldGroup, "Renamed Group", oldGroup, newGroup, metadata);
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success',
+            'message': 'Updated ' + updatedCount + ' categories'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'addSubject') {
+          sheet = doc.getSheetByName("Structure");
+          sheet.appendRow([data.data.Year, data.data.SubjectID, data.data.SubjectName, "GENERAL"]);
+          updateVersion();
+          writeAdminLog(user, userRole, "SUBJECT", "ADD", data.data.SubjectID, "Added Subject", "", data.data.SubjectName, metadata);
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'updateSubject') {
+          sheet = doc.getSheetByName("Structure");
+          var rows = sheet.getDataRange().getValues();
+          for (var i = 1; i < rows.length; i++) {
+            if (rows[i][1] == data.data.SubjectID) {
+              var oldName = rows[i][2];
+              sheet.getRange(i + 1, 1).setValue(data.data.Year);
+              sheet.getRange(i + 1, 3).setValue(data.data.SubjectName);
+              updateVersion();
+              writeAdminLog(user, userRole, "SUBJECT", "EDIT", data.data.SubjectID, "Updated Subject Info", oldName, data.data.SubjectName, metadata);
+              return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+            }
+          }
+        }
+
+        if (action === 'deleteSubject') {
+          var subjectId = data.data.SubjectID;
+          var structSheet = doc.getSheetByName("Structure");
+          var sRows = structSheet.getDataRange().getValues();
+          for (var i = sRows.length - 1; i >= 1; i--) {
+            if (sRows[i][1] == subjectId) structSheet.deleteRow(i + 1);
+          }
+          var catSheet = doc.getSheetByName("Category");
+          var cRows = catSheet.getDataRange().getValues();
+          for (var i = cRows.length - 1; i >= 1; i--) {
+            if (cRows[i][1] == subjectId) catSheet.deleteRow(i + 1);
+          }
+          updateVersion();
+          writeAdminLog(user, userRole, "SUBJECT", "DELETE", subjectId, "Deleted Subject & Related Data", "", "DELETED", metadata);
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'addCategory') {
+          sheet = doc.getSheetByName("Category");
+          sheet.appendRow([data.data.CategoryID, data.data.SubjectRef, data.data.AccordionGroup, data.data.CategoryName]);
+
+          var structSheet = doc.getSheetByName("Structure");
+          var sRows = structSheet.getDataRange().getValues();
+          var groupExists = false;
+          for (var i = 1; i < sRows.length; i++) {
+            if (sRows[i][1] == data.data.SubjectRef && sRows[i][3] == data.data.AccordionGroup) {
+              groupExists = true;
+              break;
+            }
+          }
+
+          if (!groupExists) {
+            var year = "";
+            var subjectName = "";
+            for (var i = 1; i < sRows.length; i++) {
+              if (sRows[i][1] == data.data.SubjectRef) {
+                year = sRows[i][0];
+                subjectName = sRows[i][2];
+                break;
+              }
+            }
+            if (subjectName) {
+              structSheet.appendRow([year, data.data.SubjectRef, subjectName, data.data.AccordionGroup]);
+            }
+          }
+
+          updateVersion();
+          sortCategorySheet();
+          writeAdminLog(user, userRole, "CATEGORY", "ADD", data.data.CategoryID, "Added Category", "", data.data.CategoryName, metadata);
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        'result': 'error',
+        'message': 'Action "' + action + '" not found or logic failed'
+      })).setMimeType(ContentService.MimeType.JSON);
     } finally {
-        lock.releaseLock();
+      adminLock.releaseLock();
     }
+
+  } catch (e) {
+    return ContentService.createTextOutput(JSON.stringify({
+      'result': 'error',
+      'message': e.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
 }
 
 /* 
