@@ -109,15 +109,15 @@ function getQuestionsDataCached(filterSubject, ss) {
   var v = getVersionCached();
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";
   var cacheKey = "questions_" + v + "_" + cleanFilter;
-  
+
   var cachedStr = getLargeCache(cacheKey);
   if (cachedStr != null) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
-  
+
   var response = getQuestionsData(filterSubject, ss);
   var responseStr = response.getContent();
-  putLargeCache(cacheKey, responseStr, 300); // 5 minutes
+  putLargeCache(cacheKey, responseStr, 1800); // ขยาย Cache เป็น 30 นาที เนื่องจากคีย์ผูกกับเวอร์ชันอยู่แล้ว (เมื่อมีข้อมูลใหม่แคชจะรีเซ็ตอัตโนมัติ)
   return response;
 }
 
@@ -369,22 +369,28 @@ function getOrCreateAnnouncementsSheet(ss) {
 }
 
 function doGet(e) {
-    var action = e.parameter.action;
+  var action = e.parameter.action;
+  var clientVer = e.parameter.clientVer;
+  var serverVer = getVersionCached();
 
-    if (action == 'checkVersion') {
-        var v = getVersionCached();
-        return ContentService.createTextOutput(JSON.stringify({v: v})).setMimeType(ContentService.MimeType.JSON);
-    }
-    if (action == 'getStructure') return getStructureDataCached(e.parameter.subject);
-    if (action == 'getQuestions') return getQuestionsDataCached(e.parameter.subject);
-    if (action == 'getPendingVotes') return getPendingVotesData(e.parameter.qid);
-    if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid);
-    if (action == 'getAllData') return getAllDataForAdminCached();
-    if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject);
-    if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject);
+  // คืนค่าสถานะ NOT_MODIFIED ทันทีเพื่อประหยัด Round-trip หากเวอร์ชันของไคลเอนต์ล่าสุดตรงกับเซิร์ฟเวอร์ (ช่วยประหยัดโหลดและลดการสปินอัพคอนเทนเนอร์)
+  if (clientVer && clientVer === serverVer) {
+    return ContentService.createTextOutput(JSON.stringify({ status: 'NOT_MODIFIED', v: serverVer })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action == 'checkVersion') {
+    return ContentService.createTextOutput(JSON.stringify({ v: serverVer })).setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action == 'getStructure') return getStructureDataCached(e.parameter.subject);
+  if (action == 'getQuestions') return getQuestionsDataCached(e.parameter.subject);
+  if (action == 'getPendingVotes') return getPendingVotesData(e.parameter.qid);
+  if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid);
+  if (action == 'getAllData') return getAllDataForAdminCached();
+  if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject);
+  if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject);
 
 
-    return ContentService.createTextOutput("Action not defined").setMimeType(ContentService.MimeType.TEXT);
+  return ContentService.createTextOutput("Action not defined").setMimeType(ContentService.MimeType.TEXT);
 }
 
 function getAdminsList() {
@@ -392,31 +398,32 @@ function getAdminsList() {
 }
 
 function getAllDataForAdmin() {
-    var ss = SpreadsheetApp.openById(SHEET_ID);
-    
-    // ดึงข้อมูล Admins แบบเร็ว
-    var adminsRaw = getSheetDataJSON('Admins', ss);
-    var adminsSafe = adminsRaw.map(function(admin) {
-        var safeAdmin = {};
-        for (var key in admin) {
-            if (key !== 'Password') safeAdmin[key] = admin[key];
-        }
-        return safeAdmin;
-    });
+  var ss = SpreadsheetApp.openById(SHEET_ID);
 
-    getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
+  // ดึงข้อมูล Admins แบบเร็ว
+  var adminsRaw = getSheetDataJSON('Admins', ss);
+  var adminsSafe = adminsRaw.map(function (admin) {
+    var safeAdmin = {};
+    for (var key in admin) {
+      if (key !== 'Password') safeAdmin[key] = admin[key];
+    }
+    return safeAdmin;
+  });
 
-    var data = {
-        questions: JSON.parse(getQuestionsData('', ss).getContent()), // ส่ง ss เข้าไปด้วย
-        structure: getSheetDataJSON('Structure', ss),
-        category: getSheetDataJSON('Category', ss),
-        report: getSheetDataJSON('Report', ss),
-        votes: getSheetDataJSON('Votes', ss),
-        logs: getSheetDataJSON('Logs', ss),
-        admins: adminsSafe,
-        announcements: getSheetDataJSON('Announcements', ss)
-    };
-    return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
+  getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
+
+  var data = {
+    v: getVersionCached(), // แทรกเวอร์ชันปัจจุบันเพื่อให้ฝั่งไคลเอนต์ใช้ซิงค์ในรอบเดี่ยวได้โดยไม่ต้องยิง checkVersion แยก
+    questions: JSON.parse(getQuestionsData('', ss).getContent()), // ส่ง ss เข้าไปด้วย
+    structure: getSheetDataJSON('Structure', ss),
+    category: getSheetDataJSON('Category', ss),
+    report: getSheetDataJSON('Report', ss),
+    votes: getSheetDataJSON('Votes', ss),
+    logs: getSheetDataJSON('Logs', ss),
+    admins: adminsSafe,
+    announcements: getSheetDataJSON('Announcements', ss)
+  };
+  return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
 }
 
 function getSheetDataJSON(sheetName, ss) {
