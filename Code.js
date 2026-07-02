@@ -1,7 +1,7 @@
 var SHEET_ID = '12rN8vcykEwgcPFK4LoOj18PEhj7JPhwMfz6uUkKrhJU';
 var DRIVE_FOLDER_ID = '1nzLH2ia2lL2TMxfrr6Kv-5fhsWwOWSCm'; 
 
-var VOTE_THRESHOLD_CONFIRM = 1;
+var VOTE_THRESHOLD_CONFIRM = 20;
 
 var REPORT_VOTE_THRESHOLD = 5;
 
@@ -318,7 +318,11 @@ function verifySessionToken(token) {
         sheet.deleteRow(i + 1);
         return null;
       }
-      sheet.getRange(i + 1, 5).setValue(now.toISOString());
+      // T2.6: เขียน LastUsed เฉพาะเมื่อค่าเดิมเก่ากว่า 1 ชั่วโมง (ลด Sheets write ทุก request ของแอดมิน)
+      var lastUsed = data[i][4] ? new Date(data[i][4]) : null;
+      if (!lastUsed || isNaN(lastUsed.getTime()) || (now.getTime() - lastUsed.getTime()) > 3600000) {
+        sheet.getRange(i + 1, 5).setValue(now.toISOString());
+      }
       return findAdminByEmail(data[i][1]);
     }
   }
@@ -385,7 +389,9 @@ function doGet(e) {
   if (action == 'getQuestions') return getQuestionsDataCached(e.parameter.subject);
   if (action == 'getPendingVotes') return getPendingVotesData(e.parameter.qid);
   if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid);
+  if (action == 'getPendingVotesReports') return getPendingVotesReportsData(e.parameter.subject);
   if (action == 'getAllData') return getAllDataForAdminCached();
+  if (action == 'getLogsPage') return getLogsPageData(e.parameter.offset, e.parameter.limit);
   if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject);
   if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject);
 
@@ -419,7 +425,7 @@ function getAllDataForAdmin() {
     category: getSheetDataJSON('Category', ss),
     report: getSheetDataJSON('Report', ss),
     votes: getSheetDataJSON('Votes', ss),
-    logs: getSheetDataJSON('Logs', ss),
+    logs: getLogsTailJSON(ss, 300), // จำกัดเฉพาะ 300 แถวล่าสุด (Logs โตไม่จำกัด) — โหลดเต็มผ่าน action=getLogsPage
     admins: adminsSafe,
     announcements: getSheetDataJSON('Announcements', ss)
   };
@@ -446,6 +452,85 @@ function getSheetDataJSON(sheetName, ss) {
         result.push(obj);
     }
     return result;
+}
+
+// อ่านเฉพาะ Log ท้ายสุด (tail) จำนวน limit แถว โดยไม่อ่านทั้งชีต (ป้องกัน Logs ที่โตไม่จำกัด)
+// คืนค่า object array แบบเดียวกับ getSheetDataJSON('Logs') เรียงจากเก่า→ใหม่ ตามลำดับในชีต
+function getLogsTailJSON(ss, limit) {
+    if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName('Logs');
+    if (!sheet) return [];
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return [];
+
+    var numCols = sheet.getLastColumn();
+    var headers = sheet.getRange(1, 1, 1, numCols).getValues()[0];
+
+    var maxRows = limit || 300;
+    var numRows = Math.min(maxRows, lastRow - 1);
+    var startRow = lastRow - numRows + 1;
+
+    var data = sheet.getRange(startRow, 1, numRows, numCols).getValues();
+    var result = [];
+    for (var i = 0; i < data.length; i++) {
+        var obj = {};
+        for (var j = 0; j < headers.length; j++) {
+            var value = data[i][j];
+            obj[headers[j]] = (value instanceof Date) ? value.toISOString() : value;
+        }
+        result.push(obj);
+    }
+    return result;
+}
+
+// Server-side pagination ของชีต Logs สำหรับหน้า "ประวัติทั้งหมด" ในแดชบอร์ดแอดมิน
+// offset นับจากแถวใหม่สุด (offset=0 = ชุดล่าสุด), limit = จำนวนแถวต่อหน้า (ค่าเริ่มต้น 300)
+// คืนค่า logs เป็น object array รูปแบบเดียวกับ entry ใน getAllDataForAdmin().logs
+function getLogsPageData(offsetStr, limitStr) {
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName('Logs');
+    if (!sheet) {
+        return ContentService.createTextOutput(JSON.stringify({ status: 'success', logs: [], total: 0, offset: 0, limit: 0 })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var lastRow = sheet.getLastRow();
+    var total = lastRow > 1 ? lastRow - 1 : 0;
+
+    var offset = parseInt(offsetStr) || 0;
+    if (offset < 0) offset = 0;
+    var limit = parseInt(limitStr) || 300;
+    if (limit < 1) limit = 300;
+
+    if (total === 0 || offset >= total) {
+        return ContentService.createTextOutput(JSON.stringify({ status: 'success', logs: [], total: total, offset: offset, limit: limit })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var numCols = sheet.getLastColumn();
+    var headers = sheet.getRange(1, 1, 1, numCols).getValues()[0];
+
+    // แถวใหม่สุดอยู่ล่างสุด (lastRow). ข้าม offset แถวใหม่สุด แล้วดึงถัดไป limit แถว
+    var numRows = Math.min(limit, total - offset);
+    var startRow = lastRow - offset - numRows + 1;
+
+    var data = sheet.getRange(startRow, 1, numRows, numCols).getValues();
+    var result = [];
+    for (var i = 0; i < data.length; i++) {
+        var obj = {};
+        for (var j = 0; j < headers.length; j++) {
+            var value = data[i][j];
+            obj[headers[j]] = (value instanceof Date) ? value.toISOString() : value;
+        }
+        result.push(obj);
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({
+        status: 'success',
+        logs: result,
+        total: total,
+        offset: offset,
+        limit: limit
+    })).setMimeType(ContentService.MimeType.JSON);
 }
 
 function getPendingVotesData(qid) {
@@ -513,6 +598,97 @@ function getPendingReportsData(qid) {
   var responseObj = { reports: result, threshold: REPORT_VOTE_THRESHOLD };
   var responseStr = JSON.stringify(responseObj);
   putLargeCache(cacheKey, responseStr, 300); // Cache for 5 minutes
+  return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
+}
+
+// T1.1: Bulk endpoint — คืน pending votes + reports ของทุกข้อในวิชาเดียว (sparse map ตาม qid)
+// แคชทั้งก้อนต่อวิชาโดยผูกกับ votes-version key (โหวต/รายงาน 1 ครั้ง = ล้างแคชครั้งเดียว)
+// value ต่อ qid มีรูปแบบเดียวกับ endpoint per-qid เดิม (votes -> {votes,thresholds}, reports -> {reports,threshold})
+function getPendingVotesReportsData(subjectParam) {
+  var v = getVotesVersionCached();
+  var cleanFilter = subjectParam ? String(subjectParam).trim().toUpperCase() : "all";
+  var cacheKey = "pending_vr_" + v + "_" + cleanFilter;
+  var cached = getLargeCache(cacheKey);
+  if (cached != null) {
+    return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+
+  // สร้างเซ็ตของ qid ที่อยู่ในวิชานี้ (ผ่าน category->subject map + คำถามที่แคชไว้)
+  // ใช้ตัวคำถามเป็นเกณฑ์เพื่อความถูกต้อง โดยไม่ขึ้นกับความกำกวมของคอลัมน์ subject ในชีต Votes/Report
+  var subjectQids = null; // null = รับทุก qid (กรณี subject = all)
+  if (cleanFilter !== "all") {
+    var catToSubj = getCategoryToSubjectMapCached(ss);
+    var qData = getAllQuestionsCached(ss);
+    subjectQids = {};
+    for (var qi = 0; qi < qData.length; qi++) {
+      var cats = [];
+      try {
+        var craw = String(qData[qi][6]).trim();
+        if (craw !== "") cats = (craw.indexOf("[") > -1) ? JSON.parse(craw.replace(/'/g, '"')) : [craw];
+      } catch (e) { cats = []; }
+      for (var ci = 0; ci < cats.length; ci++) {
+        if ((catToSubj[cats[ci]] || "") === cleanFilter) {
+          subjectQids[String(qData[qi][0]).trim()] = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // --- Votes (สถานะ Pending หรือ Approved) ---
+  var votesMap = {};
+  var voteSheet = ss.getSheetByName("Votes");
+  if (voteSheet) {
+    var vv = voteSheet.getDataRange().getValues();
+    for (var i = 1; i < vv.length; i++) {
+      var status = vv[i][5];
+      if (!(status == "Pending" || status == "Approved")) continue;
+      var qid = String(vv[i][0]).trim();
+      if (subjectQids && !subjectQids[qid]) continue;
+      if (!votesMap[qid]) votesMap[qid] = { votes: [], thresholds: { confirm: VOTE_THRESHOLD_CONFIRM } };
+      votesMap[qid].votes.push({
+        categoryId: vv[i][2],
+        count: vv[i][3],
+        status: status
+      });
+    }
+  }
+
+  // --- Reports (สถานะ Pending) ---
+  var reportsMap = {};
+  var reportSheet = ss.getSheetByName("Report");
+  if (reportSheet) {
+    var rv = reportSheet.getDataRange().getValues();
+    for (var j = 1; j < rv.length; j++) {
+      if (String(rv[j][9]).trim() !== "Pending") continue;
+      var rqid = String(rv[j][2]).trim();
+      if (subjectQids && !subjectQids[rqid]) continue;
+      if (!reportsMap[rqid]) reportsMap[rqid] = { reports: [], threshold: REPORT_VOTE_THRESHOLD };
+      reportsMap[rqid].reports.push({
+        timestamp: rv[j][8],
+        suggestedChoice: rv[j][6],
+        suggestedExplain: rv[j][12] || "",
+        reportDetail: rv[j][7],
+        voteCount: parseInt(rv[j][13]) || 0
+      });
+    }
+  }
+  // เรียง reports ต่อ qid ตาม voteCount มาก→น้อย (ให้เหมือน endpoint per-qid เดิม)
+  Object.keys(reportsMap).forEach(function (k) {
+    reportsMap[k].reports.sort(function (a, b) { return b.voteCount - a.voteCount; });
+  });
+
+  var responseObj = {
+    status: 'success',
+    data: {
+      votes: votesMap,
+      reports: reportsMap
+    }
+  };
+  var responseStr = JSON.stringify(responseObj);
+  putLargeCache(cacheKey, responseStr, 300); // Cache for 5 minutes (ผูกกับ votes-version key)
   return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -797,9 +973,28 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // T0.1: batchLog — จัดการ "ก่อน" ขอ Lock ใดๆ เพื่อไม่ให้ analytics (write ถี่สุดของนักเรียน) ไปบล็อกโหวต/รายงาน
+    // ใช้ appendRow ต่อแถว (atomic ในตัว ไม่ต้องพึ่ง LockService) แทน getRange(getLastRow()+1).setValues()
+    // ----------------------------------------------------
+    if (action === 'batchLog') {
+      var logs = data.logs || [];
+      if (logs.length > 0) {
+        var activitySheet = doc.getSheetByName("UserActivity") || doc.insertSheet("UserActivity");
+        if (activitySheet.getLastRow() === 0) {
+          activitySheet.appendRow(["Timestamp", "SessionID", "Action", "TargetID", "Result", "TimeSpent", "Metadata"]);
+          activitySheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#e6f7ff");
+        }
+        for (var li = 0; li < logs.length; li++) {
+          activitySheet.appendRow(toActivityRow(logs[li]));
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // ----------------------------------------------------
     // LOCALIZED LOCK GROUP (Locks briefly for writes, tryLock 15s)
     // ----------------------------------------------------
-    var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'batchLog', 'deleteSession'];
+    var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'deleteSession'];
     if (localizedActions.indexOf(action) > -1) {
       var lock = LockService.getScriptLock();
       var acquired = lock.tryLock(15000);
@@ -809,6 +1004,7 @@ function doPost(e) {
           'message': 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
         })).setMimeType(ContentService.MimeType.JSON);
       }
+      var lockReleased = false; // T0.2: ให้ปลด Lock เองก่อนงานหนัก (reconciliation/Gemini) โดย finally ไม่ปลดซ้ำ
       try {
         if (action === 'deleteSession') {
           var token = data.sessionToken;
@@ -824,20 +1020,6 @@ function doPost(e) {
                 }
               }
             }
-          }
-          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
-        }
-
-        if (action === 'batchLog') {
-          var logs = data.logs || [];
-          if (logs.length > 0) {
-            var activitySheet = doc.getSheetByName("UserActivity") || doc.insertSheet("UserActivity");
-            if (activitySheet.getLastRow() === 0) {
-              activitySheet.appendRow(["Timestamp", "SessionID", "Action", "TargetID", "Result", "TimeSpent", "Metadata"]);
-              activitySheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#e6f7ff");
-            }
-            var rowsToAppend = logs.map(function (entry) { return toActivityRow(entry); });
-            activitySheet.getRange(activitySheet.getLastRow() + 1, 1, rowsToAppend.length, 7).setValues(rowsToAppend);
           }
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
@@ -873,6 +1055,10 @@ function doPost(e) {
             }
           });
           updateVotesVersion();
+          // T0.2: ปลด Lock ก่อนรัน processVotes() (full-sheet reconciliation + sort + updateVersion)
+          // เพื่อไม่ให้ค้าง Lock ระหว่างงานหนัก — processVotes ไม่มีการเรียก UrlFetchApp จึงปลอดภัย
+          lock.releaseLock();
+          lockReleased = true;
           processVotes();
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
@@ -921,20 +1107,34 @@ function doPost(e) {
           var rv = reportSheet.getDataRange().getValues();
           var targetTs = String(data.reportTimestamp || "").trim();
           var delta = parseInt(data.delta) || 1;
+          var foundIdx = -1;
           for (var i = 1; i < rv.length; i++) {
             var sTime = rv[i][8] instanceof Date ? rv[i][8].toISOString() : String(rv[i][8]);
-            if (sTime.trim() === targetTs) {
-              var newVotes = Math.max(0, (parseInt(rv[i][13]) || 0) + delta);
-              reportSheet.getRange(i + 1, 14).setValue(newVotes);
-              updateVotesVersion();
-              processReports(doc);
-              return ContentService.createTextOutput(JSON.stringify({ result: 'success', newVoteCount: newVotes })).setMimeType(ContentService.MimeType.JSON);
-            }
+            if (sTime.trim() === targetTs) { foundIdx = i; break; }
           }
-          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report not found' })).setMimeType(ContentService.MimeType.JSON);
+          if (foundIdx === -1) {
+            return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report not found' })).setMimeType(ContentService.MimeType.JSON);
+          }
+
+          // เขียนคะแนนโหวตใหม่ (งานเบาภายใต้ Lock)
+          var newVotes = Math.max(0, (parseInt(rv[foundIdx][13]) || 0) + delta);
+          reportSheet.getRange(foundIdx + 1, 14).setValue(newVotes);
+          updateVotesVersion();
+
+          // T0.2: threshold check เฉพาะแถวนี้ — รัน processReports (ซึ่งอาจเรียก Gemini/UrlFetchApp) เฉพาะเมื่อ
+          // รายงานนี้ยัง Pending และแตะเกณฑ์แล้วเท่านั้น และต้องทำ "นอก Lock" เสมอ (ห้ามเรียก UrlFetchApp ใต้ LockService)
+          var reportStatus = String(rv[foundIdx][9]).trim();
+          var shouldProcess = (reportStatus === "Pending" && newVotes >= REPORT_VOTE_THRESHOLD);
+
+          lock.releaseLock();
+          lockReleased = true;
+          if (shouldProcess) {
+            processReports(doc);
+          }
+          return ContentService.createTextOutput(JSON.stringify({ result: 'success', newVoteCount: newVotes })).setMimeType(ContentService.MimeType.JSON);
         }
       } finally {
-        lock.releaseLock();
+        if (!lockReleased) lock.releaseLock(); // อาจถูกปลดไปแล้วใน submitVote/voteOnReport
       }
     }
 
@@ -1160,6 +1360,65 @@ function doPost(e) {
             'message': 'Drive Upload Error: ' + err.message
           })).setMimeType(ContentService.MimeType.JSON);
         }
+      }
+
+      // T2.5: อัปโหลดหลายรูปในการเรียกครั้งเดียว (สูงสุด 10 รูป) — auth และพารามิเตอร์ต่อรายการเหมือน uploadImage
+      // แต่ละรายการอยู่ใน data.images[] = { base64, questionId, type, subject, year }
+      // คืน urls[] เรียงตามลำดับ input; รายการที่ล้มเหลวจะเป็น { error: "..." } (ไม่ทำให้ทั้ง batch ล้ม)
+      if (action === 'uploadImagesBatch') {
+        var userObj = null;
+        if (data.sessionToken) {
+          userObj = verifySessionToken(data.sessionToken);
+        } else if (data.googleIdToken) {
+          var payload = verifyGoogleToken(data.googleIdToken);
+          if (payload) userObj = findAdminByEmail(payload.email);
+        } else {
+          userObj = verifyAdmin(data.username, data.adminPass);
+        }
+
+        if (!userObj) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'token_expired'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        var images = data.images || [];
+        if (!Array.isArray(images) || images.length === 0) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'ไม่พบรายการรูปภาพ (images array is empty)'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+        if (images.length > 10) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'อัปโหลดได้สูงสุด 10 รูปต่อครั้ง (batch size exceeds 10)'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        var urls = [];
+        var successCount = 0;
+        for (var bi = 0; bi < images.length; bi++) {
+          var item = images[bi] || {};
+          try {
+            if (!item.base64) { urls.push({ error: 'missing base64' }); continue; }
+            var fileUrl = uploadQuestionImageToDrive(item.base64, item.questionId, item.type, item.subject, item.year);
+            urls.push(fileUrl);
+            successCount++;
+          } catch (err) {
+            urls.push({ error: err.message });
+          }
+        }
+
+        writeAdminLog(userObj.username, userObj.role, "IMAGE", "UPLOAD_BATCH",
+          (images[0] && images[0].questionId) || "",
+          "Batch uploaded " + successCount + "/" + images.length + " images", "", "", "");
+
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'success',
+          'urls': urls
+        })).setMimeType(ContentService.MimeType.JSON);
       }
 
       if (action === 'deleteImage') {
@@ -1406,25 +1665,56 @@ function doPost(e) {
             var lastRow = targetSheet.getLastRow();
 
             if (realSheetName === 'Questions') {
-              var existing = lastRow > 1 ? targetSheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
-              var existingIds = existing.map(function (r) { return String(r[0]).trim(); });
-
               var appended = 0, updated = 0;
               var toAppend = [];
-              importData.forEach(function (row) {
-                var qId = String(row[0]).trim();
-                var idx = existingIds.indexOf(qId);
-                if (idx >= 0) {
-                  targetSheet.getRange(idx + 2, 1, 1, row.length).setValues([row]);
-                  updated++;
-                } else {
-                  toAppend.push(row);
-                  existingIds.push(qId);
+
+              // T2.4: หลีกเลี่ยง setValues ต่อแถวสำหรับข้อที่อัปเดต — อ่าน block เดียว แก้ใน memory แล้วเขียนกลับครั้งเดียว
+              // เงื่อนไข: ทุกแถวนำเข้าต้องกว้างเท่ากัน (uniform) จึงเขียนเป็นบล็อกสี่เหลี่ยมได้อย่างปลอดภัย
+              var width = importData[0].length;
+              var uniform = importData.every(function (r) { return r.length === width; });
+
+              if (uniform) {
+                // อ่านบล็อกที่มีอยู่ครั้งเดียว (กว้าง = width) เพื่อคงคอลัมน์ส่วนเกิน (ถ้ามี) ไว้ไม่ถูกแตะ
+                var block = lastRow > 1 ? targetSheet.getRange(2, 1, lastRow - 1, width).getValues() : [];
+                var idToIdx = {};
+                for (var bi = 0; bi < block.length; bi++) idToIdx[String(block[bi][0]).trim()] = bi;
+
+                importData.forEach(function (row) {
+                  var qId = String(row[0]).trim();
+                  if (idToIdx.hasOwnProperty(qId)) {
+                    block[idToIdx[qId]] = row; // อัปเดตใน memory
+                    updated++;
+                  } else {
+                    idToIdx[qId] = block.length; // กันซ้ำภายใน payload เดียวกัน
+                    block.push(row);
+                    toAppend.push(row);
+                  }
+                });
+
+                if (block.length > 0) {
+                  // เขียนทั้งบล็อก (updates + appends) ในครั้งเดียว
+                  targetSheet.getRange(2, 1, block.length, width).setValues(block);
                 }
-              });
-              if (toAppend.length > 0) {
-                var newLastRow = targetSheet.getLastRow();
-                targetSheet.getRange(newLastRow + 1, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
+                appended = toAppend.length;
+              } else {
+                // Fallback (แถวกว้างไม่เท่ากัน): upsert ต่อแถวแบบเดิม เพื่อความปลอดภัยของข้อมูล
+                var existing = lastRow > 1 ? targetSheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
+                var existingIds = existing.map(function (r) { return String(r[0]).trim(); });
+                importData.forEach(function (row) {
+                  var qId = String(row[0]).trim();
+                  var idx = existingIds.indexOf(qId);
+                  if (idx >= 0) {
+                    targetSheet.getRange(idx + 2, 1, 1, row.length).setValues([row]);
+                    updated++;
+                  } else {
+                    toAppend.push(row);
+                    existingIds.push(qId);
+                  }
+                });
+                if (toAppend.length > 0) {
+                  var newLastRow = targetSheet.getLastRow();
+                  targetSheet.getRange(newLastRow + 1, 1, toAppend.length, toAppend[0].length).setValues(toAppend);
+                }
                 appended = toAppend.length;
               }
 
@@ -2239,12 +2529,12 @@ function processVotes() {
             voteSheet.getRange(currentRow, 1, 1, 6).setBackground("#6aa84f"); 
             hasChanged = true;
         }
-        // 2. ปรับใหม่: ถ้ามีคะแนนตั้งแต่ 1 ขึ้นไป และยังเป็น Pending -> ให้ Approved ทันที
+        // 2. ปรับใหม่: ถ้ามีคะแนนตั้งแต่ 1 ขึ้นไป และยังเป็น Pending -> Approved (สถานะรอเกณฑ์)
+        //    หมายเหตุ: "ไม่" apply category ที่ 1 โหวตอีกต่อไป — ต้องถึง VOTE_THRESHOLD_CONFIRM (Verified) เท่านั้น
+        //    ปิดบั๊ก "1 โหวต hijack หมวดถาวร" + หยุด updateVersion() ล้าง cache ทุกโหวต
         else if (voteCount >= 1 && (status === "Pending" || status === "")) {
-            updateQuestionCategory(qSheet, qIdMap, qId, categoryToAdd);
             voteSheet.getRange(currentRow, 6).setValue("Approved");
             voteSheet.getRange(currentRow, 1, 1, 6).setBackground(null); // ล้างสี (สีขาว)
-            hasChanged = true;
         }
     }
 
