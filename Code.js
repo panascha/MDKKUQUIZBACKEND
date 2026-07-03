@@ -919,6 +919,11 @@ function doPost(e) {
       }
     }
 
+    // Seed/อัปเดต IntelSphere key หนึ่งใบ (idempotent by API_Key) — one-off admin setup, lock-free
+    if (action === 'seedIntelSphereKey') {
+      return seedIntelSphereKey(data.apiKey, data.donorName, data.notes);
+    }
+
     // อ่าน catalog โมเดล IntelSphere (read-only, ไม่ต้อง auth) — lock-free
     if (action === 'listModels') {
       return ContentService.createTextOutput(JSON.stringify({
@@ -3706,8 +3711,9 @@ function getIntelSphereModelCatalog() {
 
     var body = JSON.parse(response.getContentText());
     body.data.forEach(function(m) {
-      // Phase 0 (plan): ยืนยัน field name นี้กับ live response ก่อนเชื่อ — docs ใช้ owned_by เป็นชื่อโมเดล
-      var modelId = m.owned_by || m.id;
+      // ยืนยันกับ live response 2026-07-03: model ID อยู่ที่ m.id; m.owned_by = ชื่อ provider แบบ display
+      // ("Meta AI","Nova (AWS)") ที่ไม่ตรง internal key — จึงจำแนกด้วย prefix ของ m.id แทน
+      var modelId = m.id;
       var provider = inferProviderFromModel(modelId);
       if (!provider) { unknownModels.push(modelId); return; }
       if (!catalog[provider]) catalog[provider] = [];
@@ -3928,6 +3934,57 @@ function setupIntelSphereSheet() {
     sheetCreated: created,
     headersWritten: headersWritten,
     missingProviderColumns: missing
+  })).setMimeType(ContentService.MimeType.JSON);
+}
+
+// Seed/อัปเดต key หนึ่งใบใน IntelSphere_Keys — idempotent by API_Key, prefill remaining เต็มโควต้า, Status=Active
+function seedIntelSphereKey(apiKey, donorName, notes) {
+  if (!apiKey) {
+    return ContentService.createTextOutput(JSON.stringify({
+      result: 'error', message: 'apiKey required'
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME);
+  if (!sheet) { setupIntelSphereSheet(); sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME); }
+
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var colKey = headers.indexOf("API_Key");
+  var tz = "Asia/Bangkok";
+  var todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+
+  // หาแถวเดิมที่มี key นี้อยู่แล้ว (idempotent)
+  var rowIndex = -1;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][colKey]).trim() === String(apiKey).trim()) { rowIndex = i + 1; break; }
+  }
+
+  // สร้าง row object ตาม header order
+  var rowValues = new Array(headers.length).fill("");
+  function setCol(name, val) { var c = headers.indexOf(name); if (c >= 0) rowValues[c] = val; }
+  setCol("Timestamp", new Date());
+  setCol("Donor_Name", donorName || "");
+  setCol("API_Key", apiKey);
+  setCol("Status", "Active");
+  setCol("Last_Reset_Date", todayStr);
+  setCol("Notes", notes || "");
+  for (var p = 0; p < INTELSPHERE_PROVIDER_PRIORITY.length; p++) {
+    setCol(INTELSPHERE_PROVIDER_PRIORITY[p] + "_Remaining", INTELSPHERE_LIMITS[INTELSPHERE_PROVIDER_PRIORITY[p]]);
+  }
+
+  var appended = false;
+  if (rowIndex > 0) {
+    sheet.getRange(rowIndex, 1, 1, headers.length).setValues([rowValues]);
+  } else {
+    sheet.appendRow(rowValues);
+    appended = true;
+  }
+  SpreadsheetApp.flush();
+  CacheService.getScriptCache().remove("intelsphere_catalog"); // ให้ดึง live catalog ใหม่ด้วย key นี้
+
+  return ContentService.createTextOutput(JSON.stringify({
+    result: 'success', appended: appended, updatedExisting: (rowIndex > 0)
   })).setMimeType(ContentService.MimeType.JSON);
 }
 
