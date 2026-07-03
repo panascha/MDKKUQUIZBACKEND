@@ -394,6 +394,7 @@ function doGet(e) {
   if (action == 'getLogsPage') return getLogsPageData(e.parameter.offset, e.parameter.limit);
   if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject);
   if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject);
+  if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
 
 
   return ContentService.createTextOutput("Action not defined").setMimeType(ContentService.MimeType.TEXT);
@@ -918,7 +919,45 @@ function doPost(e) {
       }
     }
 
+    // อ่าน catalog โมเดล IntelSphere (read-only, ไม่ต้อง auth) — lock-free
+    if (action === 'listModels') {
+      return ContentService.createTextOutput(JSON.stringify({
+        result: 'success',
+        catalog: getIntelSphereModelCatalog()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
     if (action === 'askAIExpert') {
+      // --- IntelSphere shared-pool branch: public, rate-limited, ไม่ใช้ admin auth ---
+      if (data.provider === "IntelSphere") {
+        var rlToken = data.sessionToken || "guest_user";
+        if (!checkRateLimit(rlToken)) {
+          return ContentService.createTextOutput(JSON.stringify({
+            result: 'error',
+            message: 'คุณส่งคำถามถึง AI เกินกำหนด (สูงสุด 15 ครั้งต่อชั่วโมง) กรุณารอสักครู่แล้วลองใหม่ เพื่อช่วยแบ่งโควต้าให้เพื่อนๆ ด้วยนะครับ'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        var isModel = data.model; // ไม่มี default — frontend ส่งโมเดลที่เลือกจาก catalog เสมอ
+        if (!isModel) {
+          return ContentService.createTextOutput(JSON.stringify({
+            result: 'error', message: 'กรุณาเลือกโมเดล AI ก่อนส่งคำถาม'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        try {
+          var aiResult = executeChatbotQuery(data.prompt, isModel, 1);
+          return ContentService.createTextOutput(JSON.stringify({
+            result: 'success', answer: aiResult.content, servedModel: aiResult.servedModel, switched: aiResult.switched
+          })).setMimeType(ContentService.MimeType.JSON);
+        } catch (isErr) {
+          return ContentService.createTextOutput(JSON.stringify({
+            result: 'error', message: isErr.message
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+
+      // --- เส้นทาง admin เดิม (Gemini pool) ---
       var userObj = null;
       if (data.sessionToken) {
         userObj = verifySessionToken(data.sessionToken);
@@ -3567,4 +3606,337 @@ function cleanupStaging() {
     }
   }
   console.log('cleanupStaging: deleted ' + deleted + ' require_img rows');
+}
+
+/*
+   =========================================
+   ส่วนที่ 3: KKU IntelSphere Shared Key Pool
+   (Idea/interested-using-kkuintel.md — v7)
+   =========================================
+*/
+
+var INTELSPHERE_SHEET_NAME = "IntelSphere_Keys";
+var INTELSPHERE_ENDPOINT = "https://gen.ai.kku.ac.th/api/v1/chat/completions";
+var INTELSPHERE_QUOTA_FLOOR = 0.05; // skip a provider whose remaining < 5% of its daily limit
+
+var INTELSPHERE_LIMITS = {
+  "Deepseek": 1000000, "Gemini": 350000, "Meta": 200000, "Nova": 200000, "xAI": 200000,
+  "Qwen": 200000, "OpenAI": 150000, "Claude": 150000, "Mistral": 150000, "MiniMax": 100000
+  // Perplexity intentionally excluded — no published model ID
+};
+
+var INTELSPHERE_PROVIDER_PRIORITY = [
+  "Deepseek", "Gemini", "Meta", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "Mistral", "MiniMax"
+];
+
+// One flagship model per provider — used ONLY when rotation moves to a provider
+// other than the one the student explicitly requested.
+var PROVIDER_MODEL_MAP = {
+  "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-2.5-flash",   "Meta": "llama-4-maverick",
+  "Nova":     "nova-pro-v1",       "xAI":    "grok-4",             "Qwen": "qwen3.7-plus",
+  "OpenAI":   "gpt-5-mini",        "Claude": "claude-sonnet-4.5",  "Mistral": "mistral-medium-3",
+  "MiniMax":  "minimax-m3"
+};
+
+// Hardcoded fallback catalog — used ONLY when the live GET /models fetch fails.
+var PROVIDER_MODELS_FALLBACK = {
+  "Claude":   ["claude-sonnet-5","claude-sonnet-4.6","claude-sonnet-4.5","claude-haiku-4.5","claude-sonnet-4","claude-3.7-sonnet"],
+  "Deepseek": ["deepseek-v4-pro","deepseek-v4-flash","deepseek-v3.2","deepseek-v3.2-exp","deepseek-chat-v3.1"],
+  "Gemini":   ["gemini-3.5-flash","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
+  "Meta":     ["llama-4-maverick","llama-4-scout"],
+  "MiniMax":  ["minimax-m3"],
+  "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","codestral-2508","devstral-medium","codestral-2501"],
+  "Nova":     ["nova-2-lite-v1","nova-pro-v1"],
+  "OpenAI":   ["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano","gpt-5.2","gpt-5.1","gpt-5.1-codex","gpt-5","gpt-5-mini","gpt-5-nano","gpt-5.5"],
+  "Qwen":     ["qwen3.7-plus","qwen3.7-max","qwen3.6-flash","qwen3.5-9b","qwen3-235b-a22b-2507","qwen3-next-80b-a3b-instruct","qwen3-coder-flash","qwen3-coder","qwen3-vl-32b-instruct"],
+  "xAI":      ["grok-4.3","grok-4.1-fast","grok-4","grok-3"]
+};
+
+// จำแนก provider จาก prefix ของ model ID — ทนต่อโมเดลใหม่ในตระกูลเดิมที่ KKU เพิ่มภายหลัง
+function inferProviderFromModel(modelId) {
+  if (/^claude-/i.test(modelId))                          return "Claude";
+  if (/^deepseek-/i.test(modelId))                         return "Deepseek";
+  if (/^gemini-/i.test(modelId))                           return "Gemini";
+  if (/^llama-/i.test(modelId))                            return "Meta";
+  if (/^minimax-/i.test(modelId))                          return "MiniMax";
+  if (/^(mistral-|codestral-|devstral-)/i.test(modelId))   return "Mistral";
+  if (/^nova-/i.test(modelId))                             return "Nova";
+  if (/^gpt-/i.test(modelId))                              return "OpenAI";
+  if (/^qwen/i.test(modelId))                              return "Qwen";
+  if (/^grok-/i.test(modelId))                             return "xAI";
+  if (/^sonar-/i.test(modelId))                            return "Perplexity"; // classified for display only — still excluded from rotation
+  return null; // unrecognized prefix — log it, don't silently drop
+}
+
+// หา key ของแถว Active แถวแรกเพื่อใช้ fetch catalog (catalog เป็น account-agnostic)
+function getAnyActiveIntelSphereKeyForCatalogFetch() {
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
+  if (!sheet) return null;
+  var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return null;
+  var headers = data[0];
+  var colKey = headers.indexOf("API_Key");
+  var colStatus = headers.indexOf("Status");
+  if (colKey < 0 || colStatus < 0) return null;
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][colStatus] === "Active" && data[i][colKey]) return data[i][colKey];
+  }
+  return null;
+}
+
+// Live catalog จาก GET /models, cache 6 ชม. — fallback เป็น PROVIDER_MODELS_FALLBACK เมื่อ fetch ล้มเหลว
+function getIntelSphereModelCatalog() {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get("intelsphere_catalog");
+  if (cached) return JSON.parse(cached);
+
+  var catalog = {};
+  var unknownModels = [];
+
+  try {
+    var anyKey = getAnyActiveIntelSphereKeyForCatalogFetch();
+    if (!anyKey) throw new Error("no active key available to fetch catalog");
+
+    var response = UrlFetchApp.fetch("https://gen.ai.kku.ac.th/api/v1/models", {
+      method: "get",
+      headers: { "Authorization": "Bearer " + anyKey },
+      muteHttpExceptions: true
+    });
+    if (response.getResponseCode() !== 200) throw new Error("catalog fetch HTTP " + response.getResponseCode());
+
+    var body = JSON.parse(response.getContentText());
+    body.data.forEach(function(m) {
+      // Phase 0 (plan): ยืนยัน field name นี้กับ live response ก่อนเชื่อ — docs ใช้ owned_by เป็นชื่อโมเดล
+      var modelId = m.owned_by || m.id;
+      var provider = inferProviderFromModel(modelId);
+      if (!provider) { unknownModels.push(modelId); return; }
+      if (!catalog[provider]) catalog[provider] = [];
+      catalog[provider].push(modelId);
+    });
+
+    if (unknownModels.length > 0) {
+      console.warn("[IntelSphere] Unclassified model IDs: " + unknownModels.join(", "));
+    }
+    if (Object.keys(catalog).length === 0) throw new Error("catalog parsed but empty — check response shape assumption");
+
+  } catch (e) {
+    console.warn("[IntelSphere] Live catalog fetch failed (" + e.message + ") — using fallback list");
+    catalog = PROVIDER_MODELS_FALLBACK;
+  }
+
+  cache.put("intelsphere_catalog", JSON.stringify(catalog), 21600);
+  return catalog;
+}
+
+// เลือก (key, provider) ที่ยังมีโควต้า — weighted-random ตาม remaining tokens
+// (กับ key เดียวในระบบ พฤติกรรมเทียบเท่า top-down scan; รองรับหลาย key อัตโนมัติเมื่อมีผู้บริจาคเพิ่ม)
+function getActiveIntelSphereKey(requestedProvider) {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME);
+  if (!sheet) throw new Error("ไม่พบ sheet IntelSphere_Keys — ตรวจสอบชื่อ sheet");
+
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var colKey = headers.indexOf("API_Key");
+  var colStatus = headers.indexOf("Status");
+  var colLastReset = headers.indexOf("Last_Reset_Date");
+
+  var tz = "Asia/Bangkok"; // hardcoded — อย่าใช้ timezone ของ account เจ้าของ script (อาจเป็น UTC ทำให้ reset ช้า 7 ชม.)
+  var todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+
+  // 1. Per-row daily reset แล้วรวบรวมทุก (key, provider) pair ที่โควต้าเหลือเกิน floor
+  var candidates = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (row[colStatus] !== "Active") continue;
+
+    var lastResetStr = row[colLastReset]
+      ? Utilities.formatDate(new Date(row[colLastReset]), tz, "yyyy-MM-dd") : "";
+    if (lastResetStr !== todayStr) {
+      for (var r = 0; r < INTELSPHERE_PROVIDER_PRIORITY.length; r++) {
+        var pr = INTELSPHERE_PROVIDER_PRIORITY[r];
+        var rc = headers.indexOf(pr + "_Remaining");
+        if (rc >= 0) sheet.getRange(i + 1, rc + 1).setValue(INTELSPHERE_LIMITS[pr]);
+      }
+      sheet.getRange(i + 1, colLastReset + 1).setValue(todayStr);
+      SpreadsheetApp.flush();
+      data = sheet.getDataRange().getValues();
+      row = data[i];
+    }
+
+    for (var j = 0; j < INTELSPHERE_PROVIDER_PRIORITY.length; j++) {
+      var provider = INTELSPHERE_PROVIDER_PRIORITY[j];
+      var remCol = headers.indexOf(provider + "_Remaining");
+      if (remCol < 0) continue; // header หาย/พิมพ์ผิด — provider นั้นหลุดจาก rotation เงียบๆ ตรวจตอน seed sheet
+      var remaining = Number(row[remCol]);
+      var floor = INTELSPHERE_LIMITS[provider] * INTELSPHERE_QUOTA_FLOOR;
+      if (isNaN(remaining) || remaining <= floor) continue;
+      candidates.push({
+        key: row[colKey], provider: provider, rowIndex: i + 1,
+        remaining: remaining, remainingCol: remCol + 1
+      });
+    }
+  }
+  if (candidates.length === 0) return null; // ไม่มี key ที่ใช้ได้เลย
+
+  // 2. เคารพ provider ที่นิสิตเลือกถ้ายังมีโควต้า ไม่งั้น draw จาก pool ทั้งหมด
+  var pool = candidates;
+  if (requestedProvider) {
+    var preferred = candidates.filter(function(c) { return c.provider === requestedProvider; });
+    if (preferred.length > 0) pool = preferred;
+  }
+
+  // 3. Weighted-random pick, weight = remaining tokens
+  var total = pool.reduce(function(s, c) { return s + c.remaining; }, 0);
+  var dart = Math.random() * total;
+  for (var k = 0; k < pool.length; k++) {
+    dart -= pool[k].remaining;
+    if (dart <= 0) return pool[k];
+  }
+  return pool[pool.length - 1]; // float-rounding safety
+}
+
+// ยิงคำถามไป IntelSphere พร้อม rotation: quota-exhausted → provider ถัดไป, invalid key → key ถัดไป
+function executeChatbotQuery(prompt, requestedModel, attempt) {
+  attempt = attempt || 1;
+  var maxAttempts = INTELSPHERE_PROVIDER_PRIORITY.length; // exhaust รอบ rotation เต็มก่อนยอมแพ้
+  if (attempt > maxAttempts) throw new Error("ขออภัย ระบบ AI ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ในอีกสักครู่");
+
+  var requestedProvider = inferProviderFromModel(requestedModel);
+  if (!requestedProvider) throw new Error("ไม่รู้จักโมเดลนี้ กรุณาเลือกโมเดลใหม่จากรายการ");
+  if (requestedProvider === "Perplexity") throw new Error("โมเดลนี้ยังไม่พร้อมใช้งานในระบบ กรุณาเลือกโมเดลอื่น");
+
+  var keyObj = getActiveIntelSphereKey(requestedProvider);
+
+  if (!keyObj) {
+    // Legacy fallback: ใช้ Gemini pool เดิมถ้า IntelSphere หมดทุก key
+    if (typeof getAvailableAIKey === "function" && typeof callGeminiAI === "function") {
+      var fallbackKey = getAvailableAIKey("Gemini");
+      if (!fallbackKey) throw new Error("โควต้า AI หมดแล้วสำหรับวันนี้ กรุณารอจนถึงเที่ยงคืนเพื่อรีเซ็ตโควต้า");
+      return { content: callGeminiAI(prompt, fallbackKey, null), servedModel: "gemini (legacy pool)", switched: true };
+    }
+    throw new Error("โควต้า AI หมดแล้วสำหรับวันนี้ กรุณารอจนถึงเที่ยงคืนเพื่อรีเซ็ตโควต้า");
+  }
+
+  // ใช้โมเดลที่นิสิตเลือกเป๊ะๆ ถ้า rotation ยังอยู่ provider เดิม
+  // ถ้า rotation ย้าย provider เราไม่รู้ว่านิสิตอยากได้โมเดลไหนของเจ้านั้น — ใช้ flagship
+  var actualModel = (keyObj.provider === requestedProvider) ? requestedModel : PROVIDER_MODEL_MAP[keyObj.provider];
+  var switched = (actualModel !== requestedModel);
+
+  var payload = { model: actualModel, messages: [{ role: "user", content: prompt }], max_tokens: 800, temperature: 0.3 };
+  var options = {
+    method: "post", contentType: "application/json",
+    headers: { "Authorization": "Bearer " + keyObj.key },
+    payload: JSON.stringify(payload), muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(INTELSPHERE_ENDPOINT, options);
+  var code = response.getResponseCode();
+
+  if (code === 200) {
+    var body;
+    try { body = JSON.parse(response.getContentText()); }
+    catch (parseErr) { throw new Error("เกิดข้อผิดพลาดในการอ่านคำตอบจาก AI API กรุณาลองใหม่อีกครั้ง"); }
+
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME);
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    sheet.getRange(keyObj.rowIndex, headers.indexOf("Last_Used") + 1).setValue(new Date());
+    if (body.model_quota && typeof body.model_quota.daily_remaining_tokens === "number") {
+      sheet.getRange(keyObj.rowIndex, keyObj.remainingCol).setValue(body.model_quota.daily_remaining_tokens);
+    }
+    return { content: body.choices[0].message.content, servedModel: actualModel, switched: switched };
+  }
+
+  if (code === 401) {
+    var errText = "";
+    try { errText = JSON.parse(response.getContentText()).error || response.getContentText(); }
+    catch (e) { errText = response.getContentText(); }
+
+    var ss2 = SpreadsheetApp.openById(SHEET_ID);
+    var sheet2 = ss2.getSheetByName(INTELSPHERE_SHEET_NAME);
+    var headers2 = sheet2.getRange(1, 1, 1, sheet2.getLastColumn()).getValues()[0];
+
+    if (errText.indexOf("reached daily limit") >= 0) {
+      // Quota หมดของ provider นี้ — zero column แล้ว rotate ต่อ (ไม่แตะ Status)
+      sheet2.getRange(keyObj.rowIndex, keyObj.remainingCol).setValue(0);
+      SpreadsheetApp.flush();
+      return executeChatbotQuery(prompt, requestedModel, attempt + 1);
+    }
+
+    if (errText.indexOf("Invalid model") >= 0) {
+      // Catalog drift — bust cache แล้ว retry ด้วย flagship ของ provider เดิม (ไม่แตะ donor key)
+      CacheService.getScriptCache().remove("intelsphere_catalog");
+      console.warn("[IntelSphere] Invalid model at request time: " + actualModel + " — catalog cache cleared");
+      if (actualModel !== PROVIDER_MODEL_MAP[keyObj.provider]) {
+        return executeChatbotQuery(prompt, PROVIDER_MODEL_MAP[keyObj.provider], attempt + 1);
+      }
+      throw new Error("เกิดข้อผิดพลาดในการตั้งค่าโมเดล AI กรุณาแจ้งทีม IT");
+    }
+
+    // Key เสีย/ถูกเพิกถอนจริงๆ
+    sheet2.getRange(keyObj.rowIndex, headers2.indexOf("Status") + 1).setValue("Invalid");
+    SpreadsheetApp.flush();
+    return executeChatbotQuery(prompt, requestedModel, attempt + 1);
+  }
+
+  if (code === 400) throw new Error("เกิดข้อผิดพลาดในการส่งคำขอ กรุณาลองใหม่อีกครั้ง");
+
+  // 500/503/gateway — ไม่พยายาม JSON.parse body ที่อาจไม่ใช่ JSON
+  throw new Error("เกิดข้อผิดพลาดจาก AI API (HTTP " + code + ") กรุณาลองใหม่อีกครั้ง");
+}
+
+// One-off setup: สร้าง tab IntelSphere_Keys พร้อม headers A–Q (idempotent — เรียกซ้ำไม่ทำลายข้อมูล)
+function setupIntelSphereSheet() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME);
+  var created = false;
+
+  if (!sheet) {
+    sheet = ss.insertSheet(INTELSPHERE_SHEET_NAME);
+    created = true;
+  }
+
+  var headers = [
+    "Timestamp", "Donor_Name", "API_Key", "Status", "Last_Used", "Last_Reset_Date",
+    "Deepseek_Remaining", "Gemini_Remaining", "Meta_Remaining", "Nova_Remaining",
+    "xAI_Remaining", "Qwen_Remaining", "OpenAI_Remaining", "Claude_Remaining",
+    "Mistral_Remaining", "MiniMax_Remaining", "Notes"
+  ];
+
+  // เขียน headers เฉพาะเมื่อแถว 1 ยังว่าง (ไม่ทับของเดิม)
+  var firstCell = sheet.getRange(1, 1).getValue();
+  var headersWritten = false;
+  if (!firstCell) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#e6f7ff");
+    sheet.setFrozenRows(1);
+    headersWritten = true;
+  }
+
+  // Startup column check (plan §2.5): ทุก {Provider}_Remaining header ต้อง resolve ได้
+  var liveHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var missing = [];
+  for (var i = 0; i < INTELSPHERE_PROVIDER_PRIORITY.length; i++) {
+    if (liveHeaders.indexOf(INTELSPHERE_PROVIDER_PRIORITY[i] + "_Remaining") < 0) {
+      missing.push(INTELSPHERE_PROVIDER_PRIORITY[i] + "_Remaining");
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({
+    result: 'success',
+    sheetCreated: created,
+    headersWritten: headersWritten,
+    missingProviderColumns: missing
+  })).setMimeType(ContentService.MimeType.JSON);
+}
+
+// Rate limit: 15 คำถาม/ชม. ต่อ session token (rolling window ผ่าน CacheService TTL)
+function checkRateLimit(userToken) {
+  var cache = CacheService.getScriptCache();
+  var cacheKey = "rl_" + userToken;
+  var count = parseInt(cache.get(cacheKey) || "0");
+  if (count >= 15) return false;
+  cache.put(cacheKey, String(count + 1), 3600);
+  return true;
 }
