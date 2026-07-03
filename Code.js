@@ -919,16 +919,23 @@ function doPost(e) {
       }
     }
 
-    // Seed/อัปเดต IntelSphere key หนึ่งใบ (idempotent by API_Key) — one-off admin setup, lock-free
+    // บริจาค/อัปเดต IntelSphere key หนึ่งใบ (idempotent by API_Key) — public donation form, lock-free
+    // Rate limit ก่อน validate — กันคนใช้ endpoint นี้เป็นเครื่องเดา key (key-testing oracle)
     if (action === 'seedIntelSphereKey') {
+      if (!checkActionRateLimit('rl_seed_', data.sessionToken || 'anon', 3)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'คุณส่งคำขอบริจาคบ่อยเกินไป (สูงสุด 3 ครั้ง/ชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
       return seedIntelSphereKey(data.apiKey, data.donorName, data.notes);
     }
 
-    // อ่าน catalog โมเดล IntelSphere (read-only, ไม่ต้อง auth) — lock-free
+    // อ่าน catalog โมเดล IntelSphere + รายชื่อผู้บริจาค (read-only, ไม่ต้อง auth) — lock-free
     if (action === 'listModels') {
       return ContentService.createTextOutput(JSON.stringify({
         result: 'success',
-        catalog: getIntelSphereModelCatalog()
+        catalog: getIntelSphereModelCatalog(),
+        donors: getDonorCredits()
       })).setMimeType(ContentService.MimeType.JSON);
     }
 
@@ -1033,6 +1040,18 @@ function doPost(e) {
         }
       }
       return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // ----------------------------------------------------
+    // submitAiFeedback — append-only เดี่ยวแบบเดียวกับ batchLog จึงอยู่ lock-free tier
+    // rate limit 30/ชม. ต่อ token; เกิน limit ตอบ success (dropped) เพราะ frontend เป็น fire-and-forget
+    // ----------------------------------------------------
+    if (action === 'submitAiFeedback') {
+      if (!checkActionRateLimit('rl_fb_', data.sessionToken || 'anon', 30)) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success', dropped: true }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+      return submitAiFeedbackRow(data);
     }
 
     // ----------------------------------------------------
@@ -3621,6 +3640,7 @@ function cleanupStaging() {
 */
 
 var INTELSPHERE_SHEET_NAME = "IntelSphere_Keys";
+var AI_FEEDBACK_SHEET_NAME = "AI_Feedback";
 var INTELSPHERE_ENDPOINT = "https://gen.ai.kku.ac.th/api/v1/chat/completions";
 var INTELSPHERE_QUOTA_FLOOR = 0.05; // skip a provider whose remaining < 5% of its daily limit
 
@@ -3732,6 +3752,45 @@ function getIntelSphereModelCatalog() {
 
   cache.put("intelsphere_catalog", JSON.stringify(catalog), 21600);
   return catalog;
+}
+
+// ตรวจ key กับ IntelSphere จริงก่อนบันทึก — คืน 'valid' | 'invalid' | 'unavailable'
+// GET /models ใช้ไม่ได้ (endpoint สาธารณะ ตอบ 200 แม้ไม่มี auth — ยืนยัน 2026-07-03) ต้องยิง chat 1 token แทน
+// 401 "reached daily limit" = key จริงแต่โควต้าวันนี้หมด → ถือว่า valid (พรุ่งนี้ใช้ได้)
+function validateIntelSphereKeyLive(apiKey) {
+  var model = PROVIDER_MODEL_MAP["Deepseek"];
+  try {
+    var catalog = getIntelSphereModelCatalog();
+    for (var p in catalog) {
+      if (catalog[p] && catalog[p].length > 0) { model = catalog[p][0]; break; }
+    }
+  } catch (e) { /* ใช้ flagship fallback */ }
+
+  try {
+    var resp = UrlFetchApp.fetch(INTELSPHERE_ENDPOINT, {
+      method: "post",
+      contentType: "application/json",
+      headers: { "Authorization": "Bearer " + apiKey },
+      payload: JSON.stringify({ model: model, messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+      muteHttpExceptions: true
+    });
+    var code = resp.getResponseCode();
+    if (code === 200) return 'valid';
+    if (code === 401) {
+      var errText = "";
+      try { errText = JSON.parse(resp.getContentText()).error || resp.getContentText(); }
+      catch (e2) { errText = resp.getContentText(); }
+      if (errText.indexOf("reached daily limit") >= 0) return 'valid';
+      if (errText.indexOf("Invalid model") >= 0) {
+        CacheService.getScriptCache().remove("intelsphere_catalog"); // catalog drift — ให้รอบหน้าดึงใหม่
+        return 'unavailable';
+      }
+      return 'invalid';
+    }
+    return 'unavailable';
+  } catch (e3) {
+    return 'unavailable';
+  }
 }
 
 // เลือก (key, provider) ที่ยังมีโควต้า — weighted-random ตาม remaining tokens
@@ -3944,6 +4003,21 @@ function seedIntelSphereKey(apiKey, donorName, notes) {
       result: 'error', message: 'apiKey required'
     })).setMimeType(ContentService.MimeType.JSON);
   }
+  apiKey = String(apiKey).trim();
+
+  // ตรวจ key กับ IntelSphere ก่อนบันทึก — กัน key ปลอม/พิมพ์ผิด/ถูกเพิกถอนเข้ามาปน pool
+  var verdict = validateIntelSphereKeyLive(apiKey);
+  if (verdict === 'invalid') {
+    return ContentService.createTextOutput(JSON.stringify({
+      result: 'error', message: 'API Key ไม่ถูกต้องหรือถูกเพิกถอนแล้ว กรุณาตรวจสอบ Key จาก gen.ai.kku.ac.th อีกครั้ง'
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+  if (verdict !== 'valid') {
+    return ContentService.createTextOutput(JSON.stringify({
+      result: 'error', message: 'ไม่สามารถตรวจสอบ Key ได้ในขณะนี้ (ระบบ IntelSphere อาจขัดข้องชั่วคราว) กรุณาลองใหม่ภายหลัง'
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME);
   if (!sheet) { setupIntelSphereSheet(); sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME); }
@@ -3982,9 +4056,11 @@ function seedIntelSphereKey(apiKey, donorName, notes) {
   }
   SpreadsheetApp.flush();
   CacheService.getScriptCache().remove("intelsphere_catalog"); // ให้ดึง live catalog ใหม่ด้วย key นี้
+  CacheService.getScriptCache().remove("donor_credits"); // รายชื่อผู้บริจาคเปลี่ยน
 
   return ContentService.createTextOutput(JSON.stringify({
-    result: 'success', appended: appended, updatedExisting: (rowIndex > 0)
+    result: 'success', appended: appended, updatedExisting: (rowIndex > 0),
+    message: 'ขอบคุณสำหรับการบริจาค! Key ของคุณผ่านการตรวจสอบและพร้อมใช้งานแล้ว'
   })).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -3996,4 +4072,77 @@ function checkRateLimit(userToken) {
   if (count >= 15) return false;
   cache.put(cacheKey, String(count + 1), 3600);
   return true;
+}
+
+// Rate limit ทั่วไป: prefix แยกต่อ action, limit ต่อชั่วโมง (checkRateLimit เดิมคงไว้ — askAIExpert ใช้อยู่)
+function checkActionRateLimit(prefix, token, limit) {
+  var cache = CacheService.getScriptCache();
+  var cacheKey = prefix + token;
+  var count = parseInt(cache.get(cacheKey) || "0");
+  if (count >= limit) return false;
+  cache.put(cacheKey, String(count + 1), 3600);
+  return true;
+}
+
+// รายชื่อผู้บริจาค key ที่ Active (ชื่ออย่างเดียว ไม่มี key) — cache 6 ชม., bust ตอน seed
+function getDonorCredits() {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get("donor_credits");
+  if (cached) return JSON.parse(cached);
+
+  var donors = [];
+  try {
+    var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
+    if (sheet) {
+      var data = sheet.getDataRange().getValues();
+      var headers = data[0];
+      var colName = headers.indexOf("Donor_Name");
+      var colStatus = headers.indexOf("Status");
+      for (var i = 1; i < data.length; i++) {
+        var name = String(data[i][colName] || "").trim();
+        if (data[i][colStatus] === "Active" && name && donors.indexOf(name) < 0) donors.push(name);
+      }
+    }
+    cache.put("donor_credits", JSON.stringify(donors), 21600); // cache เฉพาะตอนอ่านสำเร็จ — error ชั่วคราวไม่ควรค้าง 6 ชม.
+  } catch (e) {
+    console.warn("[IntelSphere] getDonorCredits failed: " + e.message);
+  }
+  return donors;
+}
+
+// One-off setup: สร้าง tab AI_Feedback (idempotent — เรียกซ้ำไม่ทับข้อมูลเดิม)
+function setupAiFeedbackSheet() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_FEEDBACK_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(AI_FEEDBACK_SHEET_NAME);
+
+  var headers = ["Timestamp", "Rating", "Model", "Subject", "QuestionId", "Prompt_Snippet", "Answer_Snippet", "SessionToken"];
+  if (!sheet.getRange(1, 1).getValue()) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#e6f7ff");
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+// บันทึก feedback (ดี/เฉยๆ/แย่) ต่อคำตอบ AI หนึ่งฟอง — append-only, ไม่ต้อง lock (แบบเดียวกับ batchLog)
+function submitAiFeedbackRow(data) {
+  if (['good', 'neutral', 'bad'].indexOf(data.rating) < 0) {
+    return ContentService.createTextOutput(JSON.stringify({
+      result: 'error', message: 'ค่า rating ไม่ถูกต้อง'
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+  var sheet = setupAiFeedbackSheet(); // lazy-create ครั้งแรก
+  sheet.appendRow([
+    new Date(),
+    data.rating,
+    String(data.model || "").slice(0, 100),
+    String(data.subject || "").slice(0, 100),
+    String(data.questionId || "").slice(0, 100),
+    String(data.promptSnippet || "").slice(0, 300),
+    String(data.answerSnippet || "").slice(0, 300),
+    String(data.sessionToken || "").slice(0, 64)
+  ]);
+  return ContentService.createTextOutput(JSON.stringify({ result: 'success' }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
