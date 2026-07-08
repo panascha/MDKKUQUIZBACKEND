@@ -949,8 +949,10 @@ function doPost(e) {
     // (2) ต้องบังคับ session token (branch IntelSphere ของ askAIExpert เป็น public)
     // (3) priority เป็น Claude-first เพื่อคุณภาพ ไม่ใช่ Deepseek-first เพื่อ cost แบบ INTELSPHERE_PROVIDER_PRIORITY
     if (action === 'agentQuery') {
-      var agentUser = verifySessionToken(data.sessionToken);
-      if (!agentUser) {
+      // Auth: non-expiring owner secret (preferred) OR legacy 30-day session token.
+      // The secret's hash is kept in Script Properties — see generateAgentQueryOwnerSecret().
+      var agentAuthed = verifyAgentQueryOwnerSecret(data.ownerSecret) || !!verifySessionToken(data.sessionToken);
+      if (!agentAuthed) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: 'session_expired'
         })).setMimeType(ContentService.MimeType.JSON);
@@ -4350,6 +4352,37 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
 }
 
 // ==== agentQuery: เสิร์ฟ claude-kkuintelsphere-router (Claude Code fallback proxy) ====
+
+var AGENT_QUERY_OWNER_SECRET_HASH_PROP = 'AGENT_QUERY_OWNER_SECRET_HASH';
+
+// Non-expiring owner auth for agentQuery. Only the SHA-256 hash is stored in
+// Script Properties — the plaintext secret lives only in the proxy owner's
+// localhost config.local.json. Returns true iff the presented secret matches.
+function verifyAgentQueryOwnerSecret(secret) {
+  if (!secret) return false;
+  var stored = PropertiesService.getScriptProperties().getProperty(AGENT_QUERY_OWNER_SECRET_HASH_PROP);
+  if (!stored) return false;
+  var got = hashPasswordInternal(String(secret));
+  // constant-time-ish compare (avoid early-exit length/char leaks)
+  if (got.length !== stored.length) return false;
+  var diff = 0;
+  for (var i = 0; i < got.length; i++) diff |= got.charCodeAt(i) ^ stored.charCodeAt(i);
+  return diff === 0;
+}
+
+// One-off setup: run this once in the Apps Script editor. It mints a random
+// secret, stores only its hash, and logs the plaintext ONCE — copy that into
+// the proxy's config.local.json (gas.ownerSecret), then clear the execution log.
+// Re-running rotates the secret (invalidates the old one).
+function generateAgentQueryOwnerSecret() {
+  var secret = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
+  PropertiesService.getScriptProperties().setProperty(
+    AGENT_QUERY_OWNER_SECRET_HASH_PROP, hashPasswordInternal(secret)
+  );
+  Logger.log('AGENT_QUERY OWNER SECRET (paste into config.local.json gas.ownerSecret; shown once):\n' + secret);
+  return secret;
+}
+
 // Priority แยกจาก INTELSPHERE_PROVIDER_PRIORITY โดยเจตนา — agent ต้องการโมเดลแรงสุดก่อน ไม่ใช่ถูกสุดก่อน
 var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Qwen", "OpenAI"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
