@@ -28,9 +28,27 @@ Get `<deploymentId>` from `clasp deployments` (it's the ID embedded in `window.A
 
 ## Architecture
 
-Source is in `Code.js` (~3570 lines). `appsscript.json` sets `access: ANYONE_ANONYMOUS` — all GET requests are intentionally unauthenticated.
+Source split into 13 `.gs` files (GAS loads alphabetically into shared global scope — function order irrelevant, all top-level `var`s are literals):
 
-Key constants at the top of `Code.js`:
+| File | Contents |
+|------|----------|
+| `config.gs` | Top-level `var`s (SHEET_ID, DRIVE_FOLDER_ID, thresholds), `onOpen` menu |
+| `cache.gs` | Chunked-cache engine + all `*Cached` getters |
+| `sessions.gs` | `onSheetEdit`, `updateVersion`, session tokens, `getOrCreateAnnouncementsSheet` |
+| `router-doGet.gs` | `doGet` entry point (read-only, unauthenticated GET actions) |
+| `data-read.gs` | All GET data functions (getStructure, getQuestions, getPendingVotes, getPendingReports, getLogsPage, getChangedSince, getRelatedQuestions, getKB, getGlossary, getHighYield, getKeywordIndex) |
+| `router-doPost.gs` | `doPost` entry point (3-tier lock dispatch) |
+| `images.gs` | Drive image upload, recycle bin, restore |
+| `ai-gemini.gs` | Gemini API key management, `callGeminiAI` |
+| `votes-reports.gs` | `writelog`, `writeAdminLog`, `processVotes`, `processReports`, `applyReportCorrection`, `buildExplainPrompt`, `updateQuestionCategory` |
+| `admin.gs` | Auth functions: `hashPasswordInternal`, `verifyAdmin`, `verifyGoogleToken`, `findAdminByEmail`, `verifyUser`, `uploadToDrive`, `getPendingReportCount` |
+| `maintenance.gs` | One-off admin utils: split-category, migrations, sort, verification reports, staging cleanup |
+| `intelsphere.gs` | IntelSphere key pool, model catalog, rate limits, agentQuery, chatbot, key seeding, donor credits |
+| `study-backend.gs` | AI_Feedback, question relations, KB chunks, glossary, high-yield, keyword index |
+
+Code.js is an empty placeholder pushed to GAS to overwrite the old monolithic file.
+
+Key constants in `config.gs`:
 - `SHEET_ID` — Google Sheets spreadsheet ID (the database)
 - `DRIVE_FOLDER_ID` — Google Drive folder for uploaded images
 - `VOTE_THRESHOLD_CONFIRM` — vote count to auto-confirm a category change; currently `2` (accepted hijack-risk tradeoff — was briefly raised to `20` then lowered back per explicit user request)
