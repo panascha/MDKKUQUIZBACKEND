@@ -68,4 +68,4 @@ Questions use `///` as a multi-value separator (`img`, `choices` columns); `cate
 - 🟡 `generateSessionToken` uses `Math.random()` not `Utilities.getUuid()`.
 - Not independently re-verified: `getGeminiConfig()` double `SpreadsheetApp.openById` call and `Usage_Count` write-before-success ordering — check directly if touching Gemini quota logic.
 
-Full cross-repo issue list: parent `Idea/code-review-2026-06-14.md` or `/issuelist`.
+Full cross-repo issue list: parent `Idea/active/code-review-2026-06-14.md` or `/issuelist`.
