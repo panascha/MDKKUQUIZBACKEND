@@ -1,0 +1,250 @@
+/* 
+   ========================================================
+   ส่วนที่ 3 IMAGE CRUD SYSTEM (Upload, Recycle Bin, Restore)
+   ========================================================
+*/
+
+// 1. ฟังก์ชันช่วยหาหรือสร้าง Folder (MD > Y[ปี] > [วิชา])
+function getOrCreateFolder(parentFolder, folderName) {
+  var folders = parentFolder.getFoldersByName(folderName);
+  return folders.hasNext() ? folders.next() : parentFolder.createFolder(folderName);
+}
+
+// 2. ฟังก์ชันแกะรหัสเพื่อหาที่อยู่โฟลเดอร์
+function getQuestionRoutingInfo(questionId) {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var qSheet = ss.getSheetByName('Questions');
+  var qData = qSheet.getDataRange().getValues();
+  var categoryId = "";
+  
+  for(var i=1; i<qData.length; i++) {
+    if(qData[i][0] == questionId) {
+      var catRaw = qData[i][6].toString();
+      try { categoryId = JSON.parse(catRaw.replace(/'/g, '"'))[0]; } 
+      catch(e) { categoryId = catRaw; }
+      break;
+    }
+  }
+
+  var cSheet = ss.getSheetByName('Category');
+  var cData = cSheet.getDataRange().getValues();
+  var subjectId = "";
+  for(var i=1; i<cData.length; i++) {
+    if(cData[i][0] == categoryId) { subjectId = cData[i][1]; break; }
+  }
+
+  var sSheet = ss.getSheetByName('Structure');
+  var sData = sSheet.getDataRange().getValues();
+  var year = "Unknown";
+  for(var i=1; i<sData.length; i++) {
+    if(sData[i][1] == subjectId) { year = sData[i][0]; break; }
+  }
+
+  return { year: year, subject: subjectId || "General" };
+}
+
+// 3. ฟังก์ชันอัปโหลดรูป
+function uploadQuestionImageToDrive(base64Data, questionId, typeIdentifier) {
+  var maxRetries = 3;
+  var lastError;
+
+  for (var i = 0; i < maxRetries; i++) {
+    try {
+      var routeInfo = getQuestionRoutingInfo(questionId);
+      var rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+      
+      var mdFolder = getOrCreateFolder(rootFolder, "MD");
+      var yearFolder = getOrCreateFolder(mdFolder, "Y" + routeInfo.year);
+      var targetFolder = getOrCreateFolder(yearFolder, routeInfo.subject);
+
+      // Logic จัดเก็บแยกลง Sub-folder
+      if (questionId && questionId.indexOf('_') > -1) {
+        var parts = questionId.split('_'); 
+        if (parts.length >= 2) {
+          var yearType = parts[1].trim(); 
+          if (/^\d{2}/.test(yearType)) {
+            var examYear = yearType.substring(0, 2); 
+            var examGroup = yearType.substring(2) || "General"; 
+            var examYearFolder = getOrCreateFolder(targetFolder, examYear);
+            targetFolder = getOrCreateFolder(examYearFolder, examGroup); 
+          } else {
+            targetFolder = getOrCreateFolder(targetFolder, yearType);
+          }
+        }
+      }
+
+      if (typeIdentifier === 'Explain') {
+        targetFolder = getOrCreateFolder(targetFolder, 'Explanation');
+      }
+
+      var mimeType = "image/png";
+      var fileExtension = "png";
+      if (base64Data.indexOf("data:") === 0) {
+        var partsMime = base64Data.split(";")[0].split(":");
+        if (partsMime.length > 1) {
+          mimeType = partsMime[1];
+          if (mimeType === "application/pdf") {
+            fileExtension = "pdf";
+          } else {
+            fileExtension = mimeType.split("/")[1] || "png";
+          }
+        }
+      }
+
+      var cleanBase64 = base64Data.split(',')[1] || base64Data;
+      var uniqueID = new Date().getTime() + "_" + Math.floor(Math.random() * 10000);
+      var fileName = "Q_" + questionId + "_" + typeIdentifier + "_" + uniqueID + "." + fileExtension;
+      
+      var blob = Utilities.newBlob(Utilities.base64Decode(cleanBase64), mimeType, fileName);
+      var file = targetFolder.createFile(blob);
+      
+      if (mimeType === 'application/pdf') {
+        return 'https://drive.google.com/file/d/' + file.getId() + '/preview';
+      } else {
+        return 'https://drive.google.com/uc?export=view&id=' + file.getId();
+      }
+
+    } catch (e) {
+      lastError = e;
+      if (e.message.indexOf("Service error") !== -1 || e.message.indexOf("ข้อผิดพลาดของบริการ") !== -1) {
+        Utilities.sleep(1500);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("Drive ยังคงไม่ตอบสนองหลังจากพยายาม 3 ครั้ง: " + lastError.message);
+}
+
+function handleImageTrashAction(fileUrl, user) {
+  try {
+    var fileId = fileUrl.match(/id=([^&]+)/);
+    if (!fileId) return "Invalid URL";
+    
+    var file = DriveApp.getFileById(fileId[1]);
+    var originalParentId = file.getParents().next().getId();
+    var rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    var recycleFolder = getOrCreateFolder(rootFolder, "RecycleBin");
+
+    recycleFolder.addFile(file);
+    DriveApp.getFolderById(originalParentId).removeFile(file);
+
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var logSheet = ss.getSheetByName("RecycleLog") || ss.insertSheet("RecycleLog");
+    if(logSheet.getLastRow() == 0) logSheet.appendRow(["FileID", "Type", "OriginalParentID", "DeletedDate", "User"]);
+    
+    logSheet.appendRow([fileId[1], "Image", originalParentId, new Date().toISOString(), user]);
+    return "Moved to Recycle Bin";
+  } catch (e) {
+    throw new Error("Trash Error: " + e.message);
+  }
+}
+
+// 4. ระบบถังขยะ (Soft Delete)
+function deleteImageToRecycleBin(fileUrl, user) {
+  try {
+    var match = fileUrl.match(/id=([^&]+)/) || fileUrl.match(/\/d\/([^\/]+)/);
+    if (!match) throw new Error("ID ไฟล์ไม่ถูกต้อง");
+    var fileId = match[1];
+    
+    var file = DriveApp.getFileById(fileId);
+    
+    // ค้นหาโฟลเดอร์หลัก
+    var rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    
+    // ค้นหาหรือสร้าง RecycleBin
+    var recycleFolder;
+    var folders = rootFolder.getFoldersByName("RecycleBin");
+    if (folders.hasNext()) {
+      recycleFolder = folders.next();
+    } else {
+      recycleFolder = rootFolder.createFolder("RecycleBin");
+    }
+
+    // ย้ายไฟล์
+    recycleFolder.addFile(file);
+    
+    // พยายามดึงไฟล์ออกจากโฟลเดอร์เดิมทั้งหมด
+    var firstParentId = "";
+    var parents = file.getParents();
+    while (parents.hasNext()) {
+      var parent = parents.next();
+      if (firstParentId === "") firstParentId = parent.getId();
+      parent.removeFile(file);
+    }
+
+    // เขียนบันทึกประวัติเพื่ออนุญาตให้กู้คืนได้ผ่านระบบ Restore
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var logSheet = ss.getSheetByName("RecycleLog") || ss.insertSheet("RecycleLog");
+    if(logSheet.getLastRow() == 0) logSheet.appendRow(["FileID", "Type", "OriginalParentID", "DeletedDate", "User"]);
+    logSheet.appendRow([fileId, "ExplainMedia", firstParentId, new Date().toISOString(), user]);
+
+    return "Moved to Recycle Bin successfully";
+  } catch (e) {
+    throw new Error("Drive Error: " + e.message);
+  }
+}
+
+// 5. ระบบกู้คืน (Restore)
+function restoreImageFromRecycleBin(fileUrl) {
+  var match = fileUrl.match(/id=([^&]+)/) || fileUrl.match(/\/d\/([^\/]+)/);
+  if (!match) throw new Error("URL ไม่ถูกต้อง");
+  var fileId = match[1];
+
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var logSheet = ss.getSheetByName("RecycleLog");
+  if (!logSheet) throw new Error("ไม่พบประวัติการลบรูปภาพ");
+  
+  var data = logSheet.getDataRange().getValues();
+  var parentId = "";
+  var rowIdx = -1;
+
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] == fileId) { 
+      parentId = data[i][2]; 
+      rowIdx = i + 1; 
+      break; 
+    }
+  }
+
+  if (parentId) {
+    var file = DriveApp.getFileById(fileId);
+    var targetFolder = DriveApp.getFolderById(parentId);
+    
+    // ย้ายกลับที่เดิม
+    targetFolder.addFile(file);
+    
+    // ลบออกจากโฟลเดอร์ถังขยะ
+    var recycleBin = getOrCreateFolder(DriveApp.getFolderById(DRIVE_FOLDER_ID), "RecycleBin");
+    try { recycleBin.removeFile(file); } catch(e) {}
+
+    // ลบ Log ออกจาก Sheet
+    logSheet.deleteRow(rowIdx);
+    
+    // ส่งลิงก์ UC กลับไปให้หน้าเว็บใช้งานต่อ
+    return 'https://drive.google.com/uc?export=view&id=' + fileId;
+  }
+  throw new Error("ไม่พบประวัติไฟล์นี้ในถังขยะ (อาจเกิน 10 วันและถูกลบถาวรไปแล้ว)");
+}
+
+// 6. ลบถาวรเมื่อเกิน 10 วัน (ตั้ง Trigger รันทุกวัน)
+function autoCleanupRecycleBin() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var logSheet = ss.getSheetByName("RecycleLog");
+  if(!logSheet) return;
+  var data = logSheet.getDataRange().getValues();
+  var now = new Date();
+  for(var i = data.length - 1; i >= 1; i--) {
+    var diff = (now - new Date(data[i][3])) / (1000*60*60*24);
+    if(diff > 10) {
+      try { DriveApp.getFileById(data[i][0]).setTrashed(true); } catch(e) {}
+      logSheet.deleteRow(i + 1);
+    }
+  }
+}
+
+function setupPermissions() {
+  DriveApp.getRootFolder();
+  Logger.log("ได้รับสิทธิ์เข้าถึง Google Drive เรียบร้อยแล้ว");
+}
+
