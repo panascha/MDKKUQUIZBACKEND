@@ -909,7 +909,7 @@ function doPost(e) {
         }
       }
 
-      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual'];
+      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual', 'bulkAddQuestionCategories'];
       if (adminActions.indexOf(action) > -1) {
         var userObj = null;
         if (data.sessionToken) {
@@ -1080,6 +1080,53 @@ function doPost(e) {
               })).setMimeType(ContentService.MimeType.JSON);
             }
           }
+        }
+
+        // เพิ่ม category (เลคเชอร์) หลายข้อในครั้งเดียว — ใช้โดย AI batch categorizer ใน DATABASE admin panel
+        // data.data.updates = [{id: questionId, categoryId: catId}] — append เท่านั้น ไม่ replace (semantics เดียวกับ vote-confirm)
+        if (action === 'bulkAddQuestionCategories') {
+          var updates = (data.data && data.data.updates) || [];
+          if (!updates.length) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ไม่มีรายการ updates' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          if (updates.length > 100) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'เกิน 100 ข้อต่อรอบ — แบ่ง chunk จาก frontend' })).setMimeType(ContentService.MimeType.JSON);
+          }
+
+          sheet = doc.getSheetByName("Questions");
+          var qData = sheet.getDataRange().getValues();
+          var qIdMap = {};
+          for (var i = 1; i < qData.length; i++) qIdMap[qData[i][0]] = i + 1;
+
+          var applied = 0, skipped = 0;
+          for (var u = 0; u < updates.length; u++) {
+            var upd = updates[u];
+            var rowIdx = qIdMap[upd.id];
+            if (!rowIdx || !upd.categoryId) { skipped++; continue; }
+
+            var rawCat = String(qData[rowIdx - 1][6] || '');
+            var cats = [];
+            try { cats = rawCat ? JSON.parse(rawCat.replace(/'/g, '"')) : []; }
+            catch (e) { cats = rawCat ? [rawCat] : []; }
+
+            if (cats.indexOf(upd.categoryId) !== -1) { skipped++; continue; }
+            cats.push(upd.categoryId);
+            sheet.getRange(rowIdx, 7).setValue(JSON.stringify(cats));
+
+            try { autoCreateSplitCategories(upd.id, cats, true); } // skipSort=true — sort ทีเดียวตอนจบ
+            catch (e) { console.log("Split error in bulkAddQuestionCategories: " + e); }
+            applied++;
+          }
+
+          if (applied > 0) {
+            try { sortCategorySheet(); } catch (e) { console.log("Sort error in bulkAddQuestionCategories: " + e); }
+            updateVersion();
+          }
+          writeAdminLog(user, userRole, "QUESTION", "BULK_CATEGORIZE", updates.length + " items", "AI batch categorize", "", { applied: applied, skipped: skipped }, metadata);
+
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success', 'applied': applied, 'skipped': skipped
+          })).setMimeType(ContentService.MimeType.JSON);
         }
 
         if (action === 'deleteQuestion') {
