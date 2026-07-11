@@ -1297,22 +1297,37 @@ function doPost(e) {
         if (action === 'updateReportStatus') {
           sheet = doc.getSheetByName("Report");
           var rows = sheet.getDataRange().getValues();
+          var targetQid = data.data.questionId ? String(data.data.questionId).trim() : null;
+          var updatedCount = 0;
+
           for (var i = 1; i < rows.length; i++) {
             var sTime = rows[i][8] instanceof Date ? rows[i][8].toISOString() : String(rows[i][8]);
+            var rowQid = String(rows[i][2] || "").trim();
 
-            if (sTime === String(data.data.timestamp)) {
+            var shouldUpdate = false;
+            if (targetQid) {
+              if (rowQid === targetQid) shouldUpdate = true;
+            } else if (sTime === String(data.data.timestamp)) {
+              shouldUpdate = true;
+            }
+
+            if (shouldUpdate) {
               var oldStatus = rows[i][9];
 
               sheet.getRange(i + 1, 10, 1, 3).setValues([
                 [data.data.status, data.data.adminNote, data.data.done]
               ]);
 
-              updateVersion();
-              writeAdminLog(user, userRole, "REPORT", "UPDATE", "Report_Row_" + (i + 1), "Updated Report Status", oldStatus, data.data.status, metadata);
-
-              return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+              updatedCount++;
+              writeAdminLog(user, userRole, "REPORT", "UPDATE", "Report_Row_" + (i + 1), "Updated Report Status (batch)", oldStatus, data.data.status, metadata);
             }
           }
+
+          if (updatedCount > 0) {
+            updateVersion();
+            return ContentService.createTextOutput(JSON.stringify({ result: 'success', updated: updatedCount })).setMimeType(ContentService.MimeType.JSON);
+          }
+          return ContentService.createTextOutput(JSON.stringify({ result: 'success', updated: 0, message: 'No matching reports found' })).setMimeType(ContentService.MimeType.JSON);
         }
 
         if (action === 'deleteCategory') {
