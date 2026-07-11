@@ -163,7 +163,9 @@ function installKeySweepTrigger() {
 
 // เลือก (key, provider) ที่ยังมีโควต้า — weighted-random ตาม remaining tokens
 // (กับ key เดียวในระบบ พฤติกรรมเทียบเท่า top-down scan; รองรับหลาย key อัตโนมัติเมื่อมีผู้บริจาคเพิ่ม)
-function getActiveIntelSphereKey(requestedProvider) {
+// reservedKeySet: ชุดของ API_Key ที่ห้ามใช้ (จองไว้ให้ public) — {} = ไม่มี reserve
+function getActiveIntelSphereKey(requestedProvider, reservedKeySet) {
+  reservedKeySet = reservedKeySet || {};
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(INTELSPHERE_SHEET_NAME);
   if (!sheet) throw new Error("ไม่พบ sheet IntelSphere_Keys — ตรวจสอบชื่อ sheet");
@@ -196,6 +198,9 @@ function getActiveIntelSphereKey(requestedProvider) {
       data = sheet.getDataRange().getValues();
       row = data[i];
     }
+
+    var keyId = String(row[colKey] || "").trim();
+    if (reservedKeySet[keyId]) continue; // จองไว้ให้ public — agentQuery ห้ามใช้
 
     for (var j = 0; j < INTELSPHERE_PROVIDER_PRIORITY.length; j++) {
       var provider = INTELSPHERE_PROVIDER_PRIORITY[j];
@@ -256,8 +261,8 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
   var actualModel = (keyObj.provider === requestedProvider) ? requestedModel : PROVIDER_MODEL_MAP[keyObj.provider];
   var switched = (actualModel !== requestedModel);
 
-  // maxTokens optional (default 800) — high-yield ต้องการ output ยาวกว่า glossary/chatbot (summary+mnemonics+keywords ก้อนเดียว)
-  var payload = { model: actualModel, messages: [{ role: "user", content: prompt }], max_tokens: maxTokens || 800, temperature: 0.3 };
+  // maxTokens optional (default 2000)
+  var payload = { model: actualModel, messages: [{ role: "user", content: prompt }], max_tokens: maxTokens || 2000, temperature: 0.3 };
   var options = {
     method: "post", contentType: "application/json",
     headers: { "Authorization": "Bearer " + keyObj.key },
@@ -357,30 +362,68 @@ var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Qwen", "OpenAI"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
 var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Qwen": 131072, "OpenAI": 128000 };
+// จอง key ไว้สำหรับผู้ใช้สาธารณะ — agentQuery (owner proxy) จะไม่ใช้ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก
+// (key = 1 API_Key ใช้ได้ทุก provider → reserve ทั้ง key ไม่ใช่แยก provider)
+var AGENT_QUERY_KEY_RESERVE_COUNT = 2;
 
 // รวมโควต้าคงเหลือรายวันต่อ provider (ทุก donor key ที่ Active) — ใช้จัดลำดับ chain แบบ load-balance
 // นับเฉพาะ key ที่เกิน quota floor (เกณฑ์เดียวกับ getActiveIntelSphereKey) — ต่ำกว่า floor คือ serve ไม่ได้จริง
+// reserveCount > 0 → ข้าม key ที่มี totalRemaining มากที่สุด N อันดับแรก (จองไว้ให้ public) — ใช้เฉพาะ agentQuery
 // ข้อจำกัดที่ยอมรับ: อ่านค่าก่อน daily reset (reset เกิดใน getActiveIntelSphereKey ทีหลัง) —
 // request แรกของวันอาจเรียงด้วยค่าค้างของเมื่อวาน แล้วหายเองใน request ถัดไป
-function getIntelSphereQuotaTotals() {
+function getIntelSphereQuotaTotals(reserveCount) {
+  reserveCount = reserveCount || 0;
   var totals = {};
   var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
   if (!sheet) return totals;
   var data = sheet.getDataRange().getValues();
   var headers = data[0];
   var colStatus = headers.indexOf("Status");
+  var colKey = headers.indexOf("API_Key");
+  // สร้าง list ของ (apiKey, rowIndex, {provider: remaining}) — ไว้คำนวณ reserve
+  var keySnapshots = [];
   for (var i = 1; i < data.length; i++) {
     if (data[i][colStatus] !== "Active") continue;
+    var snapshot = { apiKey: String(data[i][colKey] || "").trim(), totalRemaining: 0 };
     for (var j = 0; j < AGENT_QUERY_PROVIDER_PRIORITY.length; j++) {
       var p = AGENT_QUERY_PROVIDER_PRIORITY[j];
       var col = headers.indexOf(p + "_Remaining");
       if (col < 0) continue;
       var rem = Number(data[i][col]);
       var floor = INTELSPHERE_LIMITS[p] * INTELSPHERE_QUOTA_FLOOR;
-      if (!isNaN(rem) && rem > floor) totals[p] = (totals[p] || 0) + rem;
+      if (!isNaN(rem) && rem > floor) {
+        snapshot.totalRemaining += rem;
+        totals[p] = (totals[p] || 0) + rem;
+      }
     }
+    if (snapshot.apiKey) keySnapshots.push(snapshot);
   }
-  return totals;
+  // จอง: เรียง key ตาม totalRemaining มาก→น้อย แล้วหักเฉพาะ top-N ออก (reserveCount = AGENT_QUERY_KEY_RESERVE_COUNT)
+  if (reserveCount > 0 && keySnapshots.length > 0) {
+    keySnapshots.sort(function(a, b) { return b.totalRemaining - a.totalRemaining; });
+    var reservedKeys = {};
+    for (var r = 0; r < reserveCount && r < keySnapshots.length; r++) {
+      reservedKeys[keySnapshots[r].apiKey] = true;
+    }
+    // สร้างชุดที่สองของ keySnapshots สำหรัับอ่านค่า remaining แบบรวม reserve ด้วย (key level)
+    // อันนี้คือ "active non-reserved totals" — เอาไปให้ agentQuery orderProviders
+    // แต่เรายังต้องรู้ reserve key ใน getActiveIntelSphereKey → เลย refactor แยกฟังก์ชัน
+    var nrTotals = {};
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][colStatus] !== "Active") continue;
+      if (reservedKeys[String(data[i][colKey] || "").trim()]) continue;
+      for (var j = 0; j < AGENT_QUERY_PROVIDER_PRIORITY.length; j++) {
+        var ap = AGENT_QUERY_PROVIDER_PRIORITY[j];
+        var acol = headers.indexOf(ap + "_Remaining");
+        if (acol < 0) continue;
+        var arem = Number(data[i][acol]);
+        var afloor = INTELSPHERE_LIMITS[ap] * INTELSPHERE_QUOTA_FLOOR;
+        if (!isNaN(arem) && arem > afloor) nrTotals[ap] = (nrTotals[ap] || 0) + arem;
+      }
+    }
+    return { totals: nrTotals, reservedKeySet: reservedKeys };
+  }
+  return { totals: totals, reservedKeySet: {} };
 }
 
 // จัดลำดับ provider ต่อ request: (1) ตัด provider ที่ context window ไม่พอ (est input + output budget),
@@ -423,7 +466,9 @@ function pickAgentModel(provider, requestedModel) {
 function executeAgentQuery(request) {
   var skip = {};
   var attempts = 0;
-  var order = orderAgentProviders(request, getIntelSphereQuotaTotals());
+  var qSnapshot = getIntelSphereQuotaTotals(AGENT_QUERY_KEY_RESERVE_COUNT);
+  var order = orderAgentProviders(request, qSnapshot.totals);
+  var reservedKeySet = qSnapshot.reservedKeySet;
   var maxAttempts = order.length * 2; // เผื่อหลาย donor key ต่อ provider
 
   while (attempts < maxAttempts) {
@@ -433,7 +478,7 @@ function executeAgentQuery(request) {
     for (var i = 0; i < order.length; i++) {
       var p = order[i];
       if (skip[p]) continue;
-      var candidate = getActiveIntelSphereKey(p);
+      var candidate = getActiveIntelSphereKey(p, reservedKeySet);
       // getActiveIntelSphereKey draw provider อื่นเมื่อ provider ที่ขอไม่มีโควต้า — ตีความเป็น "หมด" แล้วไล่ตัวถัดไปเอง
       if (candidate && candidate.provider === p) { keyObj = candidate; provider = p; break; }
       skip[p] = true;
