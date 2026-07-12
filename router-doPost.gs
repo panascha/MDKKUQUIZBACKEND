@@ -14,7 +14,8 @@ function doPost(e) {
     // LOCK-FREE GROUP (Processes instantly, no write queue overhead)
     // ----------------------------------------------------
     if (action === 'verifySession') {
-      var userObj = verifySessionToken(data.sessionToken);
+      // verifyAnySession: คืน user ทั้ง Admin และ Student (แค่ยืนยันตัวตน — สิทธิ์แอดมินตรวจราย action อยู่แล้ว)
+      var userObj = verifyAnySession(data.sessionToken);
       if (userObj) {
         return ContentService.createTextOutput(JSON.stringify({
           'result': 'success',
@@ -25,6 +26,114 @@ function doPost(e) {
           'result': 'error',
           'message': 'session_expired'
         })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // ----------------------------------------------------
+    // PROGRESS SYNC (cross-device continue) — ต้องมี session (Admin หรือ Student ก็ได้)
+    // getProgress = อ่านล้วน lock-free; saveProgress = auth/ตรวจนอก lock แล้วเขียนใต้ localized-15s (แบบ ingestKB)
+    // ----------------------------------------------------
+    if (action === 'getProgress') {
+      var gpUser = verifyAnySession(data.sessionToken);
+      if (!gpUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var gpSubject = String(data.subject || '').trim();
+      if (!gpSubject) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'missing subject'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var gpSheet = doc.getSheetByName("Progress");
+      if (gpSheet && gpSheet.getLastRow() > 1 && gpSheet.getLastColumn() >= 4) {
+        // อ่านเฉพาะ 3 คอลัมน์ key ก่อน (ห้าม getDataRange ทั้งชีต — คอลัมน์ blob ใหญ่ อ่านทุกแถวทุก request ไม่ไหว)
+        var gpKeys = gpSheet.getRange(1, 1, gpSheet.getLastRow(), 3).getValues();
+        for (var gpI = 1; gpI < gpKeys.length; gpI++) {
+          if (gpKeys[gpI][0] === gpUser.email && gpKeys[gpI][1] === gpSubject) {
+            var gpCells = gpSheet.getRange(gpI + 1, 4, 1, gpSheet.getLastColumn() - 3).getValues()[0];
+            var gpBlob = gpCells.filter(function (c) { return c !== "" && c != null; }).join("");
+            var gpState;
+            try {
+              gpState = JSON.parse(Utilities.ungzip(
+                Utilities.newBlob(Utilities.base64Decode(gpBlob), 'application/x-gzip')
+              ).getDataAsString());
+            } catch (gpErr) {
+              return ContentService.createTextOutput(JSON.stringify({
+                result: 'error', message: 'corrupt progress blob'
+              })).setMimeType(ContentService.MimeType.JSON);
+            }
+            return ContentService.createTextOutput(JSON.stringify({
+              result: 'success', timestamp: Number(gpKeys[gpI][2]) || 0, state: gpState
+            })).setMimeType(ContentService.MimeType.JSON);
+          }
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({ result: 'empty' })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === 'saveProgress') {
+      // rate-limit ก่อน auth (กัน flood ด้วย garbage token) — client debounce ~2 นาที → 60/ชม. เหลือเฟือ
+      if (!checkActionRateLimit('rl_prog_', data.sessionToken || 'anon', 60)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ซิงค์บ่อยเกินไป กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var spUser = verifyAnySession(data.sessionToken);
+      if (!spUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var spSubject = String(data.subject || '').trim();
+      var spState = data.state;
+      var spTs = spState && Number(spState.timestamp);
+      if (!spSubject || !spState || !spTs) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'missing subject/state/timestamp'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      // gzip นอก lock (งาน CPU ไม่ต้องถือ lock)
+      var spB64 = Utilities.base64Encode(
+        Utilities.gzip(Utilities.newBlob(JSON.stringify(spState), 'application/octet-stream')).getBytes()
+      );
+      var spChunks = [];
+      for (var spOff = 0; spOff < spB64.length; spOff += 45000) {
+        spChunks.push(spB64.substring(spOff, spOff + 45000));
+      }
+      var spLock = LockService.getScriptLock();
+      if (!spLock.tryLock(15000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var spSheet = getOrCreateProgressSheet(doc);
+        // อ่านเฉพาะ 3 คอลัมน์ key (เหตุผลเดียวกับ getProgress — ห้ามอ่านคอลัมน์ blob ทั้งชีต)
+        var spKeys = spSheet.getRange(1, 1, spSheet.getLastRow(), 3).getValues();
+        var spRow = -1;
+        for (var spI = 1; spI < spKeys.length; spI++) {
+          if (spKeys[spI][0] === spUser.email && spKeys[spI][1] === spSubject) { spRow = spI + 1; break; }
+        }
+        if (spRow !== -1) {
+          var spStored = Number(spKeys[spRow - 1][2]) || 0;
+          // Overwrite guard: รับเฉพาะ state ที่ใหม่กว่า — เครื่องเก่าค้างหน้าจอจะทับของใหม่ไม่ได้
+          if (spStored >= spTs) {
+            return ContentService.createTextOutput(JSON.stringify({
+              result: 'stale', cloudTimestamp: spStored
+            })).setMimeType(ContentService.MimeType.JSON);
+          }
+          // เคลียร์ chunk เก่าทั้งแถว (เผื่อ blob ใหม่สั้นกว่า) แล้วเขียนทับ
+          var spLastCol = spSheet.getLastColumn();
+          if (spLastCol > 2) spSheet.getRange(spRow, 3, 1, spLastCol - 2).clearContent();
+          spSheet.getRange(spRow, 3, 1, 1 + spChunks.length).setValues([[spTs].concat(spChunks)]);
+        } else {
+          spSheet.appendRow([spUser.email, spSubject, spTs].concat(spChunks));
+        }
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success', timestamp: spTs })).setMimeType(ContentService.MimeType.JSON);
+      } finally {
+        spLock.releaseLock();
       }
     }
 
@@ -580,10 +689,18 @@ function doPost(e) {
             'sessionToken': sessionToken
           })).setMimeType(ContentService.MimeType.JSON);
         } else {
-          writeAdminLog(email, "GUEST", "AUTH", "LOGIN_SSO_FAIL", "Session", "Google login blocked: Email not in whitelist", "", "", "");
+          // ไม่อยู่ใน whitelist แต่เป็นบัญชี KKU → ออก session ระดับ Student (ใช้ซิงค์ความคืบหน้า ไม่มีสิทธิ์แก้ไข)
+          var studentUser = {
+            displayName: tokenPayload.name || String(email).split("@")[0],
+            role: "Student",
+            email: email
+          };
+          var studentToken = createSession(email, studentUser);
+          writeAdminLog(studentUser.displayName, "Student", "AUTH", "LOGIN_SSO", "Session", "Google SSO Student Login", "", "", "");
           return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'บัญชีผู้ใช้นี้ไม่มีอยู่ในสิทธิ์การแก้ไขระบบ กรุณาติดต่อผู้ดูแลเพื่อเพิ่มรายชื่ออีเมลของคุณ'
+            'result': 'success',
+            'user': studentUser,
+            'sessionToken': studentToken
           })).setMimeType(ContentService.MimeType.JSON);
         }
       }

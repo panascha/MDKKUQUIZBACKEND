@@ -92,7 +92,8 @@ function createSession(email, userObj) {
     sheet.appendRow(["Token", "Email", "CreatedAt", "ExpiresAt", "LastUsed"]);
     sheet.getRange(1, 1, 1, 5).setFontWeight("bold");
   }
-  cleanupSessionsByEmail(sheet, email);
+  // Multi-device: เก็บได้สูงสุด 5 session ต่ออีเมล (ลบอันเก่าสุดเกินโควต้า ไม่ลบทั้งหมดแบบเดิม)
+  capSessionsByEmail(sheet, email, 4);
   var token = generateSessionToken();
   var now = new Date();
   var expiry = new Date(now.getTime() + SESSION_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
@@ -123,6 +124,62 @@ function verifySessionToken(token) {
     }
   }
   return null;
+}
+
+// ตรวจ token ของ "ใครก็ได้" (Admin หรือ Student) — ใช้เฉพาะ endpoint sync ความคืบหน้า + verifySession
+// ห้ามใช้แทน verifySessionToken ใน action ฝั่งแอดมิน: token ของ Student ต้องผ่านไม่ได้
+function verifyAnySession(token) {
+  if (!token) return null;
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName("Sessions");
+  if (!sheet) return null;
+  var data = sheet.getDataRange().getValues();
+  var now = new Date();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === token) {
+      var expiry = new Date(data[i][3]);
+      if (now > expiry) {
+        sheet.deleteRow(i + 1);
+        return null;
+      }
+      // T2.6: เขียน LastUsed เฉพาะเมื่อค่าเดิมเก่ากว่า 1 ชั่วโมง
+      var lastUsed = data[i][4] ? new Date(data[i][4]) : null;
+      if (!lastUsed || isNaN(lastUsed.getTime()) || (now.getTime() - lastUsed.getTime()) > 3600000) {
+        sheet.getRange(i + 1, 5).setValue(now.toISOString());
+      }
+      var email = data[i][1];
+      var adminUser = findAdminByEmail(email);
+      if (adminUser) return adminUser;
+      return { email: email, role: "Student", displayName: String(email).split("@")[0] };
+    }
+  }
+  return null;
+}
+
+// เก็บ session ล่าสุดไว้ไม่เกิน keep รายการต่ออีเมล (ลบอันเก่าสุดออก) — CreatedAt คือคอลัมน์ 3
+function capSessionsByEmail(sheet, email, keep) {
+  var data = sheet.getDataRange().getValues();
+  var rows = [];
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][1] === email) rows.push({ row: i + 1, createdAt: new Date(data[i][2]).getTime() || 0 });
+  }
+  if (rows.length <= keep) return;
+  rows.sort(function (a, b) { return a.createdAt - b.createdAt; }); // เก่าสุดก่อน
+  var toDelete = rows.slice(0, rows.length - keep).map(function (r) { return r.row; });
+  toDelete.sort(function (a, b) { return b - a; }); // ลบจากล่างขึ้นบน กัน index เลื่อน
+  toDelete.forEach(function (rowIdx) { sheet.deleteRow(rowIdx); });
+}
+
+// --- PROGRESS SYNC (cross-device continue) ---
+
+function getOrCreateProgressSheet(ss) {
+  var sheet = ss.getSheetByName("Progress");
+  if (!sheet) {
+    sheet = ss.insertSheet("Progress");
+    sheet.appendRow(["Email", "Subject", "Timestamp", "Blob"]);
+    sheet.getRange(1, 1, 1, 4).setFontWeight("bold").setBackground("#d0e0f0");
+  }
+  return sheet;
 }
 
 function cleanupSessionsByEmail(sheet, email) {
