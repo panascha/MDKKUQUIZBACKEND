@@ -139,7 +139,7 @@ function processReports(doc) {
         if (choicesArray.indexOf(suggestedAns) === -1) continue;
 
         var questionText = String(qv[qRowIndex-1][1] || "");
-        applyReportCorrection(qSheet, qRowIndex, suggestedAns, suggestedExplain, questionText, choicesArray);
+        applyReportCorrection(qSheet, qRowIndex, suggestedAns, suggestedExplain, questionText, choicesArray, qId);
 
         reportSheet.getRange(i+1, 10).setValue("AutoResolved");
         reportSheet.getRange(i+1, 11).setValue("Auto-applied by community vote (" + voteCount + "/" + REPORT_VOTE_THRESHOLD + ")");
@@ -148,7 +148,7 @@ function processReports(doc) {
     if (changed) updateVersion();
 }
 
-function applyReportCorrection(qSheet, qRowIndex, newAnswer, suggestedExplain, questionText, choicesArray) {
+function applyReportCorrection(qSheet, qRowIndex, newAnswer, suggestedExplain, questionText, choicesArray, qId) {
     qSheet.getRange(qRowIndex, 5).setValue(newAnswer);
     var newExplain = suggestedExplain || "";
     try {
@@ -162,6 +162,9 @@ function applyReportCorrection(qSheet, qRowIndex, newAnswer, suggestedExplain, q
         console.warn("Gemini explain failed: " + e.message);
     }
     qSheet.getRange(qRowIndex, 6).setValue(newExplain);
+    // Delta-feed: แถว group QUESTION + qid จริง ให้ getChangedSince เห็นการ auto-apply correction
+    if (!qId) qId = qSheet.getRange(qRowIndex, 1).getValue();
+    writeAdminLog("SYSTEM", "SYSTEM", "QUESTION", "REPORT_AUTOFIX", String(qId), "Answer auto-corrected by community report vote: " + newAnswer, "", "", "");
 }
 
 function buildExplainPrompt(questionText, choicesArray, correctAnswer) {
@@ -195,6 +198,8 @@ function updateQuestionCategory(qSheet, qIdMap, qId, categoryToAdd) {
             currentCats.push(categoryToAdd);
             catCell.setValue(JSON.stringify(currentCats));
             autoCreateSplitCategories(qId, currentCats);
+            // Delta-feed: getChangedSince อ่านเฉพาะแถว group QUESTION + qid จริง — ไม่มีแถวนี้ delta-sync จะไม่เห็นการ auto-confirm
+            writeAdminLog("SYSTEM", "SYSTEM", "QUESTION", "VOTE_CONFIRM", qId, "Category auto-confirmed by votes: " + categoryToAdd, "", "", "");
         }
     }
 

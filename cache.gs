@@ -49,9 +49,19 @@ function putLargeCache(key, value, ttl) {
 
   try {
     cache.put(key + "_chunks", String(chunks), ttl);
+    // putAll in batches of ≤100 keys — one RPC per batch instead of one per chunk
+    var batch = {};
+    var batchCount = 0;
     for (var i = 0; i < chunks; i++) {
-      cache.put(key + "_chunk_" + i, value.substring(i * chunkSize, (i + 1) * chunkSize), ttl);
+      batch[key + "_chunk_" + i] = value.substring(i * chunkSize, (i + 1) * chunkSize);
+      batchCount++;
+      if (batchCount >= 100) {
+        cache.putAll(batch, ttl);
+        batch = {};
+        batchCount = 0;
+      }
     }
+    if (batchCount > 0) cache.putAll(batch, ttl);
   } catch (e) {
     console.warn("putLargeCache failed for key " + key + ": " + e.message);
   }
@@ -63,9 +73,12 @@ function getLargeCache(key) {
   if (!chunksStr) return null;
   
   var chunks = parseInt(chunksStr, 10);
+  var keys = [];
+  for (var i = 0; i < chunks; i++) keys.push(key + "_chunk_" + i);
+  var chunkMap = cache.getAll(keys); // one RPC for all chunks instead of one per chunk
   var value = "";
-  for (var i = 0; i < chunks; i++) {
-    var chunk = cache.get(key + "_chunk_" + i);
+  for (var j = 0; j < chunks; j++) {
+    var chunk = chunkMap[key + "_chunk_" + j];
     if (chunk == null) return null; // If any chunk is lost, treat as cache miss
     value += chunk;
   }
@@ -115,7 +128,7 @@ function getAllDataForAdminCached() {
 
   var response = getAllDataForAdmin();
   var responseStr = response.getContent();
-  putLargeCache(cacheKey, responseStr, 300); // Cache complete dataset for 5 minutes
+  putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — key is version-scoped (admin_all_data_<v>) so staleness impossible
   return response;
 }
 

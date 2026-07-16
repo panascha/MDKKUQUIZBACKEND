@@ -19,6 +19,7 @@ function getAllDataForAdmin() {
 
   var data = {
     v: getVersionCached(), // แทรกเวอร์ชันปัจจุบันเพื่อให้ฝั่งไคลเอนต์ใช้ซิงค์ในรอบเดี่ยวได้โดยไม่ต้องยิง checkVersion แยก
+    serverTime: Date.now(), // seed lastSyncTs ฝั่ง client สำหรับ getAdminSync delta
     questions: JSON.parse(getQuestionsData('', ss).getContent()), // ส่ง ss เข้าไปด้วย
     structure: getSheetDataJSON('Structure', ss),
     category: getSheetDataJSON('Category', ss),
@@ -29,6 +30,64 @@ function getAllDataForAdmin() {
     announcements: getSheetDataJSON('Announcements', ss)
   };
   return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// getAdminSync — combined delta-sync endpoint สำหรับแดชบอร์ดแอดมิน (ยิงจาก doPost lock-free tier, auth แล้ว)
+// clientVer ตรงกับเวอร์ชันปัจจุบัน ⇒ NOT_MODIFIED; ไม่ตรง ⇒ ส่ง small slices ทั้งก้อน + question delta (ไม่ส่ง questions เต็ม)
+function getAdminSyncData(clientVer, sinceStr) {
+  // Stamp เวลา "ก่อน" อ่านทุกอย่าง — write ที่ landing ระหว่างประมวลผลจะถูกเก็บใน delta รอบถัดไปเสมอ (overlap = idempotent)
+  var syncTime = new Date().getTime();
+  var v = getVersionCached();
+  if (clientVer && String(clientVer) === String(v)) {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'NOT_MODIFIED', v: v, serverTime: syncTime
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Question delta — เรียกแบบไม่ filter subject เพื่อให้ "id อยู่ใน changedIds แต่ไม่มีแถว" = ถูกลบ เสมอ
+  var delta = JSON.parse(getChangedSinceTimestamp(sinceStr, '').getContent());
+
+  // Small slices (ทุกอย่างยกเว้น questions ~1.6MB raw) — cache ผูกเวอร์ชัน TTL 1800 เหมือน getAllData
+  var smallKey = "admin_sync_small_" + v;
+  var smallStr = getLargeCache(smallKey);
+  var small;
+  if (smallStr) {
+    small = JSON.parse(smallStr);
+  } else {
+    var ss = SpreadsheetApp.openById(SHEET_ID);
+    var adminsSafe = getSheetDataJSON('Admins', ss).map(function (admin) {
+      var safeAdmin = {};
+      for (var key in admin) {
+        if (key !== 'Password') safeAdmin[key] = admin[key];
+      }
+      return safeAdmin;
+    });
+    small = {
+      structure: getSheetDataJSON('Structure', ss),
+      category: getSheetDataJSON('Category', ss),
+      report: getSheetDataJSON('Report', ss),
+      votes: getSheetDataJSON('Votes', ss),
+      logs: getLogsTailJSON(ss, 300),
+      admins: adminsSafe,
+      announcements: getSheetDataJSON('Announcements', ss)
+    };
+    putLargeCache(smallKey, JSON.stringify(small), 1800);
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({
+    result: 'success',
+    v: v,
+    serverTime: syncTime,
+    structure: small.structure,
+    category: small.category,
+    report: small.report,
+    votes: small.votes,
+    logs: small.logs,
+    admins: small.admins,
+    announcements: small.announcements,
+    changedQuestions: delta.changed,
+    changedIds: delta.changedIds
+  })).setMimeType(ContentService.MimeType.JSON);
 }
 
 function getSheetDataJSON(sheetName, ss) {
@@ -429,7 +488,11 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
       var targetId = String(logData[i][5]).trim();
 
       if (logTime > sinceMs && actionGroup === 'QUESTION' && targetId) {
-        changedIds[targetId] = true;
+        // targetId อาจเป็น comma-joined หลาย qid (IMPORT/BULK_CATEGORIZE) — split ให้เป็นรายข้อ
+        targetId.split(",").forEach(function (tid) {
+          tid = tid.trim();
+          if (tid) changedIds[tid] = true;
+        });
       }
     }
   }
@@ -439,6 +502,7 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
   if (changedIdKeys.length === 0) {
     return ContentService.createTextOutput(JSON.stringify({
       changed: [],
+      changedIds: [],
       serverTime: new Date().getTime(),
       count: 0
     })).setMimeType(ContentService.MimeType.JSON);
@@ -482,6 +546,8 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
 
   return ContentService.createTextOutput(JSON.stringify({
     changed: changedQuestions,
+    // qid ทุกตัวที่ log ระบุว่าเปลี่ยน — id ที่อยู่ใน changedIds แต่ไม่มีแถวใน changed ⇒ ถูกลบ (client drop ได้)
+    changedIds: changedIdKeys,
     serverTime: new Date().getTime(),
     count: changedQuestions.length
   })).setMimeType(ContentService.MimeType.JSON);

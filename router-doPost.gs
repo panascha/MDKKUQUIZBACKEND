@@ -397,6 +397,25 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // getAdminSync — delta-sync แดชบอร์ดแอดมิน: NOT_MODIFIED หรือ {small slices + question delta}
+    // pure read → lock-free. dual auth แบบ getFeedback (sessionToken admin หรือ username+adminPass)
+    // ----------------------------------------------------
+    if (action === 'getAdminSync') {
+      var gasUser = null;
+      if (data.sessionToken) {
+        gasUser = verifySessionToken(data.sessionToken);
+      } else if (data.username) {
+        gasUser = verifyAdmin(data.username, data.adminPass);
+      }
+      if (!gasUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return getAdminSyncData(data.clientVer, data.since);
+    }
+
+    // ----------------------------------------------------
     // §1.8 ingestKB — เขียน KB_Chunks (logged-in-only). auth + rate-limit ทำ "นอก lock" (อ่านล้วน)
     // เพื่อไม่ให้ garbage-token flood ไปแย่ง shared localized lock ของ vote/report และไม่ให้บังคับ
     // reject-log ไม่จำกัด; ล็อกเฉพาะช่วงเขียนจริง → การเขียนยังอยู่ localized-15s tier ตามแผน (ไม่มี UrlFetchApp ใต้ lock)
@@ -1315,6 +1334,7 @@ function doPost(e) {
           for (var i = 1; i < qData.length; i++) qIdMap[qData[i][0]] = i + 1;
 
           var applied = 0, skipped = 0;
+          var appliedIds = []; // qid จริงสำหรับ delta-feed (getChangedSince split ด้วย comma)
           for (var u = 0; u < updates.length; u++) {
             var upd = updates[u];
             var rowIdx = qIdMap[upd.id];
@@ -1332,13 +1352,15 @@ function doPost(e) {
             try { autoCreateSplitCategories(upd.id, cats, true); } // skipSort=true — sort ทีเดียวตอนจบ
             catch (e) { console.log("Split error in bulkAddQuestionCategories: " + e); }
             applied++;
+            appliedIds.push(String(upd.id).trim());
           }
 
           if (applied > 0) {
             try { sortCategorySheet(); } catch (e) { console.log("Sort error in bulkAddQuestionCategories: " + e); }
             updateVersion();
           }
-          writeAdminLog(user, userRole, "QUESTION", "BULK_CATEGORIZE", updates.length + " items", "AI batch categorize", "", { applied: applied, skipped: skipped }, metadata);
+          // targetId = comma-joined qid จริง เพื่อให้ delta-sync เห็นข้อที่เปลี่ยน (เดิม "N items" ทำ delta หลุด)
+          writeAdminLog(user, userRole, "QUESTION", "BULK_CATEGORIZE", appliedIds.join(","), "AI batch categorize (" + updates.length + " items)", "", { applied: applied, skipped: skipped }, metadata);
 
           return ContentService.createTextOutput(JSON.stringify({
             'result': 'success', 'applied': applied, 'skipped': skipped
@@ -1455,6 +1477,15 @@ function doPost(e) {
               writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName,
                 "Upserted Questions: " + appended + " added, " + updated + " updated", "",
                 "Added " + appended + ", Updated " + updated, metadata);
+
+              // Delta-feed: log แถว group QUESTION พร้อม qid จริง (comma-joined) ให้ getChangedSince เห็นข้อที่ import
+              // แบ่งรอบละ 1000 qid กัน 50k char/cell limit ของ Sheets
+              var importedQids = importData.map(function (row) { return String(row[0]).trim(); }).filter(Boolean);
+              for (var qi = 0; qi < importedQids.length; qi += 1000) {
+                writeAdminLog(user, userRole, "QUESTION", "IMPORT",
+                  importedQids.slice(qi, qi + 1000).join(","),
+                  "Imported questions batch", "", "", metadata);
+              }
 
               return ContentService.createTextOutput(JSON.stringify({
                 'result': 'success',
