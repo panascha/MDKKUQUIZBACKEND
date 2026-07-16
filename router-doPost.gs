@@ -182,6 +182,25 @@ function doPost(e) {
       }
     }
 
+    // agentPoolStatus — read-only per-key quota snapshot สำหรับ dashboard ของ router (owner-only, auth เดียวกับ agentQuery)
+    if (action === 'agentPoolStatus') {
+      var poolStatusAuthed = verifyAgentQueryOwnerSecret(data.ownerSecret) || !!verifySessionToken(data.sessionToken);
+      if (!poolStatusAuthed) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'success', keys: getAgentPoolStatus()
+        })).setMimeType(ContentService.MimeType.JSON);
+      } catch (poolStatusErr) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: poolStatusErr.message
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
     if (action === 'askAIExpert') {
       // --- IntelSphere shared-pool branch: public, rate-limited, ไม่ใช้ admin auth ---
       if (data.provider === "IntelSphere") {

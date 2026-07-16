@@ -562,6 +562,35 @@ function executeAgentQuery(request) {
   throw new Error("agentQuery: all tiers exhausted — IntelSphere (" + AGENT_QUERY_PROVIDER_PRIORITY.join(" → ") + ") + personal Gemini pool");
 }
 
+// อ่านสถานะโควต้ารายวันต่อ key (read-only, ไม่แตะ sheet) — เสิร์ฟ dashboard ของ claude-kkuintelsphere-router
+// คืนทุกคอลัมน์ {Provider}_Remaining ที่มีใน sheet (future-proof เมื่อเพิ่ม provider) + key แบบ mask 4 ตัวท้าย
+function getAgentPoolStatus() {
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
+  if (!sheet) throw new Error("ไม่พบ sheet " + INTELSPHERE_SHEET_NAME);
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var colKey = headers.indexOf("API_Key");
+  var colStatus = headers.indexOf("Status");
+  var remainingCols = [];
+  for (var h = 0; h < headers.length; h++) {
+    if (/_Remaining$/.test(String(headers[h]))) {
+      remainingCols.push({ provider: String(headers[h]).replace(/_Remaining$/, ""), col: h });
+    }
+  }
+  var keys = [];
+  for (var i = 1; i < data.length; i++) {
+    var apiKey = String(data[i][colKey] || "").trim();
+    if (!apiKey) continue;
+    var remaining = {};
+    for (var j = 0; j < remainingCols.length; j++) {
+      var v = Number(data[i][remainingCols[j].col]);
+      remaining[remainingCols[j].provider] = isNaN(v) ? null : v;
+    }
+    keys.push({ key: apiKey.slice(-4), status: String(data[i][colStatus] || ""), remaining: remaining });
+  }
+  return keys;
+}
+
 // One-off setup: สร้าง tab IntelSphere_Keys พร้อม headers A–Q (idempotent — เรียกซ้ำไม่ทำลายข้อมูล)
 function setupIntelSphereSheet() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
