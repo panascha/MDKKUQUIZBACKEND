@@ -451,7 +451,13 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
   var logData;
   if (logDataJson) {
     logData = JSON.parse(logDataJson);
-  } else {
+    // Cache may hold only a last-1000-rows sample primed by a recent-since caller.
+    // If its oldest row is newer than this caller's sinceMs, the window isn't covered — read fresh.
+    if (sinceMs > 0 && logData.length > 1 && new Date(logData[1][0]).getTime() > sinceMs) {
+      logData = null;
+    }
+  }
+  if (!logData) {
     var logSheet = ss.getSheetByName('Logs');
     if (logSheet) {
       var lastRow = logSheet.getLastRow();
