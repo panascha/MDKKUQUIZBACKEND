@@ -298,6 +298,105 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // submitFeedback — รายงานบั๊ก/เสนอฟีเจอร์ของ "ตัวแอป" (คนละระบบกับ submitReport ที่รายงานข้อสอบ)
+    // โครงเดียวกับ saveProgress/ingestKB: rate-limit + validate + Drive save ทำ "นอก lock"
+    // แล้วเขียน 1 แถวใต้ localized-15s lock. anonymous ได้ (token ไม่ valid = ส่งแบบ anonymous ไม่ error)
+    // แผน: Idea/active/user-feedback-reporting.md
+    // ----------------------------------------------------
+    if (action === 'submitFeedback') {
+      // (1) rate limit 5/ชม. — key = sessionToken > clientId (localStorage UUID) > 'anon'
+      if (!checkActionRateLimit('rl_appfb_', data.sessionToken || data.clientId || 'anon', 5)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ส่งฟีดแบ็กบ่อยเกินไป (สูงสุด 5 ครั้ง/ชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      // (2) validate: payload รวม ≤1.5MB, type ใน whitelist, description ไม่ว่าง, รูป ≤2
+      if (contents.length > 1572864) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ขนาดข้อมูลใหญ่เกินไป (เกิน 1.5MB) กรุณาลดขนาด/จำนวนรูปภาพ'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var fbType = String(data.type || '').trim();
+      if (['Bug', 'Feature', 'Other'].indexOf(fbType) < 0) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ประเภทฟีดแบ็กไม่ถูกต้อง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var fbDesc = String(data.description || '').trim();
+      if (!fbDesc) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'กรุณากรอกรายละเอียด'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var fbImages = data.images || [];
+      if (!Array.isArray(fbImages) || fbImages.length > 2) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'แนบรูปได้สูงสุด 2 รูปต่อรายงาน'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      // (3) identity: token valid → email (Admin หรือ Student — verifyAnySession); ไม่ valid = anonymous ไม่ error
+      var fbEmail = 'anonymous';
+      if (data.sessionToken) {
+        var fbUser = verifyAnySession(data.sessionToken);
+        if (fbUser && fbUser.email) fbEmail = fbUser.email;
+      }
+      // (4) เซฟรูปลง Drive subfolder "Feedback" — นอก lock (Drive ops ไม่แตะชีต; T0.2 pattern)
+      var fbUrls = [];
+      for (var fbI = 0; fbI < fbImages.length; fbI++) {
+        try {
+          fbUrls.push(saveFeedbackImageToDrive(String(fbImages[fbI])));
+        } catch (fbImgErr) {
+          fbUrls.push('upload_failed');
+        }
+      }
+      // (5) เขียน 1 แถวใต้ localized-15s lock
+      var fbLock = LockService.getScriptLock();
+      if (!fbLock.tryLock(15000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var fbSheet = setupFeedbackSheet(); // lazy-create ครั้งแรก
+        fbSheet.appendRow([
+          new Date(),
+          fbType,
+          fbDesc.slice(0, 5000),
+          fbEmail,
+          String(data.clientId || '').slice(0, 64),
+          String(data.context || '').slice(0, 2000),
+          fbUrls.join('///'),
+          'New',
+          ''
+        ]);
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success' }))
+          .setMimeType(ContentService.MimeType.JSON);
+      } finally {
+        fbLock.releaseLock();
+      }
+    }
+
+    // ----------------------------------------------------
+    // getFeedback — อ่าน Feedback ทั้งหมด (admin เท่านั้น — แถวมี PII จึง "ห้าม" ไปรวมใน getAllData ที่ไม่ auth)
+    // pure read → lock-free. verifySessionToken = admin-only (token Student คืน null)
+    // ----------------------------------------------------
+    if (action === 'getFeedback') {
+      // DATABASE login เป็น username+adminPass (ไม่มี sessionToken) — รองรับทั้งสองแบบเหมือน uploadImage
+      var gfUser = null;
+      if (data.sessionToken) {
+        gfUser = verifySessionToken(data.sessionToken);
+      } else if (data.username) {
+        gfUser = verifyAdmin(data.username, data.adminPass);
+      }
+      if (!gfUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return getFeedbackRows();
+    }
+
+    // ----------------------------------------------------
     // §1.8 ingestKB — เขียน KB_Chunks (logged-in-only). auth + rate-limit ทำ "นอก lock" (อ่านล้วน)
     // เพื่อไม่ให้ garbage-token flood ไปแย่ง shared localized lock ของ vote/report และไม่ให้บังคับ
     // reject-log ไม่จำกัด; ล็อกเฉพาะช่วงเขียนจริง → การเขียนยังอยู่ localized-15s tier ตามแผน (ไม่มี UrlFetchApp ใต้ lock)
