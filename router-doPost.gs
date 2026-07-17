@@ -541,6 +541,49 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // §2.7 deleteGlossaryTerm — ลบศัพท์ที่ไม่ควรอยู่ในคลัง (เช่นคำทั่วไป "the", "woman") ออกให้ทุกคน
+    // ต้องล็อกอิน KKU (Admin หรือ Student — verifyAnySession); localized-15s tier (ลบ 1 แถวใต้ lock)
+    // rate-limit ก่อน auth (กัน flood ด้วย garbage token) — mirror saveProgress
+    // ----------------------------------------------------
+    if (action === 'deleteGlossaryTerm') {
+      if (!checkActionRateLimit('rl_gldel_', data.sessionToken || 'anon', 30)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ลบศัพท์บ่อยเกินไป กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var gdUser = verifyAnySession(data.sessionToken);
+      if (!gdUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var gdKey = normalizeGlossaryTerm(data.term_en);
+      if (!gdKey) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ไม่พบคำที่ต้องการลบ'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var gdLock = LockService.getScriptLock();
+      if (!gdLock.tryLock(15000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var gdRes = deleteGlossaryRowLocked(gdKey);
+        if (gdRes.deleted) {
+          // audit trail — นักศึกษาทุกคนลบได้ ต้องตามรอยได้ว่าใครลบคำไหน
+          writeAdminLog(gdUser.email, gdUser.role, "GLOSSARY", "DELETE", gdRes.term_en, "Deleted glossary term", gdRes.term_th, "", "");
+        }
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'success', deleted: gdRes.deleted
+        })).setMimeType(ContentService.MimeType.JSON);
+      } finally {
+        gdLock.releaseLock();
+      }
+    }
+
+    // ----------------------------------------------------
     // §3.6 generateHighYield — lazy-generate-then-cache miss-path (public, self-populating). โครงเดียวกับ askGlossaryTerm:
     // rate-limit → dedup(cache) ก่อนยิง LLM → LLM ทำ "นอก lock" → เขียน 1 แถวใต้ localized-15s lock. ***ห้ามยิง LLM ใต้ lock***
     // ไม่อยู่ใน admin tier — guest กดสร้างชีทสรุปได้ (เป็น UX หลักของ feature). subject resolve จาก categoryId ฝั่ง server

@@ -610,6 +610,26 @@ function writeGlossaryRowLocked(subject, parsed, sourceQuestionIds) {
   return { term: glossaryRowToObj(row), cached: false };
 }
 
+// §2.7: ลบแถวศัพท์ตาม normalized Term_EN (fallback Term_TH) — เรียก "ใต้ localized-15s lock" เท่านั้น (re-read ชีตสดกัน race)
+// คืน {deleted, term_en, term_th}; ไม่เจอ = deleted:false (idempotent — อีก request อาจลบไปก่อนแล้ว)
+function deleteGlossaryRowLocked(normKey) {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(GLOSSARY_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return { deleted: false };
+  var rows = sheet.getDataRange().getValues();
+  for (var r = 1; r < rows.length; r++) {
+    if (!rows[r][0]) continue;
+    if (normalizeGlossaryTerm(rows[r][0]) === normKey || normalizeGlossaryTerm(rows[r][1]) === normKey) {
+      var subj = String(rows[r][2] == null ? "" : rows[r][2]).trim();
+      sheet.deleteRow(r + 1);
+      invalidateGlossaryCache(subj);
+      invalidateGlossaryCache(""); // มุมมอง "all" cache แยกคีย์ — ต้องล้างด้วย
+      return { deleted: true, term_en: String(rows[r][0]), term_th: String(rows[r][1]) };
+    }
+  }
+  return { deleted: false };
+}
+
 /* ---- Batch generation (§2.2, idle-day) — ยิง LLM เป็นชุด ***spends tokens*** ---- */
 
 // prompt §2.2 สกัดหลายศัพท์จากก้อนข้อความ → JSON array
