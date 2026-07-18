@@ -148,6 +148,28 @@ function doPost(e) {
       return seedIntelSphereKey(data.apiKey, data.donorName, data.notes);
     }
 
+    // บริจาค/ปลุก Gemini key ลง AI_Config pool (converter ใช้) — localized lock (sheet write)
+    // Rate-limit by donor (session/clientId/username) ก่อน validate — กัน key-testing oracle + garbage spray
+    if (action === 'seedGeminiKey') {
+      var gdRlKey = data.sessionToken || data.clientId || data.username || 'anon';
+      if (!checkActionRateLimit('rl_gemdon_', gdRlKey, 3)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'คุณส่งคำขอบริจาคบ่อยเกินไป (สูงสุด 3 ครั้ง/ชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var gdLock = LockService.getScriptLock();
+      if (!gdLock.tryLock(15000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ระบบกำลังไม่ว่าง กรุณาลองใหม่อีกครั้ง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        return seedGeminiKey(data.apiKey, data.donorName);
+      } finally {
+        gdLock.releaseLock();
+      }
+    }
+
     // อ่าน catalog โมเดล IntelSphere + รายชื่อผู้บริจาค (read-only, ไม่ต้อง auth) — lock-free
     if (action === 'listModels') {
       return ContentService.createTextOutput(JSON.stringify({
@@ -268,6 +290,64 @@ function doPost(e) {
       } catch (err) {
         return ContentService.createTextOutput(JSON.stringify({
           'result': 'error', 'message': err.message
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // ----------------------------------------------------
+    // convertPdfBatch — Student PDF Converter Phase 1 (Idea/active/student-pdf-converter-plan.md)
+    // Gemini proxy แปลง PDF→คำถามผ่าน AI_Config Gemini pool — lock-free tier (ไม่มี sheet write นอกจาก quota column, แบบเดียวกับ askAIExpert)
+    // AUTH GATE: ต้องมี session KKU (Admin/Student — verifyAnySession) หรือ username+adminPass เดิมของ DATABASE
+    //   — กันคนนอกใช้เป็น open Gemini proxy เผาโควต้า pool (advisor must-fix)
+    // Rate limit 20 POST/ชม. ต่อ user ≈ 5 conversions/ชม. ตาม D11 (PDF ใหญ่แบ่ง batch ละ 1 POST, ~4 batch/ไฟล์)
+    // ----------------------------------------------------
+    if (action === 'convertPdfBatch') {
+      // rate-limit ก่อน auth (กัน flood ด้วย garbage token — mirror saveProgress)
+      var pcRlKey = data.sessionToken || data.username || data.clientId || 'anon';
+      if (!checkActionRateLimit('rl_pdfconv_', pcRlKey, 20)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'แปลง PDF บ่อยเกินไป (จำกัดต่อชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var pcUser = null;
+      if (data.sessionToken) pcUser = verifyAnySession(data.sessionToken);
+      if (!pcUser && data.username) pcUser = verifyAdmin(data.username, data.adminPass);
+      if (!pcUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var pcPrompt = String(data.prompt || '').trim();
+      var pcPdf = String(data.pdfB64 || '');
+      var pcImages = Array.isArray(data.images) ? data.images : [];
+      if (!pcPrompt || (!pcPdf && pcImages.length === 0)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ข้อมูลไม่ครบ (ต้องมี prompt และ PDF หรือรูปหน้ากระดาษ)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (pcImages.length > 20) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ส่งได้สูงสุด 20 หน้าต่อชุด กรุณาลด batch size'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var pcKeyInfo = getAvailableAIKey("Gemini");
+      if (!pcKeyInfo) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ขณะนี้ไม่มี Gemini API Key ที่พร้อมใช้งาน (โควต้ารายวันเต็มทุก Key) กรุณาลองใหม่พรุ่งนี้'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var pcRes = callGeminiConverter(pcPrompt, pcKeyInfo, pcPdf, pcImages);
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'success',
+          raw: pcRes.raw,
+          finishReason: pcRes.finishReason,
+          servedModel: pcRes.model,
+          quota: (pcKeyInfo.usage + 1) + "/" + pcKeyInfo.limit
+        })).setMimeType(ContentService.MimeType.JSON);
+      } catch (pcErr) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: pcErr.message
         })).setMimeType(ContentService.MimeType.JSON);
       }
     }
