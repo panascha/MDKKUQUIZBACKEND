@@ -949,18 +949,28 @@ function doPost(e) {
             'sessionToken': sessionToken
           })).setMimeType(ContentService.MimeType.JSON);
         } else {
-          // ไม่อยู่ใน whitelist แต่เป็นบัญชี KKU → ออก session ระดับ Student (ใช้ซิงค์ความคืบหน้า ไม่มีสิทธิ์แก้ไข)
-          var studentUser = {
-            displayName: tokenPayload.name || String(email).split("@")[0],
-            role: "Student",
-            email: email
-          };
-          var studentToken = createSession(email, studentUser);
-          writeAdminLog(studentUser.displayName, "Student", "AUTH", "LOGIN_SSO", "Session", "Google SSO Student Login", "", "", "");
+          // Auto-enroll: บัญชี KKU ทุกคนที่ login ครั้งแรก → เพิ่มเข้าชีต Admins เป็น role Admin ทันที
+          // Password ใส่ค่าสุ่ม (SSO-only) — ห้ามเว้นว่าง เพราะ verifyAdmin เทียบตรงตัว ค่าว่างจะ login ผ่านด้วยรหัสว่าง
+          var adminsSheet = doc.getSheetByName("Admins");
+          var newUsername = String(email).split("@")[0];
+          var newDisplayName = tokenPayload.name || newUsername;
+          adminsSheet.appendRow([
+            newUsername,
+            "SSO_ONLY_" + Utilities.getUuid(),
+            newDisplayName,
+            "https://api.dicebear.com/7.x/avataaars/svg?seed=" + newUsername,
+            "Admin",
+            email,
+            "", "", "", "", ""
+          ]);
+          updateVersion();
+          var newAdmin = findAdminByEmail(email);
+          var newToken = createSession(email, newAdmin);
+          writeAdminLog(newDisplayName, "Admin", "AUTH", "AUTO_ENROLL", "Session", "Auto-enrolled KKU account as Admin via Google SSO", "", "", "");
           return ContentService.createTextOutput(JSON.stringify({
             'result': 'success',
-            'user': studentUser,
-            'sessionToken': studentToken
+            'user': newAdmin,
+            'sessionToken': newToken
           })).setMimeType(ContentService.MimeType.JSON);
         }
       }

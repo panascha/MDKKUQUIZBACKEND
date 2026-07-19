@@ -568,63 +568,103 @@ function extractId(url) {
 }
 
 /**
- * สคริปต์จัดระเบียบรูปภาพวิชา GEN5
- * หากไม่ได้เป็นเจ้าของไฟล์ จะย้ายไปที่โฟลเดอร์ MD > Unknown
+ * เมนู: ถามรหัสวิชา แล้วสั่งจัดระเบียบรูปภาพของวิชานั้น
+ * รันซ้ำได้เรื่อยๆ จนกว่าจะขึ้นว่าเสร็จ (ระบบจำแถวล่าสุดไว้ให้)
  */
-function migrateGEN5WithFullStructure() {
-  var ROOT_FOLDER_ID = '1nzLH2ia2lL2TMxfrr6Kv-5fhsWwOWSCm'; 
+function promptMigrateSubjectImages() {
+  var ui = SpreadsheetApp.getUi();
+  var res = ui.prompt('จัดระเบียบรูปภาพตามวิชา', 'ใส่รหัสวิชา (ขึ้นต้นของ QuestionID) เช่น SKIN, MS, GI', ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+
+  var prefix = res.getResponseText().trim();
+  if (!prefix) {
+    ui.alert('ยังไม่ได้ใส่รหัสวิชา');
+    return;
+  }
+  ui.alert(migrateSubjectImages(prefix));
+}
+
+/**
+ * สคริปต์จัดระเบียบรูปภาพของวิชาที่ระบุ (ตั้งชื่อ Q_<qid>_Main_<n> / Q_<qid>_Choice_<A-E>)
+ * หากไม่ได้เป็นเจ้าของไฟล์ จะย้ายไปที่โฟลเดอร์ MD > Unknown
+ * รันเกิน 5 นาทีจะหยุดและจำแถวล่าสุดไว้ใน PropertiesService รันใหม่เพื่อทำต่อ
+ */
+function migrateSubjectImages(subjectPrefix, yearFolder) {
+  var ROOT_FOLDER_ID = DRIVE_FOLDER_ID;
+  var TIME_BUDGET_MS = 5 * 60 * 1000;
+  var startTime = Date.now();
+  var props = PropertiesService.getScriptProperties();
+  var cursorKey = 'migrate_cursor_' + subjectPrefix;
+
+  yearFolder = yearFolder || "Y2";
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var qSheet = ss.getSheetByName("Questions");
   var data = qSheet.getDataRange().getValues();
   var myEmail = Session.getEffectiveUser().getEmail(); // อีเมลผู้รันสคริปต์
-  
+  var startRow = Number(props.getProperty(cursorKey)) || 1;
+
   try {
     var rootFolder = DriveApp.getFolderById(ROOT_FOLDER_ID);
-    console.log("--- Starting GEN5 Migration (Active User: " + myEmail + ") ---");
+    console.log("--- Starting " + subjectPrefix + " Migration from row " + startRow + " (Active User: " + myEmail + ") ---");
 
-    for (var i = 1; i < data.length; i++) {
-      var qid = String(data[i][0]); 
-      var imgCell = String(data[i][2]); 
-      var choicesCell = String(data[i][3]); 
+    // โฟลเดอร์หลักและโฟลเดอร์ Unknown เตรียมครั้งเดียว
+    var mdFolder = getOrCreateSubFolder(rootFolder, "MD");
+    var unknownFolder = getOrCreateSubFolder(mdFolder, "Unknown");
+    var folderCache = {}; // path -> Folder กันเรียก Drive ซ้ำ
+    var processed = 0;
 
-      // 1. กรองเฉพาะวิชา GEN5
-      if (!qid || !qid.startsWith("MS")) continue;
-      
+    for (var i = startRow; i < data.length; i++) {
+      if (Date.now() - startTime > TIME_BUDGET_MS) {
+        props.setProperty(cursorKey, String(i));
+        var msg = "หยุดชั่วคราวที่แถว " + i + " จาก " + (data.length - 1) + " (จัดการไปแล้ว " + processed + " ข้อในรอบนี้) — รันเมนูเดิมซ้ำเพื่อทำต่อ";
+        console.log(msg);
+        return msg;
+      }
+
+      var qid = String(data[i][0]);
+      var imgCell = String(data[i][2]);
+      var choicesCell = String(data[i][3]);
+
+      // 1. กรองเฉพาะวิชาที่ระบุ
+      if (!qid || qid.split('_')[0] !== subjectPrefix) continue;
+
       var hasMainImg = (imgCell && imgCell != "" && !imgCell.toLowerCase().includes("require_img"));
       var hasChoiceImg = (choicesCell && choicesCell.includes("drive.google.com"));
-      
-      if (!hasMainImg && !hasChoiceImg) continue; 
+
+      if (!hasMainImg && !hasChoiceImg) continue;
 
       // 2. วิเคราะห์ Path
       var parts = qid.split('_');
       if (parts.length < 2) continue;
-      
+
       var yearType = parts[1].trim();
-      var pathNames = ["MD", "Y2", "MS"]; 
-      
+      var pathNames = ["MD", yearFolder, subjectPrefix];
+
       if (/^\d{2}/.test(yearType)) {
         pathNames.push(yearType.substring(0, 2)); // Year
         pathNames.push(yearType.substring(2) || "General"); // Type
       } else {
-        pathNames.push(yearType); 
+        pathNames.push(yearType);
       }
 
-      // 3. เตรียมโฟลเดอร์หลักและโฟลเดอร์ Unknown
-      var mdFolder = getOrCreateSubFolder(rootFolder, "MD");
-      var unknownFolder = getOrCreateSubFolder(mdFolder, "Unknown");
-
-      // เตรียมโฟลเดอร์ปลายทางตามโครงสร้างปกติ
-      var targetFolder = rootFolder;
-      pathNames.forEach(function(name) {
-        targetFolder = getOrCreateSubFolder(targetFolder, name);
-      });
+      // 3. เตรียมโฟลเดอร์ปลายทางตามโครงสร้างปกติ
+      var pathKey = pathNames.join('/');
+      var targetFolder = folderCache[pathKey];
+      if (!targetFolder) {
+        targetFolder = rootFolder;
+        pathNames.forEach(function(name) {
+          targetFolder = getOrCreateSubFolder(targetFolder, name);
+        });
+        folderCache[pathKey] = targetFolder;
+      }
 
       // 4. จัดการรูปโจทย์
       if (hasMainImg) {
         var imgUrls = imgCell.split("///");
         imgUrls.forEach(function(url, idx) {
           var newName = "Q_" + qid + "_Main_" + (idx + 1);
-          moveAndRenameFile(url, newName, targetFolder, unknownFolder, myEmail);
+          moveAndRenameFile(url, newName, targetFolder, unknownFolder);
         });
       }
 
@@ -633,64 +673,80 @@ function migrateGEN5WithFullStructure() {
         var choiceParts = choicesCell.split("///");
         choiceParts.forEach(function(content, idx) {
           if (content.includes("drive.google.com") || content.includes("id=")) {
-            var letter = String.fromCharCode(65 + idx); 
+            var letter = String.fromCharCode(65 + idx);
             var newName = "Q_" + qid + "_Choice_" + letter;
-            moveAndRenameFile(content, newName, targetFolder, unknownFolder, myEmail);
+            moveAndRenameFile(content, newName, targetFolder, unknownFolder);
           }
         });
       }
+      processed++;
     }
-    console.log("--- Finished GEN5 Migration ---");
+
+    props.deleteProperty(cursorKey);
+    console.log("--- Finished " + subjectPrefix + " Migration ---");
+    return "เสร็จสิ้น! จัดการรูปของวิชา " + subjectPrefix + " ไปแล้ว " + processed + " ข้อในรอบนี้";
   } catch (e) {
     console.error("Critical Error: " + e.message);
+    return "เกิดข้อผิดพลาด: " + e.message + " (ตำแหน่งล่าสุดถูกบันทึกไว้แล้ว รันซ้ำเพื่อทำต่อ)";
   }
 }
 
 /**
- * ฟังก์ชันย้ายไฟล์และเปลี่ยนชื่อ พร้อมตรวจสอบความเป็นเจ้าของ
+ * ฟังก์ชันย้ายไฟล์และเปลี่ยนชื่อ
+ * พยายามย้ายเข้าโฟลเดอร์ปลายทางจริงก่อนเสมอ (รูปส่วนใหญ่แชร์ "anyone: writer" ถึงจะคนละเจ้าของก็ย้ายได้)
+ * ถ้า Drive ปฏิเสธจริงๆ ค่อยตกไปที่ MD > Unknown
  */
-function moveAndRenameFile(url, newName, targetFolder, unknownFolder, myEmail) {
+function moveAndRenameFile(url, newName, targetFolder, unknownFolder) {
   try {
     var fileId = extractIdFromUrl(url);
     if (!fileId) return;
 
     var file = DriveApp.getFileById(fileId);
-    var owner = file.getOwner() ? file.getOwner().getEmail() : "Unknown";
-    
-    // ตรวจสอบความเป็นเจ้าของ
-    var finalDestination = targetFolder;
-    if (owner !== myEmail) {
-      finalDestination = unknownFolder;
-      console.log("Not Owner (" + owner + "): Moving " + newName + " to Unknown folder");
-    }
-
     var currentParents = file.getParents();
     var currentParentId = currentParents.hasNext() ? currentParents.next().getId() : "";
-    
-    // ถ้าชื่อตรงและที่อยู่ตรงแล้ว ให้ข้าม
-    if (file.getName() === newName && currentParentId === finalDestination.getId()) {
-      return; 
+
+    // ถ้าชื่อตรงและอยู่ปลายทางแล้ว ให้ข้าม (ไฟล์ที่ตกค้างใน Unknown จะไม่เข้าเงื่อนไขนี้ จึงถูกย้ายต่อ)
+    if (file.getName() === newName && currentParentId === targetFolder.getId()) {
+      return;
     }
 
-    // พยายามเปลี่ยนชื่อ (ถ้าสิทธิ์ไม่พอจะติด Catch)
+    // พยายามเปลี่ยนชื่อ (ถ้าสิทธิ์ไม่พอจะติด Catch แต่ยังย้ายต่อได้)
     try {
       file.setName(newName);
     } catch(e) {
       console.warn("Cannot rename (Permission): " + newName);
     }
-    
-    // ย้ายไฟล์ (ถ้าไม่ใช่เจ้าของแต่อยู่ในโฟลเดอร์ที่แชร์ Editor ไว้ก็อาจย้ายได้)
-    if (currentParentId !== finalDestination.getId()) {
-      try {
-        finalDestination.addFile(file);
-        DriveApp.getFolderById(currentParentId).removeFile(file);
-      } catch(e) {
-        // ถ้า remove ไม่ได้ (เพราะไม่ใช่เจ้าของ) แต่อย่างน้อยก็เพิ่มไฟล์เข้าไปในที่ใหม่ได้
-        console.warn("Move limited: " + newName + " added to " + finalDestination.getName());
-      }
+
+    if (currentParentId === targetFolder.getId()) {
+      console.log("Renamed: " + newName + " (at " + targetFolder.getName() + ")");
+      return;
     }
-    
-    console.log("Processed: " + newName + " (at " + finalDestination.getName() + ")");
+
+    // 1. ลองย้ายเข้าโฟลเดอร์ปลายทางจริง
+    try {
+      targetFolder.addFile(file);
+      if (currentParentId) {
+        try {
+          DriveApp.getFolderById(currentParentId).removeFile(file);
+        } catch(e) {
+          // Drive ใช้ parent เดียวตั้งแต่ปี 2020 addFile ย้ายให้แล้ว removeFile อาจไม่จำเป็น
+          console.warn("Move limited (remove old parent failed): " + newName);
+        }
+      }
+      console.log("Processed: " + newName + " (at " + targetFolder.getName() + ")");
+      return;
+    } catch (e) {
+      var owner = file.getOwner() ? file.getOwner().getEmail() : "Unknown";
+      console.warn("Cannot move to target (owner " + owner + "): " + newName + " — " + e.message);
+    }
+
+    // 2. ย้ายไม่ได้จริง ค่อยพักไว้ที่ Unknown
+    try {
+      unknownFolder.addFile(file);
+      console.log("Fallback to Unknown: " + newName);
+    } catch (e) {
+      console.warn("Cannot move at all: " + newName + " — " + e.message);
+    }
 
   } catch (e) {
     console.warn("Error processing " + newName + ": " + e.message);
