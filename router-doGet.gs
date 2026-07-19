@@ -27,6 +27,9 @@ function doGet(e) {
   if (action == 'getHighYield') return getHighYieldData(e.parameter.category); // Feature 3: ชีทสรุป high-yield ต่อหมวด (public read, chunked cache)
   if (action == 'getKeywordIndex') return getKeywordIndexData(e.parameter.category); // Feature 6: คำสำคัญที่ออกบ่อย ต่อหมวด (public read, chunked cache — list)
   if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
+  if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
+  if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)
+  if (action == 'recoverAIConfigKeys') return recoverAIConfigKeys(e.parameter.before); // กู้ key จาก revision history (idempotent)
 
 
   return ContentService.createTextOutput("Action not defined").setMimeType(ContentService.MimeType.TEXT);

@@ -552,7 +552,7 @@ function executeAgentQuery(request) {
       payload: JSON.stringify(gPayload), muteHttpExceptions: true
     });
     if (gResp.getResponseCode() === 200) {
-      updateAIUsage(geminiKey.index, geminiKey.usage);
+      updateAIUsage(geminiKey, geminiKey.model);
       return { provider: "gemini:" + gPayload.model, completion: JSON.parse(gResp.getContentText()) };
     }
     console.warn("[agentQuery] Gemini HTTP " + gResp.getResponseCode() + ": " + String(gResp.getContentText()).slice(0, 200));
