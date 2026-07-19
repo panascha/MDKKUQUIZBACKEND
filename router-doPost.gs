@@ -1259,7 +1259,7 @@ function doPost(e) {
       }
 
       if (action === 'restoreImage') {
-        var userObj = verifyUser(data.username, data.adminPass);
+        var userObj = verifyUser(data); // verifyUser รับ data object (sessionToken > googleIdToken > username+adminPass) — เดิมส่ง (username, adminPass) ผิด signature ทำให้ auth ไม่ผ่านทุกกรณี
         if (!userObj) {
           return ContentService.createTextOutput(JSON.stringify({
             'result': 'error',
