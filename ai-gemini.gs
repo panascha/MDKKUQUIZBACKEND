@@ -224,8 +224,11 @@ function ensureAIConfigModelColumns_(sheet, models) {
  * เลือก (key, model) ที่ยังมีโควต้า — per-model RPD ตามทะเบียน AI_Models
  * คืน shape เดิม {key, model, index, usage, limit} + {remaining, fallbackModels}
  * preferredModel (optional): ใช้โมเดลนี้ก่อนถ้ายังมีโควต้า ไม่งั้นไล่ตาม Priority
+ * reserveCount (optional, default 0): จอง key ที่มีโควต้าคงเหลือรวมมากสุด N อันดับแรกไว้ให้ผู้ใช้สาธารณะ
+ *   — ผู้เรียกที่เป็น owner (agentQuery) เท่านั้นที่ส่งค่า > 0; converter/นิสิตใช้ default 0 = ใช้ได้ทุก key
+ *   ถ้า active key มีไม่เกิน reserveCount → คืน null (ตั้งใจ: shared pool มาก่อน owner)
  */
-function getAvailableAIKey(provider, preferredModel) {
+function getAvailableAIKey(provider, preferredModel, reserveCount) {
   if (provider && provider !== "Gemini") return null; // pool นี้มีแต่ Gemini (IntelSphere แยกชีตของตัวเอง)
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = getAIConfigSheet_(ss);
@@ -273,6 +276,23 @@ function getAvailableAIKey(provider, preferredModel) {
     }
   }
   if (candidates.length === 0) return null;
+
+  // จอง key ไว้ให้ผู้ใช้สาธารณะ (แบบเดียวกับ AGENT_QUERY_KEY_RESERVE_COUNT ของ IntelSphere_Keys):
+  // รวม remaining ทุกโมเดลต่อ key → เรียงมาก→น้อย → ตัด top-N ออกจาก candidates
+  if (reserveCount > 0) {
+    var totalsByKey = {};
+    for (var c = 0; c < candidates.length; c++) {
+      var kid = String(candidates[c].key);
+      totalsByKey[kid] = (totalsByKey[kid] || 0) + candidates[c].remaining;
+    }
+    var ranked = Object.keys(totalsByKey).sort(function(a, b) {
+      return totalsByKey[b] - totalsByKey[a];
+    });
+    var reserved = {};
+    for (var rr = 0; rr < reserveCount && rr < ranked.length; rr++) reserved[ranked[rr]] = true;
+    candidates = candidates.filter(function(x) { return !reserved[String(x.key)]; });
+    if (candidates.length === 0) return null; // เหลือแต่ key ที่จองไว้ — owner ไม่แตะ
+  }
 
   // เคารพ preferredModel ถ้ายังมีโควต้า ไม่งั้นเอาโมเดล priority ดีสุดที่เหลือโควต้า
   var pool = null;

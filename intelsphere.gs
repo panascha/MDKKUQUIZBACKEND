@@ -365,6 +365,9 @@ var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Qwen": 131
 // จอง key ไว้สำหรับผู้ใช้สาธารณะ — agentQuery (owner proxy) จะไม่ใช้ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก
 // (key = 1 API_Key ใช้ได้ทุก provider → reserve ทั้ง key ไม่ใช่แยก provider)
 var AGENT_QUERY_KEY_RESERVE_COUNT = 2;
+// จอง Gemini key ใน AI_Config ไว้ให้ผู้ใช้สาธารณะ (converter/นิสิต) เพิ่มจากที่จองใน IntelSphere_Keys —
+// agentQuery จะไม่แตะ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก; มี key เดียว = agentQuery ไม่ได้ Gemini tier (ตั้งใจ)
+var AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT = 1;
 
 // รวมโควต้าคงเหลือรายวันต่อ provider (ทุก donor key ที่ Active) — ใช้จัดลำดับ chain แบบ load-balance
 // นับเฉพาะ key ที่เกิน quota floor (เกณฑ์เดียวกับ getActiveIntelSphereKey) — ต่ำกว่า floor คือ serve ไม่ได้จริง
@@ -541,7 +544,8 @@ function executeAgentQuery(request) {
   }
 
   // ---- Tier สุดท้าย: personal Gemini pool (AI_Config sheet เดิม — rotation/daily-reset ในตัว) ----
-  var geminiKey = getAvailableAIKey("Gemini");
+  // reserve: กัน key ที่เหลือโควต้ามากสุดไว้ให้ converter/นิสิต — owner ใช้เฉพาะส่วนที่เหลือ
+  var geminiKey = getAvailableAIKey("Gemini", null, AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT);
   if (geminiKey) {
     var gPayload = JSON.parse(JSON.stringify(request));
     gPayload.model = geminiKey.model || "gemini-2.5-flash";
@@ -556,10 +560,16 @@ function executeAgentQuery(request) {
       return { provider: "gemini:" + gPayload.model, completion: JSON.parse(gResp.getContentText()) };
     }
     console.warn("[agentQuery] Gemini HTTP " + gResp.getResponseCode() + ": " + String(gResp.getContentText()).slice(0, 200));
+  } else {
+    // แยก "pool ว่างจริง" ออกจาก "ยังมี key แต่ถูกจองไว้ให้ผู้ใช้สาธารณะ" — ไม่งั้นอ่าน log แล้วแยกไม่ออก
+    // ว่าทำไม owner ถึงตกไปใช้ Anthropic subscription ทั้งที่ AI_Config ยังมีโควต้าเหลือ
+    console.warn("[agentQuery] Gemini tier ว่าง — pool หมดจริง หรือเหลือแต่ key ที่จองไว้ให้สาธารณะ (reserve="
+      + AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT + ")");
   }
 
   // Terminal failure — ตั้งใจให้ fail ทันที proxy ฝั่ง client จะแสดง error ชัดๆ ไม่ retry
-  throw new Error("agentQuery: all tiers exhausted — IntelSphere (" + AGENT_QUERY_PROVIDER_PRIORITY.join(" → ") + ") + personal Gemini pool");
+  // marker "all tiers exhausted" ถูก match แบบ substring ที่ router (src/fallback.ts) — ห้ามแก้ข้อความส่วนนี้
+  throw new Error("agentQuery: all tiers exhausted — IntelSphere (" + AGENT_QUERY_PROVIDER_PRIORITY.join(" → ") + ") + personal Gemini pool (reserve=" + AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT + ")");
 }
 
 // อ่านสถานะโควต้ารายวันต่อ key (read-only, ไม่แตะ sheet) — เสิร์ฟ dashboard ของ claude-kkuintelsphere-router
