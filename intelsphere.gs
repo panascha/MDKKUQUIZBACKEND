@@ -358,13 +358,18 @@ function generateAgentQueryOwnerSecret() {
 }
 
 // Priority แยกจาก INTELSPHERE_PROVIDER_PRIORITY โดยเจตนา — agent ต้องการโมเดลแรงสุดก่อน ไม่ใช่ถูกสุดก่อน
-var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Qwen", "OpenAI"];
+var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Qwen", "OpenAI", "Gemini", "xAI"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
-var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Qwen": 131072, "OpenAI": 128000 };
+var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
+// Overflow tier: providers ที่มีโควต้าเหลือเยอะแต่จง "ใช้เป็น buffer หลัง Deepseek/Qwen/OpenAI" ไม่ใช่ workhorse หลัก
+// (ไม่งั้น quota-sort ใน orderAgentProviders จะดันขึ้นหน้าเพราะโควต้าสูงสุด) — Deepseek ยังเป็น coding model หลัก
+var AGENT_QUERY_OVERFLOW_PROVIDERS = { "Gemini": true, "xAI": true };
+// โมเดลเฉพาะ agentQuery ต่อ overflow provider — override PROVIDER_MODEL_MAP โดยไม่แตะ path ของ chatbot นิสิต
+var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-3.5-flash", "xAI": "grok-4.3" };
 // จอง key ไว้สำหรับผู้ใช้สาธารณะ — agentQuery (owner proxy) จะไม่ใช้ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก
 // (key = 1 API_Key ใช้ได้ทุก provider → reserve ทั้ง key ไม่ใช่แยก provider)
-var AGENT_QUERY_KEY_RESERVE_COUNT = 2;
+var AGENT_QUERY_KEY_RESERVE_COUNT = 1;
 // จอง Gemini key ใน AI_Config ไว้ให้ผู้ใช้สาธารณะ (converter/นิสิต) เพิ่มจากที่จองใน IntelSphere_Keys —
 // agentQuery จะไม่แตะ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก; มี key เดียว = agentQuery ไม่ได้ Gemini tier (ตั้งใจ)
 var AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT = 1;
@@ -442,9 +447,13 @@ function orderAgentProviders(request, quotaTotals) {
     return need <= (AGENT_PROVIDER_CONTEXT[p] || 128000) * 0.95;
   });
   var hasClaude = eligible.indexOf("Claude") >= 0;
-  var rest = eligible.filter(function(p) { return p !== "Claude"; }).sort(function(a, b) {
-    return (quotaTotals[b] || 0) - (quotaTotals[a] || 0);
-  });
+  var byQuota = function(a, b) { return (quotaTotals[b] || 0) - (quotaTotals[a] || 0); };
+  // non-Claude แยกเป็น primary (Deepseek/Qwen/OpenAI) เรียงตามโควต้า แล้วต่อด้วย overflow (Gemini/xAI) ท้ายสุด —
+  // overflow มีโควต้าเยอะสุดแต่จงเป็น buffer ไม่ใช่ workhorse หลัก จึงไม่ปล่อยให้ quota-sort ดันขึ้นหน้า
+  var nonClaude = eligible.filter(function(p) { return p !== "Claude"; });
+  var primary  = nonClaude.filter(function(p) { return !AGENT_QUERY_OVERFLOW_PROVIDERS[p]; }).sort(byQuota);
+  var overflow = nonClaude.filter(function(p) { return  AGENT_QUERY_OVERFLOW_PROVIDERS[p]; }).sort(byQuota);
+  var rest = primary.concat(overflow);
   var order = /haiku/i.test(request.model || "")
     ? rest.concat(hasClaude ? ["Claude"] : [])
     : (hasClaude ? ["Claude"] : []).concat(rest);
@@ -461,7 +470,7 @@ function pickAgentModel(provider, requestedModel) {
     var claudeModels = getIntelSphereModelCatalog()["Claude"] || [];
     if (claudeModels.indexOf(requestedModel) >= 0) return requestedModel;
   }
-  return PROVIDER_MODEL_MAP[provider];
+  return AGENT_QUERY_MODEL_OVERRIDE[provider] || PROVIDER_MODEL_MAP[provider];
 }
 
 // วิ่ง priority chain ตามลำดับจาก orderAgentProviders (per-request: context-fit + tier + quota balance)
