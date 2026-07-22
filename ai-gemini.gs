@@ -854,6 +854,31 @@ function purgeFakeGeminiModelRows() {
   return out({ result: 'success', removed: removed, rowsLeft: sheet.getLastRow() - 1 });
 }
 
+// ลบคอลัมน์ <model>_Remaining ใน AI_Config ที่ไม่มีแถวใน AI_Models แล้ว (orphan จาก rename/purge — เช่นคู่กับ purgeFakeGeminiModelRows
+// ที่ลบเฉพาะแถว AI_Models ทิ้งคอลัมน์ค้าง). Registry = แหล่งความจริง; Disabled ก็ยังอยู่ใน registry จึงคงคอลัมน์ไว้ (ลบเฉพาะที่หายจริง).
+// Editor/trigger-only (ไม่ผูก doGet — deployment public no-auth). ลบขวา→ซ้ายเพื่อ index ไม่เลื่อน.
+function purgeOrphanAiConfigColumns() {
+  function out(obj) {
+    return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+  }
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = getAIConfigSheet_(ss);
+  var known = {};
+  getAIModelRegistry_(ss).forEach(function(m) { known[m.model] = true; });
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var removed = [];
+  for (var c = headers.length - 1; c >= 0; c--) {
+    var h = String(headers[c] || "");
+    if (h.slice(-10) !== "_Remaining") continue; // เว้น 5 คอลัมน์ fixed (ไม่ลงท้าย _Remaining)
+    var model = h.slice(0, -10);
+    if (known[model]) continue; // ยังอยู่ใน registry (รวม Disabled) — คงไว้
+    aiSheetRetry_(function() { sheet.deleteColumn(c + 1); });
+    removed.push(h);
+  }
+  SpreadsheetApp.flush();
+  return out({ result: 'success', removed: removed, colsLeft: sheet.getLastColumn() });
+}
+
 // One-off/idempotent: สร้าง AI_Models + migrate AI_Config เป็นโครงใหม่ — GET ?action=setupAIConfig
 function setupAIConfigSheet() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
