@@ -12,14 +12,14 @@ var AI_MODELS_SHEET_NAME = "AI_Models";
 var AI_CONFIG_FIXED_HEADERS = ["API_Key", "Donor_Name", "Status", "Last_Used", "Last_Reset_Date"];
 
 // ค่าตั้งต้นทะเบียนโมเดล ตามหน้า Rate Limit free tier ของ AI Studio (RPD ต่อโมเดล ต่อ key)
+// ทุกตัว = ID ที่ยืนยันจาก models.list จริง (discoverGeminiModels) — gemini-3-flash/gemini-3.1-pro ถูกตัดออก
+// เพราะไม่มีใน list (มีแต่ -preview) เป็น seed ปลอม; priority คงเลขเดิมของตัวที่รอด (ช่องว่างไม่เป็นไร)
 var AI_MODELS_DEFAULTS = [
   // [Model, RPD_Limit, Priority, Status, Notes]
   ["gemini-3.5-flash",      20,  1, "Active",   "text-out หลัก"],
-  ["gemini-3-flash",        20,  2, "Active",   ""],
   ["gemini-2.5-flash",      20,  3, "Active",   ""],
   ["gemini-3.1-flash-lite", 500, 4, "Active",   "RPD สูงสุดใน free tier"],
   ["gemini-2.5-flash-lite", 20,  5, "Active",   ""],
-  ["gemini-3.1-pro",        0,  90, "Disabled", "free tier RPD = 0"],
   ["gemini-2.5-pro",        0,  91, "Disabled", "free tier RPD = 0"]
 ];
 
@@ -268,6 +268,7 @@ function getAvailableAIKey(provider, preferredModel, reserveCount) {
       if (remCol < 0) continue;
       var remaining = Number(row[remCol]);
       if (isNaN(remaining) || remaining <= 0) continue;
+      if (isModelCoolingDown_(row[0], activeModels[j].model)) continue; // ข้าม (key,model) ที่กำลัง RPM cooldown
       candidates.push({
         key: row[0], model: activeModels[j].model, index: i + 1,
         usage: activeModels[j].limit - remaining, limit: activeModels[j].limit,
@@ -343,7 +344,7 @@ function markModelExhausted_(apiKeyInfo, model) {
     if (!sheet) return;
     var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     var remCol = headers.indexOf(model + "_Remaining");
-    if (remCol >= 0) sheet.getRange(apiKeyInfo.index, remCol + 1).setValue(0);
+    if (remCol >= 0) { sheet.getRange(apiKeyInfo.index, remCol + 1).setValue(0); SpreadsheetApp.flush(); } // flush: ให้ getAvailableAIKey รอบถัดไปเห็นค่า 0
   } catch (e) { console.warn("markModelExhausted_ failed: " + e.message); }
 }
 
@@ -366,6 +367,491 @@ function getAIConfigStatus() {
   var mdl = ss.getSheetByName(AI_MODELS_SHEET_NAME);
   out.aiModels = mdl ? mdl.getDataRange().getValues() : null;
   return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ดึง live models จาก models.list — แหล่งความจริงเดียวว่ามีโมเดลไหนจริง (แชร์ discover + reconcile)
+// อ่าน Active key ตรงจากชีต ไม่ผ่าน getAvailableAIKey (ตัวนั้น write ตอน daily-reset → จะละเมิด read-only)
+// คืน [{id, displayName, methods}] ตามหน้า (paginate). โยน error ถ้าดึงไม่ได้
+function fetchLiveGeminiModels_() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_CONFIG_SHEET_NAME);
+  if (!sheet) throw new Error('AI_Config sheet not found');
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var colKey = headers.indexOf("API_Key");
+  var colStatus = headers.indexOf("Status");
+  var apiKey = "";
+  for (var i = 1; i < data.length; i++) {
+    var k = String(data[i][colKey] || "").trim();
+    if (k.indexOf("AIza") === 0 && String(data[i][colStatus]).trim() === "Active") { apiKey = k; break; }
+  }
+  if (!apiKey) throw new Error('no Active AIza key in AI_Config');
+
+  var models = [], pageToken = "", pages = 0;
+  do {
+    var url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + encodeURIComponent(apiKey)
+      + "&pageSize=200" + (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : "");
+    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) {
+      throw new Error('models.list HTTP ' + resp.getResponseCode() + ': ' + String(resp.getContentText()).slice(0, 300));
+    }
+    var json = JSON.parse(resp.getContentText());
+    (json.models || []).forEach(function(m) {
+      models.push({
+        id: String(m.name || "").replace(/^models\//, ""),
+        displayName: m.displayName || "",
+        methods: m.supportedGenerationMethods || []
+      });
+    });
+    pageToken = json.nextPageToken || "";
+  } while (pageToken && ++pages < 10);
+  return models;
+}
+
+// Read-only discovery — GET ?action=discoverGeminiModels (model IDs ไม่ sensitive → public เหมือน aiConfigStatus)
+function discoverGeminiModels() {
+  function out(obj) {
+    return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+  }
+  try {
+    var models = fetchLiveGeminiModels_();
+    return out({ result: 'success', count: models.length, models: models });
+  } catch (e) {
+    return out({ result: 'error', message: e.message });
+  }
+}
+
+// filter การ "append": เก็บเฉพาะ chat gemini-* ที่ทำ generateContent ได้ (ตัดสินใจแล้ว 2026-07-22)
+// ตัด non-chat (image/tts/embedding/robotics/computer-use), preview ที่ churn, และ -latest alias ที่ลอย (พังการนับ per-model)
+function isSyncableGeminiModel_(m) {
+  var id = String(m.id || "");
+  if (id.indexOf("gemini-") !== 0) return false;
+  if ((m.methods || []).indexOf("generateContent") < 0) return false;
+  if (/(image|tts|embedding|robotics|computer-use)/i.test(id)) return false;
+  if (/preview|latest/i.test(id)) return false; // ตัด preview (รวมกลางสตริง เช่น -preview-customtools) + alias ลอย -latest
+  return true;
+}
+
+// Discovery + three-way reconcile (Q1/Q2) — GET ?action=reconcileGeminiModels
+// live models.list ⇄ AI_Models: append ใหม่ Disabled/RPD=null · หายจาก API → Deprecated (ไม่ลบ คง RPD ที่ตั้งมือ) · มีทั้งคู่ → คงเดิม
+// append เทียบ filter (chat gemini-* เท่านั้น); deprecation เทียบ RAW live list เต็ม → เคารพ preview ที่ owner เพิ่มมือ
+// โครง monotonic: แถว append ท้ายเท่านั้น, คอลัมน์ผ่าน ensureAIConfigModelColumns_ (getLastColumn()+1) — index เดิมไม่ขยับ
+function reconcileGeminiModels() {
+  function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  var live;
+  try { live = fetchLiveGeminiModels_(); } catch (e) { return out({ result: 'error', step: 'discovery', message: e.message }); }
+  var rawLiveSet = {};
+  live.forEach(function(m) { rawLiveSet[m.id] = true; });
+  var appendable = live.filter(isSyncableGeminiModel_);
+
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
+  if (!sheet) return out({ result: 'error', message: 'AI_Models sheet not found' });
+  var data = sheet.getDataRange().getValues();
+  var colModel = 0, colPrio = 2, colStatus = 3; // [Model, RPD_Limit, Priority, Status, Notes]
+  var sheetModels = {}, maxPrio = 0;
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][colModel] || "").trim();
+    if (!name) continue;
+    sheetModels[name] = { row: i + 1, status: String(data[i][colStatus] || "").trim() };
+    var p = parseInt(data[i][colPrio], 10);
+    if (!isNaN(p) && p > maxPrio) maxPrio = p;
+  }
+
+  var today = Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd");
+  var added = [], deprecated = [], leftCount = 0;
+
+  // (1) append: appendable ที่ยังไม่มีในชีต → Disabled, RPD ว่าง (null), priority ต่อท้าย
+  var newRows = [], nextPrio = maxPrio;
+  appendable.forEach(function(m) {
+    if (sheetModels[m.id]) { leftCount++; return; }
+    nextPrio += 1;
+    newRows.push([m.id, "", nextPrio, "Disabled", "auto-discovered " + today]);
+    added.push(m.id);
+  });
+  if (newRows.length) {
+    aiSheetRetry_(function() {
+      sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, 5).setValues(newRows);
+      SpreadsheetApp.flush();
+    });
+  }
+
+  // (2) deprecate: ในชีตแต่หายจาก RAW live list → Deprecated (ไม่ลบ). ข้ามตัวที่ Deprecated อยู่แล้ว
+  Object.keys(sheetModels).forEach(function(name) {
+    if (rawLiveSet[name] || sheetModels[name].status === "Deprecated") return;
+    aiSheetRetry_(function() { sheet.getRange(sheetModels[name].row, colStatus + 1).setValue("Deprecated"); });
+    deprecated.push(name);
+  });
+  if (deprecated.length) SpreadsheetApp.flush();
+
+  // (3) เติมคอลัมน์ <model>_Remaining สำหรับ registry ใหม่ (append-only ที่ getLastColumn()+1)
+  var colsBefore = null, colsAfter = null;
+  try {
+    _aiModelRegistryCache = null; // reset cache → re-read หลัง mutate แถว
+    var cfg = ss.getSheetByName(AI_CONFIG_SHEET_NAME);
+    colsBefore = cfg.getLastColumn();
+    ensureAIConfigModelColumns_(cfg, getAIModelRegistry_(ss));
+    colsAfter = cfg.getLastColumn();
+  } catch (e) { /* คอลัมน์เติมรอบหน้าได้ ไม่ critical */ }
+
+  return out({ result: 'success', liveTotal: live.length, appendable: appendable.length,
+               added: added, deprecated: deprecated, leftUnchanged: leftCount,
+               configColsBefore: colsBefore, configColsAfter: colsAfter });
+}
+
+/* =========================================================
+   429 policy (Q3/Q4): แยก RPD (PerDay) ออกจาก RPM (PerMinute)
+   - PerDay  → zero โควต้าโมเดลนั้นทั้งวัน (markModelExhausted_ เดิม)
+   - PerMinute/unknown → cooldown สั้นใน CacheService, ไม่แตะโควต้าวัน → ลองโมเดล/คีย์ถัดไป
+   เหตุผล unknown→cooldown: ถ้า zero ผิดตอน RPM จะทำ flash รุ่น RPM ต่ำฆ่าตัวเอง แล้วตกไปใช้ subscription ทั้งที่ยังมีโควต้าวัน
+   ground-truth shape (compat endpoint 429): [{error:{status:"RESOURCE_EXHAUSTED",message,details:[{QuotaFailure:{violations:[{quotaId:"...PerMinute..."}]}},{RetryInfo:{retryDelay:"59s"}}]}}]
+   ========================================================= */
+
+// จำแนก metric ของ 429 → { metric: 'perDay'|'perMinute'|'unknown', retrySec }
+function parseGemini429_(body, headers) {
+  var metric = 'unknown', retrySec = 0;
+  try {
+    var j = typeof body === 'string' ? JSON.parse(body) : body;
+    if (Array.isArray(j)) j = j[0] || {};        // compat endpoint ครอบด้วย array
+    var err = j.error || j;
+    var blob = JSON.stringify(err.details || {}) + " " + String(err.message || "");
+    if (/PerMinute|RequestsPerMinute|per[\s_-]?minute/i.test(blob)) metric = 'perMinute';
+    else if (/PerDay|RequestsPerDay|per[\s_-]?day/i.test(blob)) metric = 'perDay';
+    var m = JSON.stringify(err.details || {}).match(/"retryDelay"\s*:\s*"(\d+)(?:\.\d+)?s"/);
+    if (!m) m = String(err.message || "").match(/retry in (\d+)(?:\.\d+)?\s*s/i);
+    if (m) retrySec = parseInt(m[1], 10);
+  } catch (e) {}
+  if (!retrySec && headers) {
+    var ra = headers["Retry-After"] || headers["retry-after"];
+    if (ra) retrySec = parseInt(ra, 10) || 0;
+  }
+  if (!retrySec || retrySec < 1) retrySec = 60;   // ไม่มีสัญญาณ → default 60s
+  return { metric: metric, retrySec: retrySec };
+}
+
+// cooldown แบบ ephemeral ต่อ (key,model) — GAS doPost ไม่มี state ข้าม call จึงเก็บใน CacheService
+function _cooldownCacheKey_(apiKey, model) { return "cooldown:" + String(apiKey).slice(-4) + ":" + model; }
+function setModelCooldown_(apiKey, model, ttlSec) {
+  try {
+    var ttl = Math.min(Math.max(parseInt(ttlSec, 10) || 60, 1), 21600); // CacheService cap = 6h
+    CacheService.getScriptCache().put(_cooldownCacheKey_(apiKey, model), "1", ttl);
+  } catch (e) { console.warn("setModelCooldown_ failed: " + e.message); }
+}
+function isModelCoolingDown_(apiKey, model) {
+  try { return CacheService.getScriptCache().get(_cooldownCacheKey_(apiKey, model)) !== null; }
+  catch (e) { return false; }
+}
+
+// ตัวจัดการ 429 เดียวที่ทุก path เรียก — คืน { action:'exhausted'|'cooldown', metric, retrySec }
+function handleGemini429_(apiKeyInfo, model, body, headers) {
+  var p = parseGemini429_(body, headers);
+  if (p.metric === 'perDay') {
+    markModelExhausted_(apiKeyInfo, model);                 // โควต้าวันหมดจริง → zero
+    return { action: 'exhausted', metric: p.metric, retrySec: p.retrySec };
+  }
+  setModelCooldown_(apiKeyInfo.key, model, p.retrySec);      // perMinute/unknown → cooldown, ไม่แตะโควต้าวัน
+  return { action: 'cooldown', metric: p.metric, retrySec: p.retrySec };
+}
+
+// Verify action — GET ?action=verifyRpmCooldown
+// burst compat จน 429 จริง แล้วรัน handleGemini429_ → ยืนยัน perMinute: _Remaining ไม่ถูกแตะ + cooldown ถูกตั้ง
+function verifyRpmCooldown() {
+  function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  var ss = SpreadsheetApp.openById(SHEET_ID), sheet = ss.getSheetByName(AI_CONFIG_SHEET_NAME);
+  if (!sheet) return out({ result: 'error', message: 'AI_Config not found' });
+  var data = sheet.getDataRange().getValues(), headers = data[0];
+  var colKey = headers.indexOf("API_Key"), colStatus = headers.indexOf("Status");
+  var model = "gemini-3.1-flash-lite", remCol = headers.indexOf(model + "_Remaining");
+  var apiKey = "", rowIndex = -1;
+  for (var i = 1; i < data.length; i++) {
+    var k = String(data[i][colKey] || "").trim();
+    if (k.indexOf("AIza") === 0 && String(data[i][colStatus]).trim() === "Active") { apiKey = k; rowIndex = i + 1; break; }
+  }
+  if (!apiKey) return out({ result: 'error', message: 'no active key' });
+  var apiKeyInfo = { key: apiKey, index: rowIndex, model: model };
+  var remainingBefore = remCol >= 0 ? Number(sheet.getRange(rowIndex, remCol + 1).getValue()) : null;
+
+  for (var n = 0; n < 30; n++) {
+    var resp = UrlFetchApp.fetch(GEMINI_OPENAI_COMPAT_ENDPOINT, {
+      method: "post", contentType: "application/json",
+      headers: { Authorization: "Bearer " + apiKey },
+      payload: JSON.stringify({ model: model, messages: [{ role: "user", content: "ping" }], max_tokens: 4 }),
+      muteHttpExceptions: true
+    });
+    if (resp.getResponseCode() === 429) {
+      var r = handleGemini429_(apiKeyInfo, model, resp.getContentText(), resp.getAllHeaders());
+      var remainingAfter = remCol >= 0 ? Number(sheet.getRange(rowIndex, remCol + 1).getValue()) : null;
+      return out({ result: 'success', trippedAt: n + 1, handled: r,
+                   remainingBefore: remainingBefore, remainingAfter: remainingAfter,
+                   remainingUntouched: remainingBefore === remainingAfter,
+                   cooldownSet: isModelCoolingDown_(apiKey, model) });
+    }
+  }
+  return out({ result: 'no429', note: 'RPM not tripped within 30 calls' });
+}
+
+// helper: อ่าน Active AIza key ตัวแรกจาก AI_Config ตรงๆ (read-only) — ใช้ร่วมหลาย diagnostic/enable-gate
+function firstActiveAiKey_(ss) {
+  ss = ss || SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_CONFIG_SHEET_NAME);
+  if (!sheet) return "";
+  var data = sheet.getDataRange().getValues(), headers = data[0];
+  var colKey = headers.indexOf("API_Key"), colStatus = headers.indexOf("Status");
+  for (var i = 1; i < data.length; i++) {
+    var k = String(data[i][colKey] || "").trim();
+    if (k.indexOf("AIza") === 0 && String(data[i][colStatus]).trim() === "Active") return k;
+  }
+  return "";
+}
+
+// Q6 tool-capability smoke test (fail-closed): ยิง compat endpoint ด้วย tool "ping" แล้วต้องได้ tool_calls กลับ
+// (generateContent support ≠ tool-call support; Claude Code ต้องใช้ tool_calls) → คืน { pass, reason }
+function geminiToolSmokeTest_(model, apiKey) {
+  var payload = {
+    model: model,
+    messages: [{ role: "user", content: "Call the ping function now." }],
+    tools: [{ type: "function", function: {
+      name: "ping", description: "Returns pong.",
+      parameters: { type: "object", properties: {}, required: [] }
+    } }],
+    // force ping — วัด "ทำ tool_calls ได้ไหม" (capability) ไม่ใช่ "อยากทำไหม" (propensity)
+    // tool_choice:"auto" เสี่ยง false-negative: โมเดลที่ทำ tool ได้แต่เลือกตอบ text → deprecate ผิดใน weekly probe
+    tool_choice: { type: "function", function: { name: "ping" } },
+    max_tokens: 64
+  };
+  try {
+    var resp = UrlFetchApp.fetch(GEMINI_OPENAI_COMPAT_ENDPOINT, {
+      method: "post", contentType: "application/json",
+      headers: { Authorization: "Bearer " + apiKey },
+      payload: JSON.stringify(payload), muteHttpExceptions: true
+    });
+    var code = resp.getResponseCode();
+    // transient = 429/5xx: ไม่ใช่ตัวชี้ว่า tool-incapable → weekly probe ต้องไม่ deprecate เพราะเหตุนี้
+    if (code !== 200) return { pass: false, transient: (code === 429 || code >= 500),
+                               reason: "HTTP " + code + ": " + String(resp.getContentText()).slice(0, 160) };
+    var j = JSON.parse(resp.getContentText());
+    var msg = j.choices && j.choices[0] && j.choices[0].message;
+    var tc = msg && msg.tool_calls;
+    if (tc && tc.length && tc[0].function && tc[0].function.name === "ping") return { pass: true, reason: "tool_calls ok" };
+    return { pass: false, transient: false, reason: "no tool_calls (finish=" + (j.choices && j.choices[0] && j.choices[0].finish_reason) + ")" };
+  } catch (e) { return { pass: false, transient: true, reason: e.message }; }
+}
+
+// Q6 enable-gate — GET ?action=enableGeminiModel&model=<id>
+// Disabled → Active ต้องผ่าน smoke test ก่อน (fail-closed). ผ่าน → Status=Active (owner ตั้ง RPD_Limit เองตาม Q1)
+// ไม่ผ่าน → คง Disabled, เขียน Notes "tool-incapable: <reason>"
+function enableGeminiModel(modelParam) {
+  function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  var model = String(modelParam || "").trim();
+  if (!model) return out({ result: 'error', message: 'missing model param' });
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
+  if (!sheet) return out({ result: 'error', message: 'AI_Models not found' });
+  var data = sheet.getDataRange().getValues();
+  var statusCol = 3, notesCol = 4, row = -1;
+  for (var i = 1; i < data.length; i++) { if (String(data[i][0]).trim() === model) { row = i + 1; break; } }
+  if (row < 0) return out({ result: 'error', message: 'model not in AI_Models: ' + model });
+  var apiKey = firstActiveAiKey_(ss);
+  if (!apiKey) return out({ result: 'error', message: 'no active key' });
+
+  var today = Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd");
+  var t = geminiToolSmokeTest_(model, apiKey);
+  if (!t.pass) {
+    aiSheetRetry_(function() { sheet.getRange(row, notesCol + 1).setValue("tool-incapable: " + t.reason + " (" + today + ")"); });
+    SpreadsheetApp.flush();
+    return out({ result: 'refused', model: model, reason: t.reason });
+  }
+  aiSheetRetry_(function() { sheet.getRange(row, statusCol + 1).setValue("Active"); });
+  SpreadsheetApp.flush();
+  return out({ result: 'success', model: model, enabled: true, note: 'ตั้ง RPD_Limit > 0 เพื่อเริ่ม serve (Q1 human-confirmed)' });
+}
+
+// "ปุ่ม activate" — รันจาก editor เท่านั้น (ไม่ผูก doGet: deploy นี้เป็น public no-auth ที่นิสิตเรียก)
+// Batch: ทุกแถว Disabled ที่ model ขึ้นต้น gemini- และ RPD_Limit>0 → smoke test → ผ่าน = Active + backfill
+// <model>_Remaining = RPD ทุก key ที่ Active (serve ได้วันนี้ ไม่ต้องรอ daily reset) · fail จริง = Notes tool-incapable
+// · transient (429/5xx) = ไม่แตะ Notes คง Disabled ให้ลองใหม่ (กัน deprecate ผิดจาก blip)
+// เลือก scope ด้วย RPD: ตั้ง RPD>0 เฉพาะโมเดลที่ต้องการ (เว้น -001 alias/RPD=0 ไว้ = ข้าม)
+function activateDisabledGeminiModels() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var mSheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
+  if (!mSheet) return { result: 'error', message: 'AI_Models not found' };
+  var apiKey = firstActiveAiKey_(ss);
+  if (!apiKey) return { result: 'error', message: 'no active key for smoke test' };
+
+  var cfg = getAIConfigSheet_(ss);
+  var cfgData = cfg.getDataRange().getValues(), cfgHeaders = cfgData[0];
+  var cfgStatusCol = cfgHeaders.indexOf("Status");
+  var today = Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd");
+
+  var data = mSheet.getDataRange().getValues();
+  var statusCol = 3, notesCol = 4; // [Model, RPD_Limit, Priority, Status, Notes]
+  var activated = [], refused = [], transient = [], skipped = [];
+
+  for (var i = 1; i < data.length; i++) {
+    var model = String(data[i][0] || "").trim();
+    var rpd = parseInt(data[i][1], 10) || 0;
+    var status = String(data[i][3] || "").trim();
+    if (model.indexOf("gemini-") !== 0) continue;
+    if (status !== "Disabled") continue;
+    if (rpd <= 0) { skipped.push(model + " (RPD<=0)"); continue; }
+
+    var t = geminiToolSmokeTest_(model, apiKey);
+    if (!t.pass) {
+      if (t.transient) { transient.push(model + ": " + t.reason); continue; } // blip → คง Disabled ไม่เขียน note
+      aiSheetRetry_((function(r, reason) { return function() {
+        mSheet.getRange(r, notesCol + 1).setValue("tool-incapable: " + reason + " (" + today + ")");
+      }; })(i + 1, t.reason));
+      refused.push(model + ": " + t.reason);
+      continue;
+    }
+    // ผ่าน — flip Active + backfill _Remaining=RPD ทุก key ที่ Active (serve วันนี้เลย)
+    aiSheetRetry_((function(r) { return function() {
+      mSheet.getRange(r, statusCol + 1).setValue("Active");
+    }; })(i + 1));
+    var remCol = cfgHeaders.indexOf(model + "_Remaining");
+    var filled = 0;
+    if (remCol >= 0) {
+      for (var k = 1; k < cfgData.length; k++) {
+        if (String(cfgData[k][cfgStatusCol]).trim() !== "Active") continue;
+        cfg.getRange(k + 1, remCol + 1).setValue(rpd);
+        filled++;
+      }
+    }
+    activated.push(model + " (RPD=" + rpd + ", backfilled " + filled + " keys" + (remCol < 0 ? ", NO _Remaining col — serves next reset" : "") + ")");
+  }
+  SpreadsheetApp.flush();
+  var summary = { result: 'success', activated: activated, refused: refused, transient: transient, skipped: skipped };
+  console.log("[activateDisabled] " + JSON.stringify(summary));
+  return summary;
+}
+
+// Verify — GET ?action=verifyToolSmokeTest: known tool-capable (gemini-2.5-flash → pass) vs text-only (gemma-4-31b-it → refuse)
+function verifyToolSmokeTest() {
+  function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  var apiKey = firstActiveAiKey_();
+  if (!apiKey) return out({ result: 'error', message: 'no active key' });
+  return out({ result: 'success',
+    capable_gemini_2_5_flash: geminiToolSmokeTest_("gemini-2.5-flash", apiKey),   // → pass
+    incapable_embedding_001: geminiToolSmokeTest_("gemini-embedding-001", apiKey) }); // no generateContent → fail-closed refuse
+}
+
+/* =========================================================
+   Step 5: scheduled sync (Q5/Q6 cadence)
+   - runGeminiModelSync : DAILY — models.list diff (reconcile), ไม่กิน quota (models.list ฟรี)
+   - runGeminiToolProbe : WEEKLY — tool smoke test บนโมเดล Active; genuine fail → Deprecated+Notes; transient → ข้าม
+   "alert to MDKKUQUIZDATABASE" = console log + สถานะ Deprecated/Notes บนชีต ที่ dashboard อ่านผ่าน aiConfigStatus อยู่แล้ว
+   (backend นี้ไม่มี mail/webhook infra — สถานะบนชีตคือช่องทาง alert)
+   ========================================================= */
+
+// DAILY job — reconcile รายการโมเดลจาก live models.list
+function runGeminiModelSync() {
+  var res = JSON.parse(reconcileGeminiModels().getContent());
+  console.log("[geminiSync] daily reconcile: added=" + JSON.stringify(res.added || [])
+    + " deprecated=" + JSON.stringify(res.deprecated || []) + " left=" + res.leftUnchanged);
+  return res;
+}
+
+// WEEKLY job — re-probe tool capability ของโมเดล Active; genuine fail → Deprecated, transient (429/5xx) → ข้าม
+function runGeminiToolProbe() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
+  if (!sheet) { console.warn("[geminiProbe] ไม่พบ AI_Models"); return { checked: 0, deprecated: 0 }; }
+  var apiKey = firstActiveAiKey_(ss);
+  if (!apiKey) { console.warn("[geminiProbe] ไม่มี active key"); return { checked: 0, deprecated: 0 }; }
+  var data = sheet.getDataRange().getValues();
+  var statusCol = 3, notesCol = 4;
+  var today = Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd");
+  var checked = 0, deprecated = 0, skipped = 0, results = [];
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || "").trim();
+    if (!name || String(data[i][statusCol]).trim() !== "Active" || name.indexOf("gemini-") !== 0) continue;
+    checked++;
+    var t = geminiToolSmokeTest_(name, apiKey);
+    if (t.pass) { results.push(name + ":pass"); continue; }
+    if (t.transient) { skipped++; results.push(name + ":transient"); console.log("[geminiProbe] " + name + " transient, skip: " + t.reason); continue; }
+    sheet.getRange(i + 1, statusCol + 1).setValue("Deprecated");
+    sheet.getRange(i + 1, notesCol + 1).setValue("weekly-probe-failed: " + t.reason + " (" + today + ")");
+    deprecated++; results.push(name + ":DEPRECATED");
+    console.warn("[geminiProbe] " + name + " → Deprecated: " + t.reason);
+  }
+  SpreadsheetApp.flush();
+  console.log("[geminiProbe] checked=" + checked + " deprecated=" + deprecated + " skippedTransient=" + skipped);
+  return { checked: checked, deprecated: deprecated, skippedTransient: skipped, results: results };
+}
+
+// idempotent trigger installer — daily reconcile ~ตี 6, weekly probe อาทิตย์ ~ตี 6 (เว้นตี 3-5 ให้ job เดิม)
+// รันจาก editor ได้เสมอ; ผ่าน web-app ต้องมี scope script.scriptapp (execute-as-owner)
+function installGeminiSyncTriggers() {
+  function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  var handlers = { runGeminiModelSync: true, runGeminiToolProbe: true };
+  try {
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      if (handlers[triggers[i].getHandlerFunction()]) ScriptApp.deleteTrigger(triggers[i]);
+    }
+    ScriptApp.newTrigger('runGeminiModelSync').timeBased().everyDays(1).atHour(6).create();
+    ScriptApp.newTrigger('runGeminiToolProbe').timeBased().onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(6).create();
+    var now = ScriptApp.getProjectTriggers().filter(function(t) { return handlers[t.getHandlerFunction()]; })
+      .map(function(t) { return t.getHandlerFunction() + "/" + t.getEventType(); });
+    return out({ result: 'success', installed: now });
+  } catch (e) {
+    return out({ result: 'error', message: e.message, hint: 'รัน installGeminiSyncTriggers() จาก Apps Script editor แทน' });
+  }
+}
+
+// Read-only probe — GET ?action=probeGeminiTier
+// ยิง endpoint + model เดียวกับ agentQuery Gemini tier (GEMINI_OPENAI_COMPAT_ENDPOINT + AGENT_QUERY_MODEL_OVERRIDE.Gemini)
+// เพื่อยืนยันว่า tier คืน 200 จริงหลัง cleanup — ไม่หัก quota (ไม่เรียก updateAIUsage), ใช้ key ตรงจากชีต
+function probeGeminiTier() {
+  function out(obj) {
+    return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+  }
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_CONFIG_SHEET_NAME);
+  if (!sheet) return out({ result: 'error', message: 'AI_Config sheet not found' });
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var colKey = headers.indexOf("API_Key");
+  var colStatus = headers.indexOf("Status");
+  var apiKey = "";
+  for (var i = 1; i < data.length; i++) {
+    var k = String(data[i][colKey] || "").trim();
+    if (k.indexOf("AIza") === 0 && String(data[i][colStatus]).trim() === "Active") { apiKey = k; break; }
+  }
+  if (!apiKey) return out({ result: 'error', message: 'no Active AIza key in AI_Config' });
+
+  var model = AGENT_QUERY_MODEL_OVERRIDE["Gemini"];
+  var resp = UrlFetchApp.fetch(GEMINI_OPENAI_COMPAT_ENDPOINT, {
+    method: "post", contentType: "application/json",
+    headers: { "Authorization": "Bearer " + apiKey },
+    payload: JSON.stringify({ model: model, messages: [{ role: "user", content: "ping" }], max_tokens: 8 }),
+    muteHttpExceptions: true
+  });
+  var code = resp.getResponseCode();
+  return out({ result: 'success', model: model, code: code, ok: code === 200,
+               snippet: String(resp.getContentText()).slice(0, 300) });
+}
+
+// One-off cleanup — GET ?action=purgeFakeGeminiModelRows
+// ลบแถวโมเดลปลอมออกจาก AI_Models (ไม่มีใน models.list จริง): gemini-3-flash, gemini-3.1-pro
+// idempotent — รันซ้ำได้ (ไม่เจอก็ข้าม). ไม่แตะคอลัมน์ orphan _Remaining ใน AI_Config (คงโครง monotonic)
+function purgeFakeGeminiModelRows() {
+  function out(obj) {
+    return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+  }
+  var FAKE = { "gemini-3-flash": true, "gemini-3.1-pro": true,
+               "gemini-3.1-pro-preview-customtools": true }; // ตัวหลัง = leaked จาก filter รอบแรก (preview กลางสตริง) — ลบทิ้ง
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
+  if (!sheet) return out({ result: 'error', message: 'AI_Models sheet not found' });
+  var data = sheet.getDataRange().getValues();
+  var removed = [];
+  for (var i = data.length - 1; i >= 1; i--) { // bottom-up: index ของแถวที่เหลือไม่เลื่อน
+    var name = String(data[i][0] || "").trim();
+    if (FAKE[name]) { sheet.deleteRow(i + 1); removed.push(name); }
+  }
+  SpreadsheetApp.flush();
+  return out({ result: 'success', removed: removed, rowsLeft: sheet.getLastRow() - 1 });
 }
 
 // One-off/idempotent: สร้าง AI_Models + migrate AI_Config เป็นโครงใหม่ — GET ?action=setupAIConfig
@@ -552,7 +1038,7 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
       if (res.fatal) throw new Error("แปลงไม่สำเร็จ: " + lastErr);
       // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp แล้วข้ามไปโมเดลถัดไปเลย
       if (res.recitation) { convTemp = 0.8; break; }
-      if (res.quota) markModelExhausted_(apiKeyInfo, models[mi]); // 429 → โมเดลนี้หมดโควต้าวันนี้สำหรับ key นี้
+      if (res.quota) handleGemini429_(apiKeyInfo, models[mi], res.body429, res.headers429); // 429: perDay→zero, perMinute/unknown→cooldown
       if (res.nextModel) break; // 429/404 → ข้ามไปโมเดลถัดไปเลย ไม่ต้องลอง variant
       // อื่นๆ (400/คำตอบว่าง) → วนไป variant ไม่ส่ง thinkingConfig; ถ้าหมด variant ก็ตกไปโมเดลถัดไป
     }
@@ -626,7 +1112,8 @@ function tryConverterCall_(prompt, apiKey, model, disableThinking, pdfB64, image
     }
 
     var msg = (resJson.error && resJson.error.message) || ("HTTP " + code);
-    if (code === 429 || code === 404 || code >= 500) return { ok: false, error: msg, nextModel: true, quota: code === 429 }; // quota/ไม่มีโมเดล/overloaded → โมเดลถัดไป
+    if (code === 429) return { ok: false, error: msg, nextModel: true, quota: true, body429: response.getContentText(), headers429: response.getAllHeaders() }; // 429 → caller แยก perDay/perMinute
+    if (code === 404 || code >= 500) return { ok: false, error: msg, nextModel: true }; // ไม่มีโมเดล/overloaded → โมเดลถัดไป
     if (code === 400) return { ok: false, error: msg }; // เช่น reject thinkingConfig → ลอง variant ถัดไป
     return { ok: false, error: msg, fatal: true }; // 401/403 — key ใช้ไม่ได้ เปลี่ยนโมเดลก็ไม่ช่วย
   } catch (e) {

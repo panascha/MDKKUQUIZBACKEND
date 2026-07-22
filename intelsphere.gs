@@ -554,8 +554,16 @@ function executeAgentQuery(request) {
 
   // ---- Tier สุดท้าย: personal Gemini pool (AI_Config sheet เดิม — rotation/daily-reset ในตัว) ----
   // reserve: กัน key ที่เหลือโควต้ามากสุดไว้ให้ converter/นิสิต — owner ใช้เฉพาะส่วนที่เหลือ
-  var geminiKey = getAvailableAIKey("Gemini", null, AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT);
-  if (geminiKey) {
+  // ลูปมี bound: 429 (RPM cooldown / RPD zero ผ่าน handleGemini429_) → เลือก (key,model) ใหม่ที่ยังไม่ถูกกัน
+  // แทนที่จะตกไปใช้ subscription ทันที (บั๊กเดิม: Claude Code ยิงถี่ → RPM 429 → subscription ทั้งที่โควต้าวันยังเหลือ)
+  for (var gi = 0; gi < 4; gi++) {
+    var geminiKey = getAvailableAIKey("Gemini", null, AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT);
+    if (!geminiKey) {
+      // แยก "pool ว่างจริง" ออกจาก "ยังมี key แต่ถูกจองไว้ให้ผู้ใช้สาธารณะ/ถูก cooldown" — ไม่งั้นอ่าน log แล้วแยกไม่ออก
+      if (gi === 0) console.warn("[agentQuery] Gemini tier ว่าง — pool หมดจริง หรือเหลือแต่ key ที่จองไว้ให้สาธารณะ (reserve="
+        + AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT + ")");
+      break;
+    }
     var gPayload = JSON.parse(JSON.stringify(request));
     gPayload.model = geminiKey.model || "gemini-2.5-flash";
     delete gPayload.stream;
@@ -564,16 +572,18 @@ function executeAgentQuery(request) {
       headers: { "Authorization": "Bearer " + geminiKey.key },
       payload: JSON.stringify(gPayload), muteHttpExceptions: true
     });
-    if (gResp.getResponseCode() === 200) {
+    var gCode = gResp.getResponseCode();
+    if (gCode === 200) {
       updateAIUsage(geminiKey, geminiKey.model);
       return { provider: "gemini:" + gPayload.model, completion: JSON.parse(gResp.getContentText()) };
     }
-    console.warn("[agentQuery] Gemini HTTP " + gResp.getResponseCode() + ": " + String(gResp.getContentText()).slice(0, 200));
-  } else {
-    // แยก "pool ว่างจริง" ออกจาก "ยังมี key แต่ถูกจองไว้ให้ผู้ใช้สาธารณะ" — ไม่งั้นอ่าน log แล้วแยกไม่ออก
-    // ว่าทำไม owner ถึงตกไปใช้ Anthropic subscription ทั้งที่ AI_Config ยังมีโควต้าเหลือ
-    console.warn("[agentQuery] Gemini tier ว่าง — pool หมดจริง หรือเหลือแต่ key ที่จองไว้ให้สาธารณะ (reserve="
-      + AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT + ")");
+    if (gCode === 429) {
+      // perDay → zero โควต้าวัน · perMinute/unknown → cooldown สั้น; getAvailableAIKey รอบถัดไปจะข้าม (key,model) นี้
+      handleGemini429_(geminiKey, gPayload.model, gResp.getContentText(), gResp.getAllHeaders());
+      continue;
+    }
+    console.warn("[agentQuery] Gemini HTTP " + gCode + ": " + String(gResp.getContentText()).slice(0, 200));
+    break; // 4xx/5xx อื่น (ไม่ใช่ quota) — เลิกลอง Gemini tier
   }
 
   // Terminal failure — ตั้งใจให้ fail ทันที proxy ฝั่ง client จะแสดง error ชัดๆ ไม่ retry

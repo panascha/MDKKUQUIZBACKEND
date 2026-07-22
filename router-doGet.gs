@@ -29,6 +29,10 @@ function doGet(e) {
   if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
   if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
   if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)
+  if (action == 'discoverGeminiModels') return discoverGeminiModels(); // read-only: live models.list (แหล่งความจริงของ model IDs)
+  // NOTE: gemini-sync ที่ mutate/กิน quota (reconcile/enable/purge/runGeminiModelSync/runGeminiToolProbe/installGeminiSyncTriggers)
+  // เจตนา NOT exposed ทาง doGet — deployment นี้ public no-auth (frontend นิสิตเรียก getStructure ฯลฯ). Trigger เรียก fn ตรง,
+  // manual ก็รันจาก Apps Script editor. verify actions (probeGeminiTier/verifyRpmCooldown/verifyToolSmokeTest) ก็เอาออก (scaffolding + verifyRpmCooldown burst pool ที่นิสิตใช้ร่วม).
   if (action == 'recoverAIConfigKeys') return recoverAIConfigKeys(e.parameter.before); // กู้ key จาก revision history (idempotent)
 
 
