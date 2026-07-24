@@ -5,6 +5,7 @@ function inferProviderFromModel(modelId) {
   if (/^gemini-/i.test(modelId))                           return "Gemini";
   if (/^llama-/i.test(modelId))                            return "Meta";
   if (/^minimax-/i.test(modelId))                          return "MiniMax";
+  if (/^kimi/i.test(modelId))                              return "MoonshotAI";
   if (/^(mistral-|codestral-|devstral-)/i.test(modelId))   return "Mistral";
   if (/^nova-/i.test(modelId))                             return "Nova";
   if (/^gpt-/i.test(modelId))                              return "OpenAI";
@@ -358,14 +359,17 @@ function generateAgentQueryOwnerSecret() {
 }
 
 // Priority แยกจาก INTELSPHERE_PROVIDER_PRIORITY โดยเจตนา — agent ต้องการโมเดลแรงสุดก่อน ไม่ใช่ถูกสุดก่อน
-var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Qwen", "OpenAI", "Gemini", "xAI"];
+var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Mistral", "MoonshotAI", "Qwen", "OpenAI", "Gemini", "xAI"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
-var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
+var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Mistral": 128000, "MoonshotAI": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
 // Overflow tier: providers ที่มีโควต้าเหลือเยอะแต่จง "ใช้เป็น buffer หลัง Deepseek/Qwen/OpenAI" ไม่ใช่ workhorse หลัก
 // (ไม่งั้น quota-sort ใน orderAgentProviders จะดันขึ้นหน้าเพราะโควต้าสูงสุด) — Deepseek ยังเป็น coding model หลัก
 var AGENT_QUERY_OVERFLOW_PROVIDERS = { "Gemini": true, "xAI": true };
 // โมเดลเฉพาะ agentQuery ต่อ overflow provider — override PROVIDER_MODEL_MAP โดยไม่แตะ path ของ chatbot นิสิต
+// Mistral: เคย override เป็น devstral-medium (agentic-coding) แต่ IntelSphere map ไป mistralai/devstral-medium
+// บน OpenRouter ซึ่งถูกปลด ("No endpoints found") → ตอนนี้ปล่อยให้ตกไป PROVIDER_MODEL_MAP.Mistral = mistral-medium-3
+// (slug เดียวกับ chatbot นิสิต, verified live). ใส่ override กลับได้เมื่อยืนยัน devstral slug ที่ IntelSphere รับจริง
 var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-3.5-flash", "xAI": "grok-4.3" };
 // จอง key ไว้สำหรับผู้ใช้สาธารณะ — agentQuery (owner proxy) จะไม่ใช้ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก
 // (key = 1 API_Key ใช้ได้ทุก provider → reserve ทั้ง key ไม่ใช่แยก provider)
@@ -513,6 +517,16 @@ function executeAgentQuery(request) {
 
     if (code === 200) {
       var body = JSON.parse(response.getContentText());
+      // IntelSphere บางครั้งห่อ error ของ provider ต้นทาง (เช่น OpenRouter "No endpoints found for <model>")
+      // ไว้ใน HTTP 200 — body เป็น error object ไม่มี choices. ถ้า return ตรงนี้ router จะ throw "no choices"
+      // และ chain ไม่ cascade (quota ไม่ลด → orderAgentProviders ดัน provider เดิมขึ้นหน้าทุกครั้ง = ติด loop).
+      // ถือเป็น provider failure: ข้าม provider นี้แล้ว cascade ต่อ.
+      if (!body.choices || !body.choices.length) {
+        console.warn("[agentQuery] " + provider + " HTTP 200 but no choices (upstream error 200-wrapped): "
+          + String(response.getContentText()).slice(0, 200));
+        skip[provider] = true;
+        continue;
+      }
       var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
       var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
       sheet.getRange(keyObj.rowIndex, headers.indexOf("Last_Used") + 1).setValue(new Date());
@@ -556,8 +570,9 @@ function executeAgentQuery(request) {
   // reserve: กัน key ที่เหลือโควต้ามากสุดไว้ให้ converter/นิสิต — owner ใช้เฉพาะส่วนที่เหลือ
   // ลูปมี bound: 429 (RPM cooldown / RPD zero ผ่าน handleGemini429_) → เลือก (key,model) ใหม่ที่ยังไม่ถูกกัน
   // แทนที่จะตกไปใช้ subscription ทันที (บั๊กเดิม: Claude Code ยิงถี่ → RPM 429 → subscription ทั้งที่โควต้าวันยังเหลือ)
+  var avoidGeminiModels = {}; // โมเดลที่ 429/5xx ใน call นี้ → getAvailableAIKey ข้าม → cascade ไป priority ถัดไป (เช่น flash-lite RPD 500) แทนวน key เดิม
   for (var gi = 0; gi < 4; gi++) {
-    var geminiKey = getAvailableAIKey("Gemini", null, AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT);
+    var geminiKey = getAvailableAIKey("Gemini", null, AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT, avoidGeminiModels);
     if (!geminiKey) {
       // แยก "pool ว่างจริง" ออกจาก "ยังมี key แต่ถูกจองไว้ให้ผู้ใช้สาธารณะ/ถูก cooldown" — ไม่งั้นอ่าน log แล้วแยกไม่ออก
       if (gi === 0) console.warn("[agentQuery] Gemini tier ว่าง — pool หมดจริง หรือเหลือแต่ key ที่จองไว้ให้สาธารณะ (reserve="
@@ -574,16 +589,29 @@ function executeAgentQuery(request) {
     });
     var gCode = gResp.getResponseCode();
     if (gCode === 200) {
+      var gBody = JSON.parse(gResp.getContentText());
+      // same 200-wrapped-error guard as the IntelSphere tier — อย่า return error object เป็น completion
+      if (!gBody.choices || !gBody.choices.length) {
+        console.warn("[agentQuery] Gemini " + gPayload.model + " HTTP 200 but no choices (upstream error 200-wrapped): "
+          + String(gResp.getContentText()).slice(0, 200));
+        avoidGeminiModels[gPayload.model] = true; // cascade ไปโมเดล/ key ถัดไป แทนวนเดิม
+        continue;
+      }
       updateAIUsage(geminiKey, geminiKey.model);
-      return { provider: "gemini:" + gPayload.model, completion: JSON.parse(gResp.getContentText()) };
+      return { provider: "gemini:" + gPayload.model, completion: gBody };
     }
     if (gCode === 429) {
       // perDay → zero โควต้าวัน · perMinute/unknown → cooldown สั้น; getAvailableAIKey รอบถัดไปจะข้าม (key,model) นี้
       handleGemini429_(geminiKey, gPayload.model, gResp.getContentText(), gResp.getAllHeaders());
+      avoidGeminiModels[gPayload.model] = true; // burst RPM: อย่าวน key เดิมของโมเดลนี้ต่อ — cascade ไปโมเดล quota เหลือเยอะ (flash-lite) ทันที
       continue;
     }
     console.warn("[agentQuery] Gemini HTTP " + gCode + ": " + String(gResp.getContentText()).slice(0, 200));
-    break; // 4xx/5xx อื่น (ไม่ใช่ quota) — เลิกลอง Gemini tier
+    if (gCode >= 500) { // transient ฝั่ง Google (503/500) — อย่าทิ้งทั้ง tier เพราะ error ครั้งเดียว; ข้ามโมเดลนี้แล้ว cascade ต่อ
+      avoidGeminiModels[gPayload.model] = true;
+      continue;
+    }
+    break; // 4xx อื่น (bad payload/auth — ไม่ใช่ quota/transient) — เลิกลอง Gemini tier
   }
 
   // Terminal failure — ตั้งใจให้ fail ทันที proxy ฝั่ง client จะแสดง error ชัดๆ ไม่ retry
@@ -635,7 +663,7 @@ function setupIntelSphereSheet() {
     "Timestamp", "Donor_Name", "API_Key", "Status", "Last_Used", "Last_Reset_Date",
     "Deepseek_Remaining", "Gemini_Remaining", "Meta_Remaining", "Nova_Remaining",
     "xAI_Remaining", "Qwen_Remaining", "OpenAI_Remaining", "Claude_Remaining",
-    "Mistral_Remaining", "MiniMax_Remaining", "Notes"
+    "Mistral_Remaining", "MiniMax_Remaining", "MoonshotAI_Remaining", "Notes"
   ];
 
   // เขียน headers เฉพาะเมื่อแถว 1 ยังว่าง (ไม่ทับของเดิม)

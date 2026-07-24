@@ -850,13 +850,14 @@ var INTELSPHERE_ENDPOINT = "https://gen.ai.kku.ac.th/api/v1/chat/completions";
 var INTELSPHERE_QUOTA_FLOOR = 0.05; // skip a provider whose remaining < 5% of its daily limit
 
 var INTELSPHERE_LIMITS = {
-  "Deepseek": 1000000, "Gemini": 350000, "Meta": 200000, "Nova": 200000, "xAI": 200000,
-  "Qwen": 200000, "OpenAI": 150000, "Claude": 150000, "Mistral": 150000, "MiniMax": 100000
+  "Deepseek": 1000000, "Gemini": 350000, "Meta": 200000, "Nova": 200000, "xAI": 100000,
+  "Qwen": 100000, "OpenAI": 200000, "Claude": 200000, "Mistral": 100000, "MiniMax": 100000,
+  "MoonshotAI": 100000
   // Perplexity intentionally excluded — no published model ID
 };
 
 var INTELSPHERE_PROVIDER_PRIORITY = [
-  "Deepseek", "Gemini", "Meta", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "Mistral", "MiniMax"
+  "Deepseek", "Gemini", "Meta", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "Mistral", "MiniMax", "MoonshotAI"
 ];
 
 // One flagship model per provider — used ONLY when rotation moves to a provider
@@ -865,7 +866,7 @@ var PROVIDER_MODEL_MAP = {
   "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-2.5-flash",   "Meta": "llama-4-maverick",
   "Nova":     "nova-pro-v1",       "xAI":    "grok-4",             "Qwen": "qwen3.7-plus",
   "OpenAI":   "gpt-5-mini",        "Claude": "claude-sonnet-4.5",  "Mistral": "mistral-medium-3",
-  "MiniMax":  "minimax-m3"
+  "MiniMax":  "minimax-m3",        "MoonshotAI": "kimi-k3"
 };
 
 // Hardcoded fallback catalog — used ONLY when the live GET /models fetch fails.
@@ -875,6 +876,7 @@ var PROVIDER_MODELS_FALLBACK = {
   "Gemini":   ["gemini-3.5-flash","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
   "Meta":     ["llama-4-maverick","llama-4-scout"],
   "MiniMax":  ["minimax-m3"],
+  "MoonshotAI": ["kimi-k3"],
   "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","codestral-2508","devstral-medium","codestral-2501"],
   "Nova":     ["nova-2-lite-v1","nova-pro-v1"],
   "OpenAI":   ["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano","gpt-5.2","gpt-5.1","gpt-5.1-codex","gpt-5","gpt-5-mini","gpt-5-nano","gpt-5.5"],

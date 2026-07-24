@@ -30,6 +30,7 @@ function doGet(e) {
   if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
   if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)
   if (action == 'discoverGeminiModels') return discoverGeminiModels(); // read-only: live models.list (แหล่งความจริงของ model IDs)
+  if (action == 'getAIModels') return getAIModels(); // read-only: ทะเบียน AI_Models สำหรับ admin panel (P2-Q6)
   // NOTE: gemini-sync ที่ mutate/กิน quota (reconcile/enable/purge/runGeminiModelSync/runGeminiToolProbe/installGeminiSyncTriggers)
   // เจตนา NOT exposed ทาง doGet — deployment นี้ public no-auth (frontend นิสิตเรียก getStructure ฯลฯ). Trigger เรียก fn ตรง,
   // manual ก็รันจาก Apps Script editor. verify actions (probeGeminiTier/verifyRpmCooldown/verifyToolSmokeTest) ก็เอาออก (scaffolding + verifyRpmCooldown burst pool ที่นิสิตใช้ร่วม).

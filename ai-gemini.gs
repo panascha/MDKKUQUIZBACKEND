@@ -228,7 +228,7 @@ function ensureAIConfigModelColumns_(sheet, models) {
  *   — ผู้เรียกที่เป็น owner (agentQuery) เท่านั้นที่ส่งค่า > 0; converter/นิสิตใช้ default 0 = ใช้ได้ทุก key
  *   ถ้า active key มีไม่เกิน reserveCount → คืน null (ตั้งใจ: shared pool มาก่อน owner)
  */
-function getAvailableAIKey(provider, preferredModel, reserveCount) {
+function getAvailableAIKey(provider, preferredModel, reserveCount, avoidModels) {
   if (provider && provider !== "Gemini") return null; // pool นี้มีแต่ Gemini (IntelSphere แยกชีตของตัวเอง)
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = getAIConfigSheet_(ss);
@@ -269,6 +269,7 @@ function getAvailableAIKey(provider, preferredModel, reserveCount) {
       var remaining = Number(row[remCol]);
       if (isNaN(remaining) || remaining <= 0) continue;
       if (isModelCoolingDown_(row[0], activeModels[j].model)) continue; // ข้าม (key,model) ที่กำลัง RPM cooldown
+      if (avoidModels && avoidModels[activeModels[j].model]) continue;   // ข้ามโมเดลที่เพิ่ง 429/5xx ใน call นี้ → cascade ไป priority ถัดไป
       candidates.push({
         key: row[0], model: activeModels[j].model, index: i + 1,
         usage: activeModels[j].limit - remaining, limit: activeModels[j].limit,
@@ -369,6 +370,81 @@ function getAIConfigStatus() {
   return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
 }
 
+// Public read-only — GET ?action=getAIModels: ทะเบียนโมเดลสำหรับ admin panel (P2-Q6)
+// คืน [{model, rpd, priority, status, notes}] ตรงจากชีต AI_Models (ไม่ sensitive → public เหมือน aiConfigStatus)
+function getAIModels() {
+  function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
+  if (!sheet) return out({ result: 'error', message: 'AI_Models not found' });
+  var data = sheet.getDataRange().getValues();
+  var rows = [];
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || "").trim();
+    if (!name) continue;
+    rows.push({ model: name, rpd: data[i][1], priority: data[i][2],
+                status: String(data[i][3] || "").trim(), notes: String(data[i][4] || "") });
+  }
+  return out({ result: 'success', models: rows });
+}
+
+// Admin write — POST action=setModelRpd {model, rpd?, priority?} (P2-Q1/Q5: RPD = human go-live gate; P2-Q7: priority override)
+// เขียนเฉพาะ field ที่ส่งมา (อย่างน้อย 1). rpd = non-negative int; priority = int (ติดลบได้ = flagship min-1)
+// reset registry cache + ensureAIConfigModelColumns_ + backfill _Remaining=rpd ทุก key Active → serve วันนี้เลย
+// auth ทำที่ doPost (mirror getFeedback: sessionToken admin หรือ username+adminPass) — ฟังก์ชันนี้ถือว่า authed แล้ว
+function setModelRpd(model, rpd, priority) {
+  function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  var name = String(model || "").trim();
+  if (!name) return out({ result: 'error', message: 'missing model' });
+  var hasRpd = (rpd !== undefined && rpd !== null && String(rpd).trim() !== "");
+  var hasPrio = (priority !== undefined && priority !== null && String(priority).trim() !== "");
+  if (!hasRpd && !hasPrio) return out({ result: 'error', message: 'nothing to set (need rpd or priority)' });
+  var rpdN, prioN;
+  if (hasRpd) {
+    rpdN = Number(rpd);
+    if (!isFinite(rpdN) || rpdN < 0 || Math.floor(rpdN) !== rpdN) return out({ result: 'error', message: 'rpd must be a non-negative integer' });
+  }
+  if (hasPrio) {
+    prioN = Number(priority);
+    if (!isFinite(prioN) || Math.floor(prioN) !== prioN) return out({ result: 'error', message: 'priority must be an integer' });
+  }
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
+  if (!sheet) return out({ result: 'error', message: 'AI_Models not found' });
+  var data = sheet.getDataRange().getValues();
+  var row = -1;
+  for (var i = 1; i < data.length; i++) { if (String(data[i][0]).trim() === name) { row = i + 1; break; } }
+  if (row < 0) return out({ result: 'error', message: 'model not in AI_Models: ' + name });
+
+  aiSheetRetry_(function() {
+    if (hasRpd) sheet.getRange(row, 2).setValue(rpdN);   // col 2 = RPD_Limit
+    if (hasPrio) sheet.getRange(row, 3).setValue(prioN); // col 3 = Priority
+  });
+  SpreadsheetApp.flush();
+  _aiModelRegistryCache = null; // registry re-read เห็น limit/priority ใหม่
+  var backfilled = 0;
+  try {
+    var cfg = getAIConfigSheet_(ss); // ensureAIConfigModelColumns_ ในตัว → คอลัมน์ _Remaining มีแน่
+    if (hasRpd) {
+      // backfill _Remaining=rpd ให้ทุก key Active → serve วันนี้เลย (house-style activateDisabledGeminiModels)
+      var cfgData = cfg.getDataRange().getValues(), cfgHeaders = cfgData[0];
+      var cfgStatusCol = cfgHeaders.indexOf("Status"), remCol = cfgHeaders.indexOf(name + "_Remaining");
+      if (remCol >= 0) {
+        for (var k = 1; k < cfgData.length; k++) {
+          if (String(cfgData[k][0] || "").trim() && String(cfgData[k][cfgStatusCol]).trim() === "Active") {
+            cfg.getRange(k + 1, remCol + 1).setValue(rpdN); backfilled++;
+          }
+        }
+        SpreadsheetApp.flush();
+      }
+    }
+  } catch (e) { /* คอลัมน์/backfill รอบหน้าได้ (daily-reset ก็เติมให้) */ }
+  return out({ result: 'success', model: name,
+               rpd: hasRpd ? rpdN : undefined, priority: hasPrio ? prioN : undefined,
+               backfilledKeys: backfilled,
+               note: hasRpd ? 'serve ได้ทันที (backfill ' + backfilled + ' keys)' : 'priority updated' });
+}
+
 // ดึง live models จาก models.list — แหล่งความจริงเดียวว่ามีโมเดลไหนจริง (แชร์ discover + reconcile)
 // อ่าน Active key ตรงจากชีต ไม่ผ่าน getAvailableAIKey (ตัวนั้น write ตอน daily-reset → จะละเมิด read-only)
 // คืน [{id, displayName, methods}] ตามหน้า (paginate). โยน error ถ้าดึงไม่ได้
@@ -432,6 +508,57 @@ function isSyncableGeminiModel_(m) {
   return true;
 }
 
+/* =========================================================
+   Phase 2 (P2-Q2/Q3): auto newer-first ranking on append — pure, testable, no GAS globals.
+   parse id → (tierRank, major, minor); sort key = (tierRank asc, major desc, minor desc).
+   Notes vocab (shared w/ probe auto-enable + admin panel — DO NOT drift):
+     clean auto-rank : "auto-discovered <date>"
+     rank fail-safe  : "auto-discovered <date> needs-manual-priority"
+   ========================================================= */
+
+// parse "gemini-X.Y-<tier>" → {tierRank, major, minor} หรือ null (curveball: preview/latest/date/-8b/customtools)
+// flash-lite ต้องมาก่อน flash ใน alternation ไม่งั้น lite ไปแมตช์ prefix "flash"
+function _parseGeminiRank_(id) {
+  var m = String(id || "").match(/^gemini-(\d+)\.(\d+)-(flash-lite|flash|pro)$/);
+  if (!m) return null;
+  var tierRank = { "flash": 0, "flash-lite": 1, "pro": 2 }[m[3]];
+  return { tierRank: tierRank, major: parseInt(m[1], 10), minor: parseInt(m[2], 10) };
+}
+
+// เทียบ 2 rank key: คืน <0 ถ้า a ดีกว่า (ลองก่อน = priority number น้อยกว่า)
+// ดีกว่า = tierRank น้อยกว่า → major สูงกว่า → minor สูงกว่า (newer-first ในแต่ละ tier)
+function _cmpGeminiRank_(a, b) {
+  if (a.tierRank !== b.tierRank) return a.tierRank - b.tierRank;
+  if (a.major !== b.major) return b.major - a.major;
+  return b.minor - a.minor;
+}
+
+// P2-Q3 insert-without-renumber: คืน {priority} ให้ id ใหม่ตามตำแหน่ง sort-key เทียบ workingRegistry
+// (existing non-Deprecated + ตัวที่เพิ่ง place รอบนี้), หรือ null → fail-safe (worst + needs-manual-priority)
+// workingRegistry: [{id, priority}]. ไม่แตะ priority เดิม (เคารพ hand-tuning + monotonic lock)
+function assignDiscoveredPriority_(id, workingRegistry) {
+  var key = _parseGeminiRank_(id);
+  if (!key) return null; // unparseable → fail-safe
+  var allPrios = [], better = [], worse = [];
+  for (var i = 0; i < (workingRegistry || []).length; i++) {
+    var p = parseInt(workingRegistry[i].priority, 10);
+    if (isNaN(p)) continue;
+    allPrios.push(p);
+    var rk = _parseGeminiRank_(workingRegistry[i].id);
+    if (!rk) continue; // แถวเดิมที่ parse ไม่ได้ — กินสล็อต priority แต่เทียบ sort-key ไม่ได้
+    var c = _cmpGeminiRank_(rk, key);
+    if (c < 0) better.push(p);        // เดิมดีกว่า → ใหม่อยู่ต่อท้าย (priority มากกว่า)
+    else if (c > 0) worse.push(p);    // เดิมแย่กว่า → ใหม่อยู่ก่อน (priority น้อยกว่า)
+    else return null;                 // rank ชนพอดี (id ซ้ำ?) → fail-safe
+  }
+  if (allPrios.length === 0) return { priority: 1 };
+  if (better.length === 0) return { priority: Math.min.apply(null, allPrios) - 1 }; // flagship
+  if (worse.length === 0) return { priority: Math.max.apply(null, allPrios) + 1 };  // ท้ายสุด
+  var prevPrio = Math.max.apply(null, better), nextPrio = Math.min.apply(null, worse);
+  if (prevPrio + 1 >= nextPrio) return null; // ไม่มีช่อง integer → fail-safe
+  return { priority: Math.floor((prevPrio + nextPrio) / 2) };
+}
+
 // Discovery + three-way reconcile (Q1/Q2) — GET ?action=reconcileGeminiModels
 // live models.list ⇄ AI_Models: append ใหม่ Disabled/RPD=null · หายจาก API → Deprecated (ไม่ลบ คง RPD ที่ตั้งมือ) · มีทั้งคู่ → คงเดิม
 // append เทียบ filter (chat gemini-* เท่านั้น); deprecation เทียบ RAW live list เต็ม → เคารพ preview ที่ owner เพิ่มมือ
@@ -449,25 +576,48 @@ function reconcileGeminiModels() {
   if (!sheet) return out({ result: 'error', message: 'AI_Models sheet not found' });
   var data = sheet.getDataRange().getValues();
   var colModel = 0, colPrio = 2, colStatus = 3; // [Model, RPD_Limit, Priority, Status, Notes]
-  var sheetModels = {}, maxPrio = 0;
+  var sheetModels = {}, maxPrio = 0, workingRegistry = [];
   for (var i = 1; i < data.length; i++) {
     var name = String(data[i][colModel] || "").trim();
     if (!name) continue;
-    sheetModels[name] = { row: i + 1, status: String(data[i][colStatus] || "").trim() };
+    var status = String(data[i][colStatus] || "").trim();
+    sheetModels[name] = { row: i + 1, status: status };
     var p = parseInt(data[i][colPrio], 10);
     if (!isNaN(p) && p > maxPrio) maxPrio = p;
+    // ranker เทียบเฉพาะแถวที่ยังใช้งาน (Deprecated ไม่นับเป็นเพื่อนบ้าน)
+    if (status !== "Deprecated" && !isNaN(p)) workingRegistry.push({ id: name, priority: p });
   }
 
   var today = Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd");
   var added = [], deprecated = [], leftCount = 0;
 
-  // (1) append: appendable ที่ยังไม่มีในชีต → Disabled, RPD ว่าง (null), priority ต่อท้าย
-  var newRows = [], nextPrio = maxPrio;
-  appendable.forEach(function(m) {
-    if (sheetModels[m.id]) { leftCount++; return; }
-    nextPrio += 1;
-    newRows.push([m.id, "", nextPrio, "Disabled", "auto-discovered " + today]);
+  // (1) append: appendable ที่ยังไม่มีในชีต → Disabled, RPD ว่าง (null)
+  // P2-Q2/Q3: auto newer-first ranking. process ตาม sort-key (ดีสุดก่อน) แล้ว fold แต่ละตัวเข้า
+  // workingRegistry ก่อน place ตัวถัดไป → โมเดลที่มาพร้อมกันรอบเดียว rank เทียบกันเองด้วย
+  var pending = appendable.filter(function(m) {
+    if (sheetModels[m.id]) { leftCount++; return false; }
+    return true;
+  });
+  pending.sort(function(a, b) {
+    var ka = _parseGeminiRank_(a.id), kb = _parseGeminiRank_(b.id);
+    if (ka && kb) return _cmpGeminiRank_(ka, kb);
+    if (ka) return -1; if (kb) return 1; return 0; // parse ไม่ได้ → ไปท้าย (place หลัง = worst)
+  });
+  var newRows = [];
+  pending.forEach(function(m) {
+    var r = assignDiscoveredPriority_(m.id, workingRegistry);
+    var prio, notes;
+    if (r === null) { // fail-safe: worst priority + flag ให้ owner ตั้งเอง
+      maxPrio += 1; prio = maxPrio;
+      notes = "auto-discovered " + today + " needs-manual-priority";
+    } else {
+      prio = r.priority;
+      if (prio > maxPrio) maxPrio = prio;
+      notes = "auto-discovered " + today;
+    }
+    newRows.push([m.id, "", prio, "Disabled", notes]);
     added.push(m.id);
+    workingRegistry.push({ id: m.id, priority: prio }); // fold in ก่อน place ตัวถัดไป
   });
   if (newRows.length) {
     aiSheetRetry_(function() {
@@ -751,7 +901,11 @@ function runGeminiModelSync() {
   return res;
 }
 
-// WEEKLY job — re-probe tool capability ของโมเดล Active; genuine fail → Deprecated, transient (429/5xx) → ข้าม
+// WEEKLY job — tool-capability smoke test. สองบทบาท:
+//  (a) Active gemini-* → re-probe; genuine fail → Deprecated, transient (429/5xx) → ข้าม
+//  (b) P2-Q4 auto-enable: Disabled ที่ Notes มี "auto-discovered" → smoke test; pass → Active (RPD ยังว่าง = dormant
+//      ตาม P2-Q5 interlock จน owner ตั้ง RPD), genuine fail → คง Disabled + Notes tool-incapable, transient → ข้าม
+//  ข้าม owner-hand-disabled (Notes ไม่มี "auto-discovered" เช่น gemini-2.5-pro "free tier RPD = 0") และ Deprecated
 function runGeminiToolProbe() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
@@ -759,14 +913,40 @@ function runGeminiToolProbe() {
   var apiKey = firstActiveAiKey_(ss);
   if (!apiKey) { console.warn("[geminiProbe] ไม่มี active key"); return { checked: 0, deprecated: 0 }; }
   var data = sheet.getDataRange().getValues();
-  var statusCol = 3, notesCol = 4;
+  var prioCol = 2, statusCol = 3, notesCol = 4;
   var today = Utilities.formatDate(new Date(), "Asia/Bangkok", "yyyy-MM-dd");
-  var checked = 0, deprecated = 0, skipped = 0, results = [];
+  var checked = 0, deprecated = 0, enabled = 0, refused = 0, skipped = 0, results = [];
   for (var i = 1; i < data.length; i++) {
     var name = String(data[i][0] || "").trim();
-    if (!name || String(data[i][statusCol]).trim() !== "Active" || name.indexOf("gemini-") !== 0) continue;
+    if (!name || name.indexOf("gemini-") !== 0) continue;
+    var status = String(data[i][statusCol]).trim();
+    var notes = String(data[i][notesCol] || "");
+    var isActive = status === "Active";
+    var isAutoDisabled = status === "Disabled" && /auto-discovered/i.test(notes);
+    if (!isActive && !isAutoDisabled) continue; // owner-hand-disabled + Deprecated → ข้าม
     checked++;
     var t = geminiToolSmokeTest_(name, apiKey);
+
+    if (isAutoDisabled) { // (b) auto-enable path
+      if (t.pass) {
+        var prio = parseInt(data[i][prioCol], 10);
+        var keepFlag = /needs-manual-priority/i.test(notes) ? "needs-manual-priority, " : ""; // ต้องคง flag
+        sheet.getRange(i + 1, statusCol + 1).setValue("Active");
+        sheet.getRange(i + 1, notesCol + 1).setValue(keepFlag + "auto-discovered, tool-OK, priority "
+          + (isNaN(prio) ? "?" : prio) + " — SET RPD TO GO LIVE (" + today + ")");
+        enabled++; results.push(name + ":ENABLED");
+        console.log("[geminiProbe] " + name + " → Active (auto-enabled, รอ RPD)");
+      } else if (t.transient) {
+        skipped++; results.push(name + ":transient");
+      } else {
+        sheet.getRange(i + 1, notesCol + 1).setValue("tool-incapable: " + t.reason + " (" + today + ")");
+        refused++; results.push(name + ":tool-incapable");
+        console.warn("[geminiProbe] " + name + " tool-incapable: " + t.reason);
+      }
+      continue;
+    }
+
+    // (a) Active re-probe path
     if (t.pass) { results.push(name + ":pass"); continue; }
     if (t.transient) { skipped++; results.push(name + ":transient"); console.log("[geminiProbe] " + name + " transient, skip: " + t.reason); continue; }
     sheet.getRange(i + 1, statusCol + 1).setValue("Deprecated");
@@ -775,8 +955,9 @@ function runGeminiToolProbe() {
     console.warn("[geminiProbe] " + name + " → Deprecated: " + t.reason);
   }
   SpreadsheetApp.flush();
-  console.log("[geminiProbe] checked=" + checked + " deprecated=" + deprecated + " skippedTransient=" + skipped);
-  return { checked: checked, deprecated: deprecated, skippedTransient: skipped, results: results };
+  console.log("[geminiProbe] checked=" + checked + " enabled=" + enabled + " refused=" + refused
+    + " deprecated=" + deprecated + " skippedTransient=" + skipped);
+  return { checked: checked, enabled: enabled, refused: refused, deprecated: deprecated, skippedTransient: skipped, results: results };
 }
 
 // idempotent trigger installer — daily reconcile ~ตี 6, weekly probe อาทิตย์ ~ตี 6 (เว้นตี 3-5 ให้ job เดิม)
