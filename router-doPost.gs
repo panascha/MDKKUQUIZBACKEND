@@ -223,6 +223,21 @@ function doPost(e) {
       }
     }
 
+    // setModelRpd — admin panel เขียน RPD_Limit/Priority ของโมเดลใน AI_Models (P2-Q1/Q5/Q7)
+    // auth: mirror getFeedback (sessionToken admin หรือ username+adminPass). lock-free: single-cell write ความถี่ต่ำ
+    // (สอดคล้อง Q5 — AI_Config/AI_Models write ไม่ใช้ LockService; off-by-one ยอมรับได้)
+    if (action === 'setModelRpd') {
+      var smrUser = null;
+      if (data.sessionToken) smrUser = verifySessionToken(data.sessionToken);
+      else if (data.username) smrUser = verifyAdmin(data.username, data.adminPass);
+      if (!smrUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return setModelRpd(data.model, data.rpd, data.priority);
+    }
+
     if (action === 'askAIExpert') {
       // --- IntelSphere shared-pool branch: public, rate-limited, ไม่ใช้ admin auth ---
       if (data.provider === "IntelSphere") {
@@ -764,7 +779,7 @@ function doPost(e) {
     // ----------------------------------------------------
     // LOCALIZED LOCK GROUP (Locks briefly for writes, tryLock 15s)
     // ----------------------------------------------------
-    var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'deleteSession'];
+    var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'deleteSession', 'saveStudentId'];
     if (localizedActions.indexOf(action) > -1) {
       var lock = LockService.getScriptLock();
       var acquired = lock.tryLock(15000);
@@ -792,6 +807,41 @@ function doPost(e) {
             }
           }
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // ยืนยันตัวตนด้วยรหัสนักศึกษา — ผู้ใช้ที่ auto-enroll ผ่าน Google SSO กรอกรหัส นศ. หลังล็อกอิน
+        // ต้องมี session ที่ใช้ได้ (Admin หรือ Student ก็ได้) แล้วเขียนลงคอลัมน์ StudentID (col 9, index 8) ของแถวตนเองในชีต Admins
+        if (action === 'saveStudentId') {
+          var sidUser = verifyAnySession(data.sessionToken);
+          if (!sidUser || !sidUser.email) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var newSid = String(data.studentId || '').trim();
+          if (!/^\d{6,12}$/.test(newSid)) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'รหัสนักศึกษาไม่ถูกต้อง (ต้องเป็นตัวเลข 6-12 หลัก)' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var adminsSheet = doc.getSheetByName("Admins");
+          if (!adminsSheet) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ไม่พบชีต Admins' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var adminsData = adminsSheet.getDataRange().getValues();
+          var myRow = -1;
+          var myEmail = String(sidUser.email).trim().toLowerCase();
+          for (var si = 1; si < adminsData.length; si++) {
+            var rowSid = String(adminsData[si][8]).trim();
+            // กันรหัสซ้ำ: มีคนอื่น (คนละอีเมล) ใช้รหัสนี้แล้ว
+            if (rowSid && rowSid === newSid && String(adminsData[si][5]).trim().toLowerCase() !== myEmail) {
+              return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'รหัสนักศึกษานี้ถูกใช้ยืนยันตัวตนโดยบัญชีอื่นแล้ว' })).setMimeType(ContentService.MimeType.JSON);
+            }
+            if (String(adminsData[si][5]).trim().toLowerCase() === myEmail) myRow = si + 1;
+          }
+          if (myRow === -1) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ไม่พบบัญชีของคุณในระบบ' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          adminsSheet.getRange(myRow, 9).setValue(newSid); // col 9 = StudentID (index 8)
+          updateVersion();
+          writeAdminLog(sidUser.displayName || myEmail, sidUser.role || "", "AUTH", "VERIFY_SID", "Admins", "ยืนยันตัวตนด้วยรหัสนักศึกษา", "", "", "");
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success', 'studentId': newSid })).setMimeType(ContentService.MimeType.JSON);
         }
 
         if (action === 'submitVote') {
