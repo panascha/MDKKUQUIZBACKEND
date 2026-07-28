@@ -15,6 +15,22 @@ function inferProviderFromModel(modelId) {
   return null; // unrecognized prefix — log it, don't silently drop
 }
 
+// โมเดลไหน "อ่านรูปได้" — whitelist แบบอนุรักษ์นิยม (ไม่รู้จัก = ถือว่าอ่านไม่ได้)
+// เจตนา: ยอมทิ้งรูปเงียบๆ ไม่ได้ ต้องรู้ให้แน่ว่าโมเดลเห็นรูปจริง มิฉะนั้นแจ้งนิสิตว่าไม่ได้ดูรูป
+// Deepseek (flagship ของ rotation) ยังเป็น text-only จึงไม่อยู่ในลิสต์นี้
+function isVisionModel(modelId) {
+  var m = String(modelId || "").toLowerCase();
+  if (/^gemini-/.test(m)) return true;                 // Gemini ทุกตัวรับภาพ
+  if (/^claude-(3|opus|sonnet|haiku|[4-9])/.test(m)) return true;
+  if (/^gpt-(4o|4\.|5)/.test(m)) return true;
+  if (/^qwen.*(vl|omni)/.test(m)) return true;         // เฉพาะสาย VL เท่านั้น
+  if (/^llama-.*(vision|scout)/.test(m)) return true;  // maverick ตัดออก: gateway คืน 200 แต่ body ไม่มี choices (ทดสอบ 2026-07-28)
+  if (/^nova-(lite|pro|premier)/.test(m)) return true;
+  if (/^pixtral/.test(m) || /^mistral-(small|medium|large)-2/.test(m)) return true;
+  if (/^grok-(2-vision|4|vision)/.test(m)) return true;
+  return false;
+}
+
 // หา key ของแถว Active แถวแรกเพื่อใช้ fetch catalog (catalog เป็น account-agnostic)
 function getAnyActiveIntelSphereKeyForCatalogFetch() {
   var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
@@ -236,7 +252,11 @@ function getActiveIntelSphereKey(requestedProvider, reservedKeySet) {
 }
 
 // ยิงคำถามไป IntelSphere พร้อม rotation: quota-exhausted → provider ถัดไป, invalid key → key ถัดไป
-function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
+// imageUrls (optional): array ของ URL รูปสาธารณะ (lh3.googleusercontent.com จาก transformUrl)
+//   มีรูป → ส่ง content เป็น array แบบ OpenAI multimodal; ไม่มี → ส่ง string เหมือนเดิม (ผู้เรียกเดิมไม่กระทบ)
+//   ยังไม่ได้ยืนยันว่า gateway รองรับ content-array — ถ้า 400 จะ retry ซ้ำแบบ text-only อัตโนมัติ
+//   แล้วคืน imagesSent:false เพื่อให้ frontend บอกนิสิตตรงๆ ว่า AI ไม่ได้เห็นรูป
+function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, imageUrls) {
   attempt = attempt || 1;
   var maxAttempts = INTELSPHERE_PROVIDER_PRIORITY.length; // exhaust รอบ rotation เต็มก่อนยอมแพ้
   if (attempt > maxAttempts) throw new Error("ขออภัย ระบบ AI ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ในอีกสักครู่");
@@ -252,7 +272,11 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
     if (typeof getAvailableAIKey === "function" && typeof callGeminiAI === "function") {
       var fallbackKey = getAvailableAIKey("Gemini");
       if (!fallbackKey) throw new Error("โควต้า AI หมดแล้วสำหรับวันนี้ กรุณารอจนถึงเที่ยงคืนเพื่อรีเซ็ตโควต้า");
-      return { content: callGeminiAI(prompt, fallbackKey, null), servedModel: "gemini (legacy pool)", switched: true };
+      // callGeminiAI รับ prompt เป็น string เท่านั้น → รูปหลุดแน่นอน ต้องบอก frontend
+      return {
+        content: callGeminiAI(prompt, fallbackKey, null), servedModel: "gemini (legacy pool)", switched: true,
+        imagesSent: false
+      };
     }
     throw new Error("โควต้า AI หมดแล้วสำหรับวันนี้ กรุณารอจนถึงเที่ยงคืนเพื่อรีเซ็ตโควต้า");
   }
@@ -262,8 +286,20 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
   var actualModel = (keyObj.provider === requestedProvider) ? requestedModel : PROVIDER_MODEL_MAP[keyObj.provider];
   var switched = (actualModel !== requestedModel);
 
+  // รูปจะถูกส่งจริงก็ต่อเมื่อโมเดลที่ยิงจริงอยู่ใน whitelist vision เท่านั้น
+  // rotation อาจสลับไป provider อื่น (actualModel เปลี่ยน) → โมเดลปลายทางอาจอ่านรูปไม่ได้
+  // ยอมทิ้งรูปแล้วแจ้งนิสิต ดีกว่าให้ AI ตอบมั่นใจทั้งที่ไม่เคยเห็นรูป (โจทย์แพทย์ = อันตราย)
+  var wantImages = !!(imageUrls && imageUrls.length);
+  var sendImages = wantImages && isVisionModel(actualModel);
+
+  var msgContent = prompt;
+  if (sendImages) {
+    msgContent = [{ type: "text", text: prompt }];
+    imageUrls.forEach(function (u) { msgContent.push({ type: "image_url", image_url: { url: u } }); });
+  }
+
   // maxTokens optional (default 2000)
-  var payload = { model: actualModel, messages: [{ role: "user", content: prompt }], max_tokens: maxTokens || 2000, temperature: 0.3 };
+  var payload = { model: actualModel, messages: [{ role: "user", content: msgContent }], max_tokens: maxTokens || 2000, temperature: 0.3 };
   var options = {
     method: "post", contentType: "application/json",
     headers: { "Authorization": "Bearer " + keyObj.key },
@@ -285,7 +321,21 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
     if (body.model_quota && typeof body.model_quota.daily_remaining_tokens === "number") {
       sheet.getRange(keyObj.rowIndex, keyObj.remainingCol).setValue(body.model_quota.daily_remaining_tokens);
     }
-    return { content: body.choices[0].message.content, servedModel: actualModel, switched: switched };
+
+    // Guard: gateway คืน 200 แต่ body.choices หาย (เช่น llama-4-maverick+รูป) → retry text-only
+    if (!body.choices || !body.choices[0]) {
+      if (sendImages) {
+        console.warn("[IntelSphere] 200 without choices on multimodal — retrying text-only: " + actualModel);
+        var textOnly = executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, null);
+        textOnly.imagesSent = false;
+        return textOnly;
+      }
+      throw new Error("เกิดข้อผิดพลาดในการอ่านคำตอบจาก AI API กรุณาลองใหม่อีกครั้ง");
+    }
+
+    // imagesSent เป็น "คำยืนยันเชิงบวก" ไม่ใช่ flag บอกความผิดพลาด
+    // frontend เตือนนิสิตเมื่อ "ไม่มี" ค่านี้ → backend เวอร์ชันเก่าที่ไม่รู้จักรูปก็ยังเตือนถูก (fail-safe)
+    return { content: body.choices[0].message.content, servedModel: actualModel, switched: switched, imagesSent: sendImages };
   }
 
   if (code === 401) {
@@ -301,7 +351,7 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
       // Quota หมดของ provider นี้ — zero column แล้ว rotate ต่อ (ไม่แตะ Status)
       sheet2.getRange(keyObj.rowIndex, keyObj.remainingCol).setValue(0);
       SpreadsheetApp.flush();
-      return executeChatbotQuery(prompt, requestedModel, attempt + 1, maxTokens);
+      return executeChatbotQuery(prompt, requestedModel, attempt + 1, maxTokens, imageUrls);
     }
 
     if (errText.indexOf("Invalid model") >= 0) {
@@ -309,7 +359,7 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
       CacheService.getScriptCache().remove("intelsphere_catalog");
       console.warn("[IntelSphere] Invalid model at request time: " + actualModel + " — catalog cache cleared");
       if (actualModel !== PROVIDER_MODEL_MAP[keyObj.provider]) {
-        return executeChatbotQuery(prompt, PROVIDER_MODEL_MAP[keyObj.provider], attempt + 1, maxTokens);
+        return executeChatbotQuery(prompt, PROVIDER_MODEL_MAP[keyObj.provider], attempt + 1, maxTokens, imageUrls);
       }
       throw new Error("เกิดข้อผิดพลาดในการตั้งค่าโมเดล AI กรุณาแจ้งทีม IT");
     }
@@ -317,10 +367,20 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens) {
     // Key เสีย/ถูกเพิกถอนจริงๆ
     sheet2.getRange(keyObj.rowIndex, headers2.indexOf("Status") + 1).setValue("Invalid");
     SpreadsheetApp.flush();
-    return executeChatbotQuery(prompt, requestedModel, attempt + 1, maxTokens);
+    return executeChatbotQuery(prompt, requestedModel, attempt + 1, maxTokens, imageUrls);
   }
 
-  if (code === 400) throw new Error("เกิดข้อผิดพลาดในการส่งคำขอ กรุณาลองใหม่อีกครั้ง");
+  if (code === 400) {
+    // gateway อาจไม่รองรับ content-array (ยังไม่เคยยืนยัน) → ลองใหม่แบบ text-only ครั้งเดียว
+    // ไม่นับ attempt เพิ่ม เพราะไม่ได้เปลี่ยน key/provider แค่ถอดรูปออก
+    if (sendImages) {
+      console.warn("[IntelSphere] 400 with multimodal content — retrying text-only for model " + actualModel);
+      var textOnly = executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, null);
+      textOnly.imagesSent = false;
+      return textOnly;
+    }
+    throw new Error("เกิดข้อผิดพลาดในการส่งคำขอ กรุณาลองใหม่อีกครั้ง");
+  }
 
   // 500/503/gateway — ไม่พยายาม JSON.parse body ที่อาจไม่ใช่ JSON
   throw new Error("เกิดข้อผิดพลาดจาก AI API (HTTP " + code + ") กรุณาลองใหม่อีกครั้ง");
@@ -359,18 +419,22 @@ function generateAgentQueryOwnerSecret() {
 }
 
 // Priority แยกจาก INTELSPHERE_PROVIDER_PRIORITY โดยเจตนา — agent ต้องการโมเดลแรงสุดก่อน ไม่ใช่ถูกสุดก่อน
-var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Mistral", "MoonshotAI", "Qwen", "OpenAI", "Gemini", "xAI"];
+var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Mistral", "MoonshotAI", "Qwen", "OpenAI", "Gemini", "xAI", "Meta", "Nova", "MiniMax"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
 var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Mistral": 128000, "MoonshotAI": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
 // Overflow tier: providers ที่มีโควต้าเหลือเยอะแต่จง "ใช้เป็น buffer หลัง Deepseek/Qwen/OpenAI" ไม่ใช่ workhorse หลัก
 // (ไม่งั้น quota-sort ใน orderAgentProviders จะดันขึ้นหน้าเพราะโควต้าสูงสุด) — Deepseek ยังเป็น coding model หลัก
-var AGENT_QUERY_OVERFLOW_PROVIDERS = { "Gemini": true, "xAI": true };
+// Meta/Nova/MiniMax เป็น buffer ล้วน (โควต้าเหลือเยอะสุดตอนเพิ่ม: Meta/Nova ~2.8M, MiniMax ~1.4M)
+// → ต้องอยู่ overflow ไม่งั้น quota-sort ดันขึ้นหน้า Deepseek แล้วโมเดลอ่อนกลายเป็น workhorse
+var AGENT_QUERY_OVERFLOW_PROVIDERS = { "Gemini": true, "xAI": true, "Meta": true, "Nova": true, "MiniMax": true };
 // โมเดลเฉพาะ agentQuery ต่อ overflow provider — override PROVIDER_MODEL_MAP โดยไม่แตะ path ของ chatbot นิสิต
 // Mistral: เคย override เป็น devstral-medium (agentic-coding) แต่ IntelSphere map ไป mistralai/devstral-medium
 // บน OpenRouter ซึ่งถูกปลด ("No endpoints found") → ตอนนี้ปล่อยให้ตกไป PROVIDER_MODEL_MAP.Mistral = mistral-medium-3
 // (slug เดียวกับ chatbot นิสิต, verified live). ใส่ override กลับได้เมื่อยืนยัน devstral slug ที่ IntelSphere รับจริง
-var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-3.5-flash", "xAI": "grok-4.3" };
+// Gemini: 3.5-flash → 3.6-flash 2026-07-26 (live catalog ยืนยันว่ารับทั้งคู่) — tier นี้ถือโควต้าเหลือมากสุด
+// (~4.87M) แต่ serve 0 req; override ตัวนี้คือค่าที่ pickAgentModel ใช้จริง ไม่ใช่ PROVIDER_MODEL_MAP.Gemini
+var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-3.6-flash", "xAI": "grok-4.3" };
 // จอง key ไว้สำหรับผู้ใช้สาธารณะ — agentQuery (owner proxy) จะไม่ใช้ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก
 // (key = 1 API_Key ใช้ได้ทุก provider → reserve ทั้ง key ไม่ใช่แยก provider)
 var AGENT_QUERY_KEY_RESERVE_COUNT = 1;

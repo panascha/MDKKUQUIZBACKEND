@@ -43,29 +43,36 @@ function writeAdminLog(user, role, group, type, targetId, details, oldVal, newVa
 }
 
 /**
- * ฟังก์ชันใหม่: บันทึกกิจกรรมผู้ใช้ (User Activity)
+ * บันทึกสถิติการใช้งานแบบ "ไม่ระบุตัวตน" ลงไฟล์ audit ที่แยกจากคลังข้อสอบ (getAuditSheetId)
+ * - append-only ต่อแถว (atomic ในตัว → เรียกได้ใน lock-free tier ไม่ต้องพึ่ง LockService)
+ * - eventType === 'ai_intent' → แท็บ AI_Intents (tag + model), อื่น ๆ → แท็บ Interactions (feature)
+ * - PRIVACY: ไม่รับ/ไม่เขียน email, studentId, clientId, userAgent, prompt ดิบ — เก็บแค่ tag/feature/app/เวลา
  */
-function writeUserActivity(data) {
+function writeInteractionEvents_(appId, events) {
   try {
-    var ss = SpreadsheetApp.openById(SHEET_ID);
-    var sheet = ss.getSheetByName("UserActivity") || ss.insertSheet("UserActivity");
-    
-    // Create header if empty
-    if (sheet.getLastRow() == 0) {
-      sheet.appendRow(["Timestamp", "SessionID", "Action", "TargetID", "Result", "TimeSpent", "Metadata"]);
-      sheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#e6f7ff");
-    }
+    var ss = SpreadsheetApp.openById(getAuditSheetId());
+    var features = getAuditTab_(ss, 'Features', ["Timestamp", "AppId", "FeatureName"]);
+    var intents = getAuditTab_(ss, 'AI_Intents', ["Timestamp", "AppId", "IntentTag", "Model"]);
+    var now = new Date();
 
-    sheet.appendRow([
-      new Date(),
-      data.session || "N/A",
-      data.action || "",
-      data.target || "",
-      data.result || "",
-      data.timeSpent || 0,
-      data.metadata || ""
-    ]);
-  } catch (e) { console.error("User Log Error: " + e.message); }
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i] || {};
+      var type = String(ev.eventType || 'feature_use').slice(0, 40);
+
+      if (type === 'ai_intent') {
+        intents.appendRow([
+          now, appId,
+          String(ev.tag || 'other').slice(0, 40),
+          String(ev.model || '').slice(0, 80)
+        ]);
+      } else {
+        features.appendRow([
+          now, appId,
+          String(ev.feature || '').slice(0, 200)
+        ]);
+      }
+    }
+  } catch (e) { console.error("Audit Log Error: " + e.message); }
 }
 
 

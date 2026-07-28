@@ -767,7 +767,10 @@ function geminiToolSmokeTest_(model, apiKey) {
     // force ping — วัด "ทำ tool_calls ได้ไหม" (capability) ไม่ใช่ "อยากทำไหม" (propensity)
     // tool_choice:"auto" เสี่ยง false-negative: โมเดลที่ทำ tool ได้แต่เลือกตอบ text → deprecate ผิดใน weekly probe
     tool_choice: { type: "function", function: { name: "ping" } },
-    max_tokens: 64
+    // 64 ถูกพบว่าเตี้ยเกินไปสำหรับโมเดล thinking-by-default รุ่นใหม่ (เช่น gemini-3.6-flash) — reasoning
+    // tokens กิน budget ก่อนถึง tool_calls จริง → finish=length false-negative ทั้งที่ capable
+    // (2026-07-24, ยืนยันจาก gemini-3.6-flash ที่ fail ด้วย "no tool_calls (finish=length)")
+    max_tokens: 1024
   };
   try {
     var resp = UrlFetchApp.fetch(GEMINI_OPENAI_COMPAT_ENDPOINT, {
@@ -887,17 +890,65 @@ function verifyToolSmokeTest() {
 
 /* =========================================================
    Step 5: scheduled sync (Q5/Q6 cadence)
-   - runGeminiModelSync : DAILY — models.list diff (reconcile), ไม่กิน quota (models.list ฟรี)
+   - runGeminiModelSync : DAILY — quota reset (all Active-key rows) + models.list diff (reconcile)
    - runGeminiToolProbe : WEEKLY — tool smoke test บนโมเดล Active; genuine fail → Deprecated+Notes; transient → ข้าม
    "alert to MDKKUQUIZDATABASE" = console log + สถานะ Deprecated/Notes บนชีต ที่ dashboard อ่านผ่าน aiConfigStatus อยู่แล้ว
    (backend นี้ไม่มี mail/webhook infra — สถานะบนชีตคือช่องทาง alert)
    ========================================================= */
 
-// DAILY job — reconcile รายการโมเดลจาก live models.list
+// Batch daily reset — เดิม getAvailableAIKey มี reset ต่อแถวแบบ lazy (บรรทัด ~252) แต่ทำงานเฉพาะ
+// แถวที่ถูกสแกนตอนมี request เข้ามาเท่านั้น วันที่ไม่มี agentQuery เลย โควต้าจะไม่ refill จนกว่า request ถัดไป
+// ฟังก์ชันนี้ทำ reset แบบ unconditional จาก trigger รายวัน ไม่ต้องพึ่ง traffic — เกณฑ์เดียวกับ lazy reset:
+// Last_Reset_Date ของแถว (key ที่ Status=Active) ไม่ตรงวันนี้ (Asia/Bangkok) → เติม <model>_Remaining
+// กลับเป็น RPD_Limit ของทุกโมเดล Active ใน AI_Models แล้วเซ็ต Last_Reset_Date = วันนี้
+// ไม่แตะโครงคอลัมน์ (เขียนแค่ value) — monotonic เดิมยังอยู่
+function resetExpiredGeminiQuotas_() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = getAIConfigSheet_(ss);
+  var models = getAIModelRegistry_(ss).filter(function(m) { return m.active; });
+  if (!models.length) return { checked: 0, reset: 0 };
+
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var colStatus = headers.indexOf("Status");
+  var colLastReset = headers.indexOf("Last_Reset_Date");
+  var tz = "Asia/Bangkok"; // อย่าใช้ timezone ของ script (อาจเป็น UTC — reset ช้า 7 ชม.)
+  var todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+
+  var checked = 0, reset = 0;
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!String(row[0] || "").trim()) continue;
+    if (row[colStatus] !== "Active") continue;
+    checked++;
+    var lastResetStr = row[colLastReset]
+      ? Utilities.formatDate(new Date(row[colLastReset]), tz, "yyyy-MM-dd") : "";
+    if (lastResetStr === todayStr) continue;
+
+    (function(rowIndex) {
+      aiSheetRetry_(function() {
+        for (var m = 0; m < models.length; m++) {
+          var rc = headers.indexOf(models[m].model + "_Remaining");
+          if (rc >= 0) sheet.getRange(rowIndex + 1, rc + 1).setValue(models[m].limit);
+        }
+        sheet.getRange(rowIndex + 1, colLastReset + 1).setValue(todayStr);
+      });
+    })(i);
+    reset++;
+  }
+  if (reset) SpreadsheetApp.flush();
+  console.log("[geminiQuotaReset] checked=" + checked + " reset=" + reset);
+  return { checked: checked, reset: reset };
+}
+
+// DAILY job — reset โควต้าแถวที่ข้ามวัน (ไม่พึ่ง traffic) + reconcile รายการโมเดลจาก live models.list
 function runGeminiModelSync() {
+  var resetRes = resetExpiredGeminiQuotas_();
   var res = JSON.parse(reconcileGeminiModels().getContent());
+  res.quotaReset = resetRes;
   console.log("[geminiSync] daily reconcile: added=" + JSON.stringify(res.added || [])
-    + " deprecated=" + JSON.stringify(res.deprecated || []) + " left=" + res.leftUnchanged);
+    + " deprecated=" + JSON.stringify(res.deprecated || []) + " left=" + res.leftUnchanged
+    + " quotaReset=" + JSON.stringify(resetRes));
   return res;
 }
 
@@ -939,7 +990,11 @@ function runGeminiToolProbe() {
       } else if (t.transient) {
         skipped++; results.push(name + ":transient");
       } else {
-        sheet.getRange(i + 1, notesCol + 1).setValue("tool-incapable: " + t.reason + " (" + today + ")");
+        // เก็บ "auto-discovered" ไว้ในข้อความเสมอ — ไม่งั้น isAutoDisabled (บรรทัด 928) จะไม่ match รอบถัดไป
+        // แล้วแถวนี้หลุดออกจาก retry pool ถาวร (แยกไม่ออกจาก owner-hand-disabled) ทั้งที่ fail อาจเป็น false
+        // negative ชั่วคราว (เช่น max_tokens ของ smoke test เตี้ยไปสำหรับโมเดล thinking — พบ 2026-07-24)
+        var keepFlag2 = /needs-manual-priority/i.test(notes) ? "needs-manual-priority, " : "";
+        sheet.getRange(i + 1, notesCol + 1).setValue(keepFlag2 + "auto-discovered, tool-incapable: " + t.reason + " (" + today + ")");
         refused++; results.push(name + ":tool-incapable");
         console.warn("[geminiProbe] " + name + " tool-incapable: " + t.reason);
       }
@@ -1208,7 +1263,9 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
 */
 
 // D13: fallback chain สำรองกรณีทะเบียน AI_Models อ่านไม่ได้ (ปกติ chain มาจาก apiKeyInfo.fallbackModels)
-var CONVERTER_FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"];
+// gemini-3.5-flash-lite เพิ่ม 2026-07-24: auto-discovered+auto-ranked+probe-passed แล้ว (Active, RPD 500,
+// priority 0 ใน AI_Models) — ตัวนี้ผ่าน tool-capability gate จริง จึงเติมใน static backup ด้วย
+var CONVERTER_FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-3.1-flash-lite"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
 

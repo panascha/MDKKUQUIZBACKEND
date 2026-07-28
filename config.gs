@@ -5,6 +5,50 @@ var VOTE_THRESHOLD_CONFIRM = 2;
 
 var REPORT_VOTE_THRESHOLD = 5;
 
+// ────────────────────────────────────────────────────────────────────────────
+// AUDIT LOG — แยก spreadsheet ออกจาก SHEET_ID (คลังข้อสอบ) โดยสิ้นเชิง
+// เหตุผล: log การใช้งาน/prompt AI โตไม่จำกัด → ถ้าเขียนลง SHEET_ID เดียวกันจะดัน
+//   จำนวนเซลล์ชนเพดาน 10M ต่อไฟล์ แล้วทำให้ "ทั้งฐานข้อมูล" (คำถาม/โหวต/รายงาน) เขียนไม่ได้
+// วิธีแก้: สร้างไฟล์ audit เดี่ยว 1 ครั้ง เก็บ ID ไว้ใน ScriptProperties (auto-provision)
+//   overflow/พังของไฟล์ audit จะกระทบเฉพาะ audit ไม่แตะคลังข้อสอบ
+// ────────────────────────────────────────────────────────────────────────────
+// PRIVACY: ไฟล์ audit เก็บเฉพาะสถิติ "ไม่ระบุตัวตน" — ไม่มี email / studentId / clientId /
+//   userAgent / ข้อความ prompt ดิบ เลย. เก็บแค่ intent tag + ฟีเจอร์ + app + เวลา
+//   (จำแนก intent ฝั่ง client; ข้อความดิบไม่เคยออกจากอุปกรณ์)
+function getAuditSheetId() {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty('AUDIT_SHEET_ID');
+  if (id) return id;
+
+  // provision ครั้งเดียว — สร้าง spreadsheet ใหม่ + 2 แท็บ (Features / AI_Intents)
+  // ★ ชื่อแท็บใหม่ (Features/AI_Intents) ตั้งใจให้ไม่ชนกับ schema เก่า (Interactions/AI_Prompts)
+  //   → ถ้าไฟล์ audit เคยถูกสร้างด้วย schema เก่า getAuditTab_ จะสร้างแท็บใหม่สดเสมอ ไม่เขียนผิดคอลัมน์
+  var ss = SpreadsheetApp.create('MDKKUQUIZ_Audit');
+  var features = ss.getSheets()[0].setName('Features');
+  features.appendRow(["Timestamp", "AppId", "FeatureName"]);
+  features.getRange(1, 1, 1, 3).setFontWeight("bold").setBackground("#e6f7ff");
+
+  var intents = ss.insertSheet('AI_Intents');
+  intents.appendRow(["Timestamp", "AppId", "IntentTag", "Model"]);
+  intents.getRange(1, 1, 1, 4).setFontWeight("bold").setBackground("#ffe6f0");
+
+  id = ss.getId();
+  props.setProperty('AUDIT_SHEET_ID', id);
+  return id;
+}
+
+// คืนแท็บชื่อ name (สร้างพร้อม header ถ้ายังไม่มี) — กันกรณีไฟล์ audit ถูก provision
+//   ด้วย schema เก่าไปแล้ว: self-heal โดยไม่ต้องลบไฟล์/property เอง
+function getAuditTab_(ss, name, headers) {
+  var sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(headers);
+    sh.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+  }
+  return sh;
+}
+
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('🛠️ MDKKU Tools')

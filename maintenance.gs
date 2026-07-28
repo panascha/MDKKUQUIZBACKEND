@@ -863,7 +863,7 @@ var INTELSPHERE_PROVIDER_PRIORITY = [
 // One flagship model per provider — used ONLY when rotation moves to a provider
 // other than the one the student explicitly requested.
 var PROVIDER_MODEL_MAP = {
-  "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-2.5-flash",   "Meta": "llama-4-maverick",
+  "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-3.6-flash",   "Meta": "llama-4-maverick",
   "Nova":     "nova-pro-v1",       "xAI":    "grok-4",             "Qwen": "qwen3.7-plus",
   "OpenAI":   "gpt-5-mini",        "Claude": "claude-sonnet-4.5",  "Mistral": "mistral-medium-3",
   "MiniMax":  "minimax-m3",        "MoonshotAI": "kimi-k3"
@@ -873,7 +873,7 @@ var PROVIDER_MODEL_MAP = {
 var PROVIDER_MODELS_FALLBACK = {
   "Claude":   ["claude-sonnet-5","claude-sonnet-4.6","claude-sonnet-4.5","claude-haiku-4.5","claude-sonnet-4","claude-3.7-sonnet"],
   "Deepseek": ["deepseek-v4-pro","deepseek-v4-flash","deepseek-v3.2","deepseek-v3.2-exp","deepseek-chat-v3.1"],
-  "Gemini":   ["gemini-3.5-flash","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
+  "Gemini":   ["gemini-3.6-flash","gemini-3.5-flash","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
   "Meta":     ["llama-4-maverick","llama-4-scout"],
   "MiniMax":  ["minimax-m3"],
   "MoonshotAI": ["kimi-k3"],

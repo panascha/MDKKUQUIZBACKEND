@@ -223,6 +223,20 @@ function doPost(e) {
       }
     }
 
+    // ownerEnableGeminiModel — owner-triggered re-probe of one AI_Models row (Q6 gate), mirrors the
+    // existing runXBatchManual admin-triggered-batch pattern (e.g. runGlossaryBatchManual below) but
+    // owner-secret-gated like agentQuery/agentPoolStatus (no admin-session fallback — spends real
+    // Gemini quota + mutates the shared sheet). Wraps the editor-only enableGeminiModel().
+    if (action === 'ownerEnableGeminiModel') {
+      var oemAuthed = verifyAgentQueryOwnerSecret(data.ownerSecret);
+      if (!oemAuthed) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return enableGeminiModel(data.model);
+    }
+
     // setModelRpd — admin panel เขียน RPD_Limit/Priority ของโมเดลใน AI_Models (P2-Q1/Q5/Q7)
     // auth: mirror getFeedback (sessionToken admin หรือ username+adminPass). lock-free: single-cell write ความถี่ต่ำ
     // (สอดคล้อง Q5 — AI_Config/AI_Models write ไม่ใช้ LockService; off-by-one ยอมรับได้)
@@ -256,10 +270,17 @@ function doPost(e) {
           })).setMimeType(ContentService.MimeType.JSON);
         }
 
+        // imageUrls: URL รูปโจทย์แบบสาธารณะ (lh3.googleusercontent.com) — จำกัด 4 รูป กัน payload บวม
+        // รับเฉพาะ https เท่านั้น: กัน data:/file:/http: ที่ทำให้ gateway ไปดึงของแปลกๆ แทนเรา
+        var isImages = Array.isArray(data.imageUrls)
+          ? data.imageUrls.filter(function (u) { return typeof u === 'string' && /^https:\/\//.test(u); }).slice(0, 4)
+          : [];
+
         try {
-          var aiResult = executeChatbotQuery(data.prompt, isModel, 1);
+          var aiResult = executeChatbotQuery(data.prompt, isModel, 1, null, isImages);
           return ContentService.createTextOutput(JSON.stringify({
-            result: 'success', answer: aiResult.content, servedModel: aiResult.servedModel, switched: aiResult.switched
+            result: 'success', answer: aiResult.content, servedModel: aiResult.servedModel,
+            switched: aiResult.switched, imagesSent: !!aiResult.imagesSent
           })).setMimeType(ContentService.MimeType.JSON);
         } catch (isErr) {
           return ContentService.createTextOutput(JSON.stringify({
@@ -367,36 +388,54 @@ function doPost(e) {
       }
     }
 
-    // Helper function for mapping batch logs to rows
-    function toActivityRow(entry) {
-      return [
-        entry.timestamp ? new Date(entry.timestamp) : new Date(),
-        entry.session || "N/A",
-        entry.action || "",
-        entry.target || "",
-        entry.result || "",
-        entry.timeSpent || 0,
-        entry.metadata || ""
-      ];
+    // ----------------------------------------------------
+    // logUserInteraction — ระบบ log ใหม่ (แทน batchLog/UserActivity เดิมที่ถูกถอดออก)
+    // เขียนลงไฟล์ audit แยก (getAuditSheetId) → overflow ไม่แตะคลังข้อสอบ (SHEET_ID)
+    // อยู่ lock-free tier: append-only ต่อแถว, return ก่อนขอ Lock ใด ๆ
+    // การ์ด (ลำดับเดียวกับ convertPdfBatch/submitFeedback): rate limit → batch cap → payload cap → field caps
+    // identity ดึงจาก sessionToken ฝั่ง server เท่านั้น (ไม่เชื่อ email ที่ client ส่งมา — กัน spoof)
+    // fire-and-forget: error ใด ๆ ตอบ success(dropped) ไม่โยน error ให้นักเรียน
+    // ----------------------------------------------------
+    if (action === 'logUserInteraction') {
+      // PRIVACY: เก็บสถิติไม่ระบุตัวตนเท่านั้น (intent tag + feature) — ไม่ derive/เขียน identity ใด ๆ
+      // clientId ที่ส่งมาถูกใช้ "เฉพาะ" เป็น rate-limit key ชั่วคราวใน CacheService — ไม่เคยเขียนลง sheet
+      // (1) rate limit — แยก 2 bucket:
+      //   - ai_intent → 120/ชม. (client ยิง 1 คำขอ/คำถาม)
+      //   - feature events → 30/ชม. (batched) กัน event ถี่ ๆ มาเบียดโควต้า
+      var uiEventsRaw = Array.isArray(data.events) ? data.events : [];
+      var uiHasIntent = false;
+      for (var upi = 0; upi < uiEventsRaw.length; upi++) {
+        if (uiEventsRaw[upi] && uiEventsRaw[upi].eventType === 'ai_intent') { uiHasIntent = true; break; }
+      }
+      var uiKey = data.clientId || 'anon';   // throttle key ชั่วคราวเท่านั้น — ไม่ persist
+      var uiRlOk = uiHasIntent
+        ? checkActionRateLimit('rl_uiprompt_', uiKey, 120)
+        : checkActionRateLimit('rl_uilog_', uiKey, 30);
+      if (!uiRlOk) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success', dropped: true })).setMimeType(ContentService.MimeType.JSON);
+      }
+      // (2) payload cap 512KB (contents = raw POST body, คำนวณไว้แล้วต้นฟังก์ชัน)
+      if (contents && contents.length > 524288) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success', dropped: true })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var events = uiEventsRaw; // parse แล้วด้านบน
+      if (events.length === 0) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
+      }
+      // (3) batch cap 50 แถว/คำขอ
+      if (events.length > 50) events = events.slice(0, 50);
+
+      var uiAppId = String(data.appId || 'unknown').slice(0, 40);
+      writeInteractionEvents_(uiAppId, events);
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------
-    // T0.1: batchLog — จัดการ "ก่อน" ขอ Lock ใดๆ เพื่อไม่ให้ analytics (write ถี่สุดของนักเรียน) ไปบล็อกโหวต/รายงาน
-    // ใช้ appendRow ต่อแถว (atomic ในตัว ไม่ต้องพึ่ง LockService) แทน getRange(getLastRow()+1).setValues()
+    // batchLog — DEPRECATED: ระบบ UserActivity เดิมถูกถอดออก (write-only, ไม่มีใครอ่าน + ไม่มี cap)
+    // คง stub ที่ "รับแล้วทิ้ง" ไว้ เพื่อไม่ให้ PWA client เวอร์ชันเก่า (cache) ยิงมาแล้ว error
     // ----------------------------------------------------
     if (action === 'batchLog') {
-      var logs = data.logs || [];
-      if (logs.length > 0) {
-        var activitySheet = doc.getSheetByName("UserActivity") || doc.insertSheet("UserActivity");
-        if (activitySheet.getLastRow() === 0) {
-          activitySheet.appendRow(["Timestamp", "SessionID", "Action", "TargetID", "Result", "TimeSpent", "Metadata"]);
-          activitySheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#e6f7ff");
-        }
-        for (var li = 0; li < logs.length; li++) {
-          activitySheet.appendRow(toActivityRow(logs[li]));
-        }
-      }
-      return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success', dropped: true })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------

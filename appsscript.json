@@ -15,6 +15,9 @@
     "executeAs": "USER_DEPLOYING",
     "access": "ANYONE_ANONYMOUS"
   },
+  "executionApi": {
+    "access": "MYSELF"
+  },
   "oauthScopes": [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/script.external_request",
