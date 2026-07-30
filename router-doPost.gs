@@ -280,7 +280,8 @@ function doPost(e) {
           var aiResult = executeChatbotQuery(data.prompt, isModel, 1, null, isImages);
           return ContentService.createTextOutput(JSON.stringify({
             result: 'success', answer: aiResult.content, servedModel: aiResult.servedModel,
-            switched: aiResult.switched, imagesSent: !!aiResult.imagesSent
+            switched: aiResult.switched, imagesSent: !!aiResult.imagesSent,
+            finishReason: aiResult.finishReason || null
           })).setMimeType(ContentService.MimeType.JSON);
         } catch (isErr) {
           return ContentService.createTextOutput(JSON.stringify({

@@ -1205,7 +1205,7 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
     // }],
     "generationConfig": {
       "temperature": 1.0, 
-      "maxOutputTokens": 2048,
+      "maxOutputTokens": 8192,
       "thinkingConfig": {
         "includeThoughts": true // เปิดใช้งาน Thinking ในการประเมินวิเคราะห์ข้อสอบ
       }

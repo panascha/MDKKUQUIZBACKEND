@@ -828,7 +828,7 @@ var GLOSSARY_BATCH_CHARS = 6000;          // ขนาดก้อนข้อ�
 // batch = generateHighYieldForSubject / runHighYieldBatch (checkpointed) + runHighYieldBatchManual (admin tier). trigger เว้นไว้ไม่ติดตั้ง
 var HIGHYIELD_SHEET_NAME = "HighYield_Cache";
 var HIGHYIELD_MODEL = "gemini-2.5-flash";  // cheap flash tier — เหมือน glossary; executeChatbotQuery rotate ต่อถ้าโควต้าหมด
-var HIGHYIELD_MAX_TOKENS = 1800;           // output ก้อนใหญ่ (summary+mnemonics+keywords) — มากกว่า default 800 เพื่อกัน JSON ขาดกลาง
+var HIGHYIELD_MAX_TOKENS = 8192;           // output ก้อนใหญ่ (summary+mnemonics+keywords) — 8192 รองรับ Thai Unicode overhead + JSON เต็ม
 var HIGHYIELD_GEN_RATE_LIMIT = 6;          // ต่อ token/'anon' ต่อชั่วโมง (call ใหญ่/แพงกว่า glossary มาก → เข้มกว่า 20)
 var HIGHYIELD_VOTE_RATE_LIMIT = 40;        // 👍/🚩 mnemonic เบามาก — กัน spam อย่างเดียว
 var HIGHYIELD_MAX_QUESTIONS = 80;          // เพดานจำนวนข้อที่รวมต่อ 1 หมวด (IntelSphere context เล็ก) — เลือกข้อมีเฉลยก่อน
@@ -877,7 +877,9 @@ var PROVIDER_MODELS_FALLBACK = {
   "Meta":     ["llama-4-maverick","llama-4-scout"],
   "MiniMax":  ["minimax-m3"],
   "MoonshotAI": ["kimi-k3"],
-  "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","codestral-2508","devstral-medium","codestral-2501"],
+  // devstral-medium ถอดออก 2026-07-29 — IntelSphere map ไป mistralai/devstral-medium บน OpenRouter ซึ่งถูกปลดแล้ว
+  // ("No endpoints found") → นิสิตเลือกได้ก็ยิงไม่ติด. ใส่กลับได้เมื่อ live catalog ยืนยันว่ารับ slug นี้จริง
+  "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","codestral-2508","codestral-2501"],
   "Nova":     ["nova-2-lite-v1","nova-pro-v1"],
   "OpenAI":   ["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano","gpt-5.2","gpt-5.1","gpt-5.1-codex","gpt-5","gpt-5-mini","gpt-5-nano","gpt-5.5"],
   "Qwen":     ["qwen3.7-plus","qwen3.7-max","qwen3.6-flash","qwen3.5-9b","qwen3-235b-a22b-2507","qwen3-next-80b-a3b-instruct","qwen3-coder-flash","qwen3-coder","qwen3-vl-32b-instruct"],

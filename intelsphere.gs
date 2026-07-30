@@ -298,8 +298,8 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, imageUr
     imageUrls.forEach(function (u) { msgContent.push({ type: "image_url", image_url: { url: u } }); });
   }
 
-  // maxTokens optional (default 2000)
-  var payload = { model: actualModel, messages: [{ role: "user", content: msgContent }], max_tokens: maxTokens || 2000, temperature: 0.3 };
+  // maxTokens optional (default 8192 — รองรับ Thai Unicode overhead + reasoning/thinking tokens)
+  var payload = { model: actualModel, messages: [{ role: "user", content: msgContent }], max_tokens: maxTokens || 8192, temperature: 0.3 };
   var options = {
     method: "post", contentType: "application/json",
     headers: { "Authorization": "Bearer " + keyObj.key },
@@ -335,7 +335,8 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, imageUr
 
     // imagesSent เป็น "คำยืนยันเชิงบวก" ไม่ใช่ flag บอกความผิดพลาด
     // frontend เตือนนิสิตเมื่อ "ไม่มี" ค่านี้ → backend เวอร์ชันเก่าที่ไม่รู้จักรูปก็ยังเตือนถูก (fail-safe)
-    return { content: body.choices[0].message.content, servedModel: actualModel, switched: switched, imagesSent: sendImages };
+    var finishReason = (body.choices[0].finish_reason) || null;
+    return { content: body.choices[0].message.content, servedModel: actualModel, switched: switched, imagesSent: sendImages, finishReason: finishReason };
   }
 
   if (code === 401) {
@@ -572,15 +573,36 @@ function executeAgentQuery(request) {
       payload.max_tokens = AGENT_QUERY_MAX_OUTPUT_TOKENS;
     }
 
-    var response = UrlFetchApp.fetch(INTELSPHERE_ENDPOINT, {
-      method: "post", contentType: "application/json",
-      headers: { "Authorization": "Bearer " + keyObj.key },
-      payload: JSON.stringify(payload), muteHttpExceptions: true
-    });
+    // muteHttpExceptions กันแค่ HTTP error — transport ล้ม (DNS/TLS/host down) ยัง "throw" อยู่ดี
+    // เช่น "ที่อยู่ไม่สามารถใช้ได้: https://gen.ai.kku.ac.th/api/v1/chat/completions" — throw นี้เดิมหลุด
+    // ออกนอก while ทั้งก้อนไปโผล่ที่ catch ของ doPost → router ตอบ 400 โดยไม่ cascade เลย
+    // ทุก provider ยิงโฮสต์เดียวกัน → transport ล้ม = ล้มทั้ง IntelSphere tier ไม่ใช่แค่ provider นี้
+    // จึง break ไป Gemini tier (คนละโฮสต์) ทันที ไม่ใช่ skip แล้วไล่ยิงต่อจนชน execution cap 6 นาที
+    var response;
+    try {
+      response = UrlFetchApp.fetch(INTELSPHERE_ENDPOINT, {
+        method: "post", contentType: "application/json",
+        headers: { "Authorization": "Bearer " + keyObj.key },
+        payload: JSON.stringify(payload), muteHttpExceptions: true
+      });
+    } catch (fetchErr) {
+      console.warn("[agentQuery] IntelSphere transport failure at " + provider
+        + " — ข้ามทั้ง tier ไป Gemini: " + fetchErr.message);
+      break;
+    }
     var code = response.getResponseCode();
 
     if (code === 200) {
-      var body = JSON.parse(response.getContentText());
+      // gateway อาจคืน 200 พร้อม body ที่ไม่ใช่ JSON (error page) — parse throw = จบทั้ง request
+      // ถือเป็น provider failure แบบเดียวกับ 200-no-choices ด้านล่าง แล้ว cascade ต่อ
+      var body;
+      try { body = JSON.parse(response.getContentText()); }
+      catch (parseErr) {
+        console.warn("[agentQuery] " + provider + " HTTP 200 non-JSON body — skip provider: "
+          + String(response.getContentText()).slice(0, 200));
+        skip[provider] = true;
+        continue;
+      }
       // IntelSphere บางครั้งห่อ error ของ provider ต้นทาง (เช่น OpenRouter "No endpoints found for <model>")
       // ไว้ใน HTTP 200 — body เป็น error object ไม่มี choices. ถ้า return ตรงนี้ router จะ throw "no choices"
       // และ chain ไม่ cascade (quota ไม่ลด → orderAgentProviders ดัน provider เดิมขึ้นหน้าทุกครั้ง = ติด loop).
@@ -646,14 +668,30 @@ function executeAgentQuery(request) {
     var gPayload = JSON.parse(JSON.stringify(request));
     gPayload.model = geminiKey.model || "gemini-2.5-flash";
     delete gPayload.stream;
-    var gResp = UrlFetchApp.fetch(GEMINI_OPENAI_COMPAT_ENDPOINT, {
-      method: "post", contentType: "application/json",
-      headers: { "Authorization": "Bearer " + geminiKey.key },
-      payload: JSON.stringify(gPayload), muteHttpExceptions: true
-    });
+    // transport ล้ม throw เหมือน tier บน — แต่ที่นี่ loop bound อยู่แล้ว (4 รอบ) และมี key/model อื่นให้ไป
+    // จึงข้ามเฉพาะโมเดลนี้แล้ววนต่อ ไม่ break ทิ้งทั้ง tier
+    var gResp;
+    try {
+      gResp = UrlFetchApp.fetch(GEMINI_OPENAI_COMPAT_ENDPOINT, {
+        method: "post", contentType: "application/json",
+        headers: { "Authorization": "Bearer " + geminiKey.key },
+        payload: JSON.stringify(gPayload), muteHttpExceptions: true
+      });
+    } catch (gFetchErr) {
+      console.warn("[agentQuery] Gemini transport failure at " + gPayload.model + ": " + gFetchErr.message);
+      avoidGeminiModels[gPayload.model] = true;
+      continue;
+    }
     var gCode = gResp.getResponseCode();
     if (gCode === 200) {
-      var gBody = JSON.parse(gResp.getContentText());
+      var gBody;
+      try { gBody = JSON.parse(gResp.getContentText()); }
+      catch (gParseErr) {
+        console.warn("[agentQuery] Gemini " + gPayload.model + " HTTP 200 non-JSON body: "
+          + String(gResp.getContentText()).slice(0, 200));
+        avoidGeminiModels[gPayload.model] = true;
+        continue;
+      }
       // same 200-wrapped-error guard as the IntelSphere tier — อย่า return error object เป็น completion
       if (!gBody.choices || !gBody.choices.length) {
         console.warn("[agentQuery] Gemini " + gPayload.model + " HTTP 200 but no choices (upstream error 200-wrapped): "
