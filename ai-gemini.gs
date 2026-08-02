@@ -27,7 +27,12 @@ var AI_MODELS_DEFAULTS = [
 function aiSheetRetry_(fn) {
   var lastErr;
   for (var a = 0; a < 3; a++) {
-    try { return fn(); } catch (e) { lastErr = e; Utilities.sleep(1500 * (a + 1)); }
+    try { return fn(); } catch (e) {
+      lastErr = e;
+      // งบ execution ใกล้หมด → เลิก retry ทันที (นอนรอ+ลองใหม่ = ชนเพดาน 6 นาทีเปล่าๆ)
+      if (execRemainingMs_() < 20000) break;
+      Utilities.sleep(1500 * (a + 1));
+    }
   }
   throw lastErr;
 }

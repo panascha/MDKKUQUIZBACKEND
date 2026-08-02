@@ -260,6 +260,11 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, imageUr
   attempt = attempt || 1;
   var maxAttempts = INTELSPHERE_PROVIDER_PRIORITY.length; // exhaust รอบ rotation เต็มก่อนยอมแพ้
   if (attempt > maxAttempts) throw new Error("ขออภัย ระบบ AI ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่ในอีกสักครู่");
+  // rotation ข้าม provider ได้หลายรอบ แต่ละรอบยิง UrlFetchApp จริง — ถ้างบ execution ใกล้หมด
+  // ต้องหยุดเองก่อน ไม่งั้นโดน GAS ตัดที่ 6 นาที (execution ค้างเป็น Failed/Timed Out นิสิตไม่ได้คำตอบ)
+  if (attempt > 1 && execBudgetExhausted_()) {
+    throw new Error("ระบบ AI ใช้เวลานานเกินกำหนด กรุณาลองใหม่อีกครั้ง");
+  }
 
   var requestedProvider = inferProviderFromModel(requestedModel);
   if (!requestedProvider) throw new Error("ไม่รู้จักโมเดลนี้ กรุณาเลือกโมเดลใหม่จากรายการ");
@@ -554,6 +559,11 @@ function executeAgentQuery(request) {
 
   while (attempts < maxAttempts) {
     attempts++;
+    // งบเวลาไม่พอยิงรอบใหม่ → ตกไป Gemini tier ทันที (ยิงต่อ = โดนตัดกลางคัน ผู้ใช้ไม่ได้อะไรเลย)
+    if (execBudgetExhausted_()) {
+      console.warn("[agentQuery] งบ execution ใกล้หมด (" + execRemainingMs_() + "ms) — หยุด IntelSphere chain");
+      break;
+    }
 
     var keyObj = null, provider = null;
     for (var i = 0; i < order.length; i++) {
@@ -658,6 +668,10 @@ function executeAgentQuery(request) {
   // แทนที่จะตกไปใช้ subscription ทันที (บั๊กเดิม: Claude Code ยิงถี่ → RPM 429 → subscription ทั้งที่โควต้าวันยังเหลือ)
   var avoidGeminiModels = {}; // โมเดลที่ 429/5xx ใน call นี้ → getAvailableAIKey ข้าม → cascade ไป priority ถัดไป (เช่น flash-lite RPD 500) แทนวน key เดิม
   for (var gi = 0; gi < 4; gi++) {
+    if (execBudgetExhausted_()) {
+      console.warn("[agentQuery] งบ execution ใกล้หมด (" + execRemainingMs_() + "ms) — หยุด Gemini tier");
+      break;
+    }
     var geminiKey = getAvailableAIKey("Gemini", null, AGENT_QUERY_GEMINI_KEY_RESERVE_COUNT, avoidGeminiModels);
     if (!geminiKey) {
       // แยก "pool ว่างจริง" ออกจาก "ยังมี key แต่ถูกจองไว้ให้ผู้ใช้สาธารณะ/ถูก cooldown" — ไม่งั้นอ่าน log แล้วแยกไม่ออก

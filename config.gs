@@ -6,6 +6,25 @@ var VOTE_THRESHOLD_CONFIRM = 2;
 var REPORT_VOTE_THRESHOLD = 5;
 
 // ────────────────────────────────────────────────────────────────────────────
+// EXECUTION BUDGET — GAS ตัด execution ที่ ~6 นาที (หน้า Executions โชว์ 369.99s ซ้ำๆ = ชนเพดาน)
+// UrlFetchApp ไม่มีพารามิเตอร์ timeout ให้ตั้ง → กันชนเพดานได้ทางเดียวคือ "ไม่เริ่มรอบใหม่"
+//   เมื่องบเวลาใกล้หมด. global var ถูก evaluate ใหม่ทุก execution จึงใช้เป็นจุดเริ่มนับได้
+// ลูปไหนที่ยิง UrlFetchApp หรือ retry ซ้ำ ต้องเช็ค execRemainingMs_() ก่อนเริ่มรอบถัดไป
+// ────────────────────────────────────────────────────────────────────────────
+var EXEC_START_MS = Date.now();
+var EXEC_BUDGET_MS = 300000;        // 5 นาที — เหลืออีก 1 นาทีให้ serialize + ตอบกลับก่อนโดนตัด
+var EXEC_FETCH_RESERVE_MS = 60000;  // กันไว้ให้ UrlFetchApp 1 ครั้งที่ช้าที่สุด
+
+function execRemainingMs_() {
+  return EXEC_BUDGET_MS - (Date.now() - EXEC_START_MS);
+}
+
+// true = เวลาเหลือไม่พอเริ่ม network call รอบใหม่
+function execBudgetExhausted_() {
+  return execRemainingMs_() < EXEC_FETCH_RESERVE_MS;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // AUDIT LOG — แยก spreadsheet ออกจาก SHEET_ID (คลังข้อสอบ) โดยสิ้นเชิง
 // เหตุผล: log การใช้งาน/prompt AI โตไม่จำกัด → ถ้าเขียนลง SHEET_ID เดียวกันจะดัน
 //   จำนวนเซลล์ชนเพดาน 10M ต่อไฟล์ แล้วทำให้ "ทั้งฐานข้อมูล" (คำถาม/โหวต/รายงาน) เขียนไม่ได้
