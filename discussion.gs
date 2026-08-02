@@ -30,8 +30,8 @@ function computeEmailTag_(email) {
   return hex.slice(0, 4);
 }
 
-function readDiscussionComments_(qid) {
-  var ss = SpreadsheetApp.openById(SHEET_ID);
+function readDiscussionComments_(qid, ss) {
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(DISCUSSION_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return [];
   var rows = sheet.getDataRange().getValues();
@@ -46,8 +46,8 @@ function readDiscussionComments_(qid) {
 
 // Report sheet columns: From,Category,QuestionID,Question,Image,Choices,SuggestedAnswer,ReportDetail,Time,Status,AdminNote,Done,SuggestedExplain,VoteCount
 // decision #7: เปิด ReportDetail/SuggestedAnswer/Time/Status/VoteCount, ซ่อน From (ผู้รายงาน)
-function readQuestionReports_(qid) {
-  var ss = SpreadsheetApp.openById(SHEET_ID);
+function readQuestionReports_(qid, ss) {
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName("Report");
   if (!sheet || sheet.getLastRow() < 2) return [];
   var rows = sheet.getDataRange().getValues();
@@ -68,16 +68,26 @@ function readQuestionReports_(qid) {
 
 // Logs columns: Timestamp,User,Role,ActionGroup,ActionType,TargetID,Details,OldValue,NewValue,Metadata
 // decision #8: filter ActionGroup=QUESTION/ActionType=EDIT/TargetID=qid, diff แบบย่อ, ซ่อนชื่อแอดมิน
-function readQuestionRevisions_(qid) {
-  var ss = SpreadsheetApp.openById(SHEET_ID);
-  var sheet = ss.getSheetByName("Logs");
-  if (!sheet || sheet.getLastRow() < 2) return [];
-  var rows = sheet.getDataRange().getValues();
+// ใช้ logs_data_cache (15s TTL) แบบเดียวกับ getChangedSinceTimestamp — กัน full-scan Logs ซ้ำทุกครั้งที่เปิด discussion
+function readQuestionRevisions_(qid, ss, startTime) {
+  if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
+  var logDataJson = getLargeCache("logs_data_cache");
+  var logData;
+  if (logDataJson) {
+    logData = JSON.parse(logDataJson);
+  } else {
+    if (startTime) assertNotTimedOut_(startTime, 'readQuestionRevisions_:before_logs');
+    var sheet = ss.getSheetByName("Logs");
+    if (!sheet || sheet.getLastRow() < 2) return [];
+    logData = sheet.getDataRange().getValues();
+    putLargeCache("logs_data_cache", JSON.stringify(logData), 15, startTime);
+  }
   var out = [];
-  for (var i = 1; i < rows.length; i++) {
-    if (rows[i][3] !== "QUESTION" || rows[i][4] !== "EDIT" || String(rows[i][5]) !== qid) continue;
-    var t = rows[i][0] instanceof Date ? rows[i][0].toISOString() : String(rows[i][0]);
-    out.push({ time: t, diff: describeQuestionEditDiff_(rows[i][7], rows[i][8]) });
+  for (var i = 1; i < logData.length; i++) {
+    if (i % 1000 === 0 && startTime) assertNotTimedOut_(startTime, 'readQuestionRevisions_:loop');
+    if (logData[i][3] !== "QUESTION" || logData[i][4] !== "EDIT" || String(logData[i][5]) !== qid) continue;
+    var t = logData[i][0] instanceof Date ? logData[i][0].toISOString() : String(logData[i][0]);
+    out.push({ time: t, diff: describeQuestionEditDiff_(logData[i][7], logData[i][8]) });
   }
   return out;
 }
@@ -134,11 +144,19 @@ function getDiscussionData(qid, startTime) {
   if (cached) return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
 
   if (startTime) assertNotTimedOut_(startTime, 'getDiscussionData');
+  var ss = SpreadsheetApp.openById(SHEET_ID); // เปิดครั้งเดียว ส่งต่อให้ sub-helpers ทั้ง 3 ตัว กัน openById ซ้ำ
+  if (startTime) assertNotTimedOut_(startTime, 'getDiscussionData:after_openById');
+  var comments = readDiscussionComments_(qid, ss);
+  if (startTime) assertNotTimedOut_(startTime, 'getDiscussionData:after_comments');
+  var reports = readQuestionReports_(qid, ss);
+  if (startTime) assertNotTimedOut_(startTime, 'getDiscussionData:after_reports');
+  var revisions = readQuestionRevisions_(qid, ss, startTime);
+  if (startTime) assertNotTimedOut_(startTime, 'getDiscussionData:after_revisions');
   var payload = JSON.stringify({
     result: "success",
-    comments: readDiscussionComments_(qid),
-    reports: readQuestionReports_(qid),
-    revisions: readQuestionRevisions_(qid)
+    comments: comments,
+    reports: reports,
+    revisions: revisions
   });
   cache.put(cacheKey, payload, DISCUSSION_CACHE_TTL_SEC); // เขียน cache แม้ผลว่างเปล่า กัน full-scan Logs ซ้ำทุกครั้งที่เปิด
   return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
