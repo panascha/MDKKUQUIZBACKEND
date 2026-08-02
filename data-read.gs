@@ -2,7 +2,8 @@ function getAdminsList() {
     return getSheetDataJSON('Admins');
 }
 
-function getAllDataForAdmin() {
+function getAllDataForAdmin(startTime) {
+  startTime = startTime || Date.now();
   var ss = SpreadsheetApp.openById(SHEET_ID);
 
   // ดึงข้อมูล Admins แบบเร็ว
@@ -15,20 +16,37 @@ function getAllDataForAdmin() {
     return safeAdmin;
   });
 
+  assertNotTimedOut_(startTime, 'getAllDataForAdmin:admins');
   getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
+
+  assertNotTimedOut_(startTime, 'getAllDataForAdmin:questions');
+  // getQuestionsArray คืน array ตรง ไม่ต้องผ่าน stringify→parse ของ getQuestionsData (เดิม materialize คำถาม 26MB ซ้ำ 2 รอบก่อนถูก stringify รอบสุดท้ายด้านล่าง)
+  var questionsArr = getQuestionsArray('', ss, startTime);
+
+  assertNotTimedOut_(startTime, 'getAllDataForAdmin:structure_category');
+  var structureArr = getSheetDataJSON('Structure', ss);
+  var categoryArr = getSheetDataJSON('Category', ss);
+
+  assertNotTimedOut_(startTime, 'getAllDataForAdmin:report_votes');
+  var reportArr = getSheetDataJSON('Report', ss);
+  var votesArr = getSheetDataJSON('Votes', ss);
+
+  assertNotTimedOut_(startTime, 'getAllDataForAdmin:logs');
+  var logsArr = getLogsTailJSON(ss, 300); // จำกัดเฉพาะ 300 แถวล่าสุด (Logs โตไม่จำกัด) — โหลดเต็มผ่าน action=getLogsPage
 
   var data = {
     v: getVersionCached(), // แทรกเวอร์ชันปัจจุบันเพื่อให้ฝั่งไคลเอนต์ใช้ซิงค์ในรอบเดี่ยวได้โดยไม่ต้องยิง checkVersion แยก
     serverTime: Date.now(), // seed lastSyncTs ฝั่ง client สำหรับ getAdminSync delta
-    questions: JSON.parse(getQuestionsData('', ss).getContent()), // ส่ง ss เข้าไปด้วย
-    structure: getSheetDataJSON('Structure', ss),
-    category: getSheetDataJSON('Category', ss),
-    report: getSheetDataJSON('Report', ss),
-    votes: getSheetDataJSON('Votes', ss),
-    logs: getLogsTailJSON(ss, 300), // จำกัดเฉพาะ 300 แถวล่าสุด (Logs โตไม่จำกัด) — โหลดเต็มผ่าน action=getLogsPage
+    questions: questionsArr,
+    structure: structureArr,
+    category: categoryArr,
+    report: reportArr,
+    votes: votesArr,
+    logs: logsArr,
     admins: adminsSafe,
     announcements: getSheetDataJSON('Announcements', ss)
   };
+  assertNotTimedOut_(startTime, 'getAllDataForAdmin:before_stringify');
   return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -401,16 +419,21 @@ function getStructureData(filterSubject) {
   })).setMimeType(ContentService.MimeType.JSON);
 }
 
-function getQuestionsData(filterSubject, ss) {
+// คืน array ของคำถามตรง (ไม่ผ่าน ContentService) — ให้ caller ในกระบวนการเดียวกัน (เช่น getAllDataForAdmin)
+// ใส่ลง object รวมแล้ว stringify ครั้งเดียวตอนท้าย แทนที่จะ stringify ที่นี่แล้วต้อง parse กลับซ้ำ
+function getQuestionsArray(filterSubject, ss, startTime) {
   if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
 
   var categoryToSubjectMap = getCategoryToSubjectMapCached(ss);
 
   var qData = getAllQuestionsCached(ss);
-  if (qData.length === 0) return ContentService.createTextOutput("[]").setMimeType(ContentService.MimeType.JSON);
+  if (qData.length === 0) return [];
 
-  var questions = qData.map(function (row) {
+  // นอก .map callback เสมอ — ข้างในมี catch(err) ของตัวเองที่จะกลืน throw ของ assertNotTimedOut_ ถ้าเช็คในนั้น
+  if (startTime) assertNotTimedOut_(startTime, 'getQuestionsArray:before_map');
+
+  return qData.map(function (row) {
     var categories = [];
     try {
       var catRaw = row[6].toString().trim();
@@ -434,7 +457,10 @@ function getQuestionsData(filterSubject, ss) {
       return (categoryToSubjectMap[catId] || "") === cleanFilter;
     });
   });
+}
 
+function getQuestionsData(filterSubject, ss) {
+  var questions = getQuestionsArray(filterSubject, ss);
   return ContentService.createTextOutput(JSON.stringify(questions)).setMimeType(ContentService.MimeType.JSON);
 }
 

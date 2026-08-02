@@ -117,7 +117,8 @@ function getQuestionsDataCached(filterSubject, ss) {
   return response;
 }
 
-function getAllDataForAdminCached() {
+function getAllDataForAdminCached(startTime) {
+  startTime = startTime || Date.now();
   var v = getVersionCached();
   var cacheKey = "admin_all_data_" + v;
 
@@ -126,10 +127,27 @@ function getAllDataForAdminCached() {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
 
-  var response = getAllDataForAdmin();
-  var responseStr = response.getContent();
-  putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — key is version-scoped (admin_all_data_<v>) so staleness impossible
-  return response;
+  // Single-flight advisory flag: กันหลาย doGet execution ที่มาชนกันตอน cache miss (เช่นหลังแก้ข้อมูล v เปลี่ยน)
+  // จาก compute payload 26MB ซ้ำกันคนละ execution พร้อมกัน (ตรงกับ log: 4-5 execution ค้าง 100-311s)
+  // ไม่ใช่ LockService.getScriptLock() เพราะจะไปแย่ง lock กับ doPost admin tier (25s tryLock) จนเขียนข้อมูลค้าง
+  var scriptCache = CacheService.getScriptCache();
+  var inflightKey = "inflight_" + cacheKey;
+  if (scriptCache.get(inflightKey) != null) {
+    return ContentService.createTextOutput(JSON.stringify({
+      result: 'error',
+      message: 'Server is already building this data - please retry shortly or use Delta Sync'
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  try {
+    scriptCache.put(inflightKey, "1", 150); // TTL กันธงค้างถ้า execution ตายกลางคัน (โควต้าจริง 360s แต่ guard ตัดที่ 90s)
+    var response = getAllDataForAdmin(startTime);
+    var responseStr = response.getContent();
+    putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — key is version-scoped (admin_all_data_<v>) so staleness impossible
+    return response;
+  } finally {
+    scriptCache.remove(inflightKey);
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────

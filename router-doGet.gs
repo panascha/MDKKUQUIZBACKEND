@@ -1,16 +1,35 @@
 
+// เพดานเวลาต่อ doGet execution — เช็ค checkpoint ระหว่างขั้นตอนหนักๆ (getAllData/getQuestions cache miss)
+// เพื่อตัดจบก่อน Google ฆ่า container ที่ 360s (เห็นจาก Executions log: 4-5 execution ค้าง 100-311s, ตัวหนึ่ง timeout ที่ 369.985s)
+var DOGET_TIMEOUT_MS = 90 * 1000;
+var DOGET_TIMEOUT_MARK = 'DOGET_TIMEOUT';
+
+function assertNotTimedOut_(startTime, context) {
+  if (Date.now() - startTime > DOGET_TIMEOUT_MS) {
+    throw new Error(DOGET_TIMEOUT_MARK + ':' + (context || ''));
+  }
+}
+
 function doGet(e) {
   try {
     return doGet_(e);
   } catch (err) {
+    var msg = err.toString();
+    if (msg.indexOf(DOGET_TIMEOUT_MARK) !== -1) {
+      return ContentService.createTextOutput(JSON.stringify({
+        result: 'error',
+        message: 'Request timeout - please filter by subject or use Delta Sync'
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
     return ContentService.createTextOutput(JSON.stringify({
       'result': 'error',
-      'message': err.toString()
+      'message': msg
     })).setMimeType(ContentService.MimeType.JSON);
   }
 }
 
 function doGet_(e) {
+  var __startTime = Date.now();
   var action = e.parameter.action;
   var clientVer = e.parameter.clientVer;
   var serverVer = getVersionCached();
@@ -24,11 +43,20 @@ function doGet_(e) {
     return ContentService.createTextOutput(JSON.stringify({ v: serverVer })).setMimeType(ContentService.MimeType.JSON);
   }
   if (action == 'getStructure') return getStructureDataCached(e.parameter.subject);
-  if (action == 'getQuestions') return getQuestionsDataCached(e.parameter.subject);
+  if (action == 'getQuestions') {
+    // ไม่มี caller ปัจจุบัน (REAL) เรียกโดยไม่มี subject — บล็อกเส้นทางดึงคำถามทั้งหมดแบบไม่กรองที่ไม่เคยถูกใช้จริง
+    if (!e.parameter.subject) {
+      return ContentService.createTextOutput(JSON.stringify({
+        result: 'error',
+        message: 'subject is required for getQuestions - please filter by subject'
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    return getQuestionsDataCached(e.parameter.subject);
+  }
   if (action == 'getPendingVotes') return getPendingVotesData(e.parameter.qid);
   if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid);
   if (action == 'getPendingVotesReports') return getPendingVotesReportsData(e.parameter.subject);
-  if (action == 'getAllData') return getAllDataForAdminCached();
+  if (action == 'getAllData') return getAllDataForAdminCached(__startTime);
   if (action == 'getLogsPage') return getLogsPageData(e.parameter.offset, e.parameter.limit);
   if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject);
   if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject);
@@ -37,6 +65,7 @@ function doGet_(e) {
   if (action == 'getGlossary') return getGlossaryData(e.parameter.subject); // Feature 2: glossary ต่อวิชา (public read, chunked cache)
   if (action == 'getHighYield') return getHighYieldData(e.parameter.category); // Feature 3: ชีทสรุป high-yield ต่อหมวด (public read, chunked cache)
   if (action == 'getKeywordIndex') return getKeywordIndexData(e.parameter.category); // Feature 6: คำสำคัญที่ออกบ่อย ต่อหมวด (public read, chunked cache — list)
+  if (action == 'getDiscussion') return getDiscussionData(e.parameter.qid); // Feature 4 (main-task): comments+reports+revisions ต่อ qid (public read, cache disc_<qid> 5 นาที)
   if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
   if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
   if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)
