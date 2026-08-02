@@ -200,6 +200,19 @@ function cleanupExpiredSessions() {
   }
 }
 
+// ติดตั้ง time-driven trigger รันทุกวัน ~ตี 2 (idempotent) — เว้นตี 3-6 ให้ batch jobs เดิม
+// รันเองครั้งเดียวจาก Apps Script editor (ไม่เรียกอัตโนมัติตอนโหลด — เหมือน install*Trigger ตัวอื่น)
+function installSessionCleanupTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'cleanupExpiredSessions') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('cleanupExpiredSessions').timeBased().everyDays(1).atHour(2).create();
+  return 'installed';
+}
+
 function getOrCreateAnnouncementsSheet(ss) {
   var sheet = ss.getSheetByName("Announcements");
   if (!sheet) {

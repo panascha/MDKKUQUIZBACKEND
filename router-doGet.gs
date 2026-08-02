@@ -1,5 +1,16 @@
 
 function doGet(e) {
+  try {
+    return doGet_(e);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({
+      'result': 'error',
+      'message': err.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function doGet_(e) {
   var action = e.parameter.action;
   var clientVer = e.parameter.clientVer;
   var serverVer = getVersionCached();
@@ -29,7 +40,15 @@ function doGet(e) {
   if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
   if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
   if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)
-  if (action == 'discoverGeminiModels') return discoverGeminiModels(); // read-only: live models.list (แหล่งความจริงของ model IDs)
+  if (action == 'discoverGeminiModels') {
+    // เรียก Gemini จริงกินโควต้า key ที่บริจาค — public ไม่มี session token ให้ผูก key เลยจำกัดรวมทั้งระบบ
+    if (!checkActionRateLimit('rl_discovergemini_', 'global', 5)) {
+      return ContentService.createTextOutput(JSON.stringify({
+        result: 'error', message: 'Rate limited (max 5/hour)'
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    return discoverGeminiModels(); // read-only: live models.list (แหล่งความจริงของ model IDs)
+  }
   if (action == 'getAIModels') return getAIModels(); // read-only: ทะเบียน AI_Models สำหรับ admin panel (P2-Q6)
   // NOTE: gemini-sync ที่ mutate/กิน quota (reconcile/enable/purge/runGeminiModelSync/runGeminiToolProbe/installGeminiSyncTriggers)
   // เจตนา NOT exposed ทาง doGet — deployment นี้ public no-auth (frontend นิสิตเรียก getStructure ฯลฯ). Trigger เรียก fn ตรง,
