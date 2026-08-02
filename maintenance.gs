@@ -846,6 +846,14 @@ var KEYWORD_INDEX_SHEET_NAME = "Keyword_Index";
 var KEYWORD_MIN_LEN_EN = 2;   // §6.4 min length กัน keyword สั้น/กำกวม (EN มี word-boundary ป้องกันอยู่แล้ว → 2 พอ เช่น "MI")
 var KEYWORD_MIN_LEN_TH = 3;   // TH ใช้ substring (อันตรายกว่า) → ต้องยาว ≥3 กัน match มั่วทั่ว
 
+// ── Feature 4 (main-task): Peer Discussion Thread (per-question) — Idea/active/peer-discussion-thread.md ──
+// อ่าน = getDiscussion (doGet, public, cache disc_<qid> 5 นาที — ไม่ rate-limit เพราะ cache กันซ้ำอยู่แล้ว)
+// เขียน = postComment/deleteComment (doPost, localized-15s tier, ต้อง login — verifyAnySession)
+var DISCUSSION_SHEET_NAME = "Discussion";
+var DISCUSSION_MAX_CHARS = 500;        // เพดานความยาวข้อความต่อ 1 comment (บังคับ backend, counter ฝั่ง frontend)
+var DISCUSSION_MAX_COMMENTS = 100;     // เพดานจำนวน comment ที่ยัง visible ต่อ 1 คำถาม — เช็คใต้ lock กัน race
+var DISCUSSION_CACHE_TTL_SEC = 300;    // 5 นาที ต่อ qid (payload เล็ก ไม่ต้อง chunk)
+
 var INTELSPHERE_ENDPOINT = "https://gen.ai.kku.ac.th/api/v1/chat/completions";
 var INTELSPHERE_QUOTA_FLOOR = 0.05; // skip a provider whose remaining < 5% of its daily limit
 

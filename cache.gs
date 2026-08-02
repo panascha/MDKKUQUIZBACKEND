@@ -40,7 +40,7 @@ function updateVotesVersion() {
   return newVer;
 }
 
-function putLargeCache(key, value, ttl) {
+function putLargeCache(key, value, ttl, startTime) {
   if (!value) return;
   var cache = CacheService.getScriptCache();
   // Downsized to 25KB character slices to protect against multi-byte (Thai) UTF-8 expansion (up to 3x bytes per char)
@@ -53,6 +53,7 @@ function putLargeCache(key, value, ttl) {
     var batch = {};
     var batchCount = 0;
     for (var i = 0; i < chunks; i++) {
+      if (startTime) assertNotTimedOut_(startTime, 'putLargeCache:' + key);
       batch[key + "_chunk_" + i] = value.substring(i * chunkSize, (i + 1) * chunkSize);
       batchCount++;
       if (batchCount >= 100) {
@@ -63,6 +64,7 @@ function putLargeCache(key, value, ttl) {
     }
     if (batchCount > 0) cache.putAll(batch, ttl);
   } catch (e) {
+    if (e.message && e.message.indexOf(DOGET_TIMEOUT_MARK) !== -1) throw e;
     console.warn("putLargeCache failed for key " + key + ": " + e.message);
   }
 }
@@ -85,7 +87,7 @@ function getLargeCache(key) {
   return value;
 }
 
-function getStructureDataCached(filterSubject) {
+function getStructureDataCached(filterSubject, startTime) {
   var v = getVersionCached();
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";
   var cacheKey = "struct_" + v + "_" + cleanFilter;
@@ -95,13 +97,14 @@ function getStructureDataCached(filterSubject) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
   
-  var response = getStructureData(filterSubject);
+  if (startTime) assertNotTimedOut_(startTime, 'getStructureDataCached:start');
+  var response = getStructureData(filterSubject, startTime);
   var responseStr = response.getContent();
-  putLargeCache(cacheKey, responseStr, 1800); // 30 minutes
+  putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — no startTime: data already built, write regardless of time
   return response;
 }
 
-function getQuestionsDataCached(filterSubject, ss) {
+function getQuestionsDataCached(filterSubject, ss, startTime) {
   var v = getVersionCached();
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";
   var cacheKey = "questions_" + v + "_" + cleanFilter;
@@ -111,9 +114,10 @@ function getQuestionsDataCached(filterSubject, ss) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
 
-  var response = getQuestionsData(filterSubject, ss);
+  if (startTime) assertNotTimedOut_(startTime, 'getQuestionsDataCached:start');
+  var response = getQuestionsData(filterSubject, ss, startTime);
   var responseStr = response.getContent();
-  putLargeCache(cacheKey, responseStr, 1800); // ขยาย Cache เป็น 30 นาที เนื่องจากคีย์ผูกกับเวอร์ชันอยู่แล้ว (เมื่อมีข้อมูลใหม่แคชจะรีเซ็ตอัตโนมัติ)
+  putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — no startTime: data already built, write regardless of time
   return response;
 }
 
@@ -143,7 +147,7 @@ function getAllDataForAdminCached(startTime) {
     scriptCache.put(inflightKey, "1", 150); // TTL กันธงค้างถ้า execution ตายกลางคัน (โควต้าจริง 360s แต่ guard ตัดที่ 90s)
     var response = getAllDataForAdmin(startTime);
     var responseStr = response.getContent();
-    putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — key is version-scoped (admin_all_data_<v>) so staleness impossible
+    putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — no startTime: data already built, write cache regardless of time elapsed
     return response;
   } finally {
     scriptCache.remove(inflightKey);
@@ -154,65 +158,71 @@ function getAllDataForAdminCached(startTime) {
 // NEW: ADVANCED CACHED SHEET LOADERS (Bypasses Sheets API contention)
 // ────────────────────────────────────────────────────────────────────
 
-function getCategorySheetDataCached(ss) {
+function getCategorySheetDataCached(ss, startTime) {
   var v = getVersionCached();
   var cacheKey = "category_sheet_raw_" + v;
   var cached = getLargeCache(cacheKey);
   if (cached) {
     return JSON.parse(cached);
   }
+  if (startTime) assertNotTimedOut_(startTime, 'getCategorySheetDataCached');
   if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var catSheet = ss.getSheetByName('Category');
   if (!catSheet) return [];
   var rows = catSheet.getDataRange().getValues();
-  putLargeCache(cacheKey, JSON.stringify(rows), 1800); // 30 minutes
+  putLargeCache(cacheKey, JSON.stringify(rows), 1800); // 30 minutes — no startTime on write-back
   return rows;
 }
 
-function getStructureSheetDataCached(ss) {
+function getStructureSheetDataCached(ss, startTime) {
   var v = getVersionCached();
   var cacheKey = "structure_sheet_raw_" + v;
   var cached = getLargeCache(cacheKey);
   if (cached) {
     return JSON.parse(cached);
   }
+  if (startTime) assertNotTimedOut_(startTime, 'getStructureSheetDataCached');
   if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var structSheet = ss.getSheetByName('Structure');
   if (!structSheet) return [];
   var rows = structSheet.getDataRange().getValues();
-  putLargeCache(cacheKey, JSON.stringify(rows), 1800); // 30 minutes
+  putLargeCache(cacheKey, JSON.stringify(rows), 1800); // 30 minutes — no startTime on write-back
   return rows;
 }
 
-function getAllQuestionsCached(ss) {
+function getAllQuestionsCached(ss, startTime) {
   var v = getVersionCached();
   var cacheKey = "all_questions_raw_" + v;
   var cached = getLargeCache(cacheKey);
   if (cached) {
     return JSON.parse(cached);
   }
+  if (startTime) assertNotTimedOut_(startTime, 'getAllQuestionsCached:before_sheet');
   if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var qSheet = ss.getSheetByName('Questions');
   var qLastRow = qSheet.getLastRow();
   if (qLastRow <= 1) return [];
 
+  if (startTime) assertNotTimedOut_(startTime, 'getAllQuestionsCached:before_getValues');
   var qData = qSheet.getRange(2, 1, qLastRow - 1, 7).getValues();
+  // No timeout check before putLargeCache — data already fetched; always write cache regardless of elapsed time
   putLargeCache(cacheKey, JSON.stringify(qData), 1800); // 30 minutes
   return qData;
 }
 
-function getCategoryToSubjectMapCached(ss) {
+function getCategoryToSubjectMapCached(ss, startTime) {
   var v = getVersionCached();
   var cacheKey = "cat_to_subj_map_" + v;
   var cached = getLargeCache(cacheKey);
   if (cached) {
     return JSON.parse(cached);
   }
-  var catRows = getCategorySheetDataCached(ss);
+  if (startTime) assertNotTimedOut_(startTime, 'getCategoryToSubjectMapCached');
+  var catRows = getCategorySheetDataCached(ss, startTime);
   var categoryToSubjectMap = {};
   for (var i = 1; i < catRows.length; i++) {
     categoryToSubjectMap[String(catRows[i][0]).trim()] = String(catRows[i][1]).trim().toUpperCase();
   }
-  putLargeCache(cacheKey, JSON.stringify(categoryToSubjectMap), 1800); // 30 minutes
+  putLargeCache(cacheKey, JSON.stringify(categoryToSubjectMap), 1800); // 30 minutes — no startTime on write-back
   return categoryToSubjectMap;
 }

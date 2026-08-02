@@ -163,7 +163,8 @@ function getLogsTailJSON(ss, limit) {
 // Server-side pagination ของชีต Logs สำหรับหน้า "ประวัติทั้งหมด" ในแดชบอร์ดแอดมิน
 // offset นับจากแถวใหม่สุด (offset=0 = ชุดล่าสุด), limit = จำนวนแถวต่อหน้า (ค่าเริ่มต้น 300)
 // คืนค่า logs เป็น object array รูปแบบเดียวกับ entry ใน getAllDataForAdmin().logs
-function getLogsPageData(offsetStr, limitStr) {
+function getLogsPageData(offsetStr, limitStr, startTime) {
+    if (startTime) assertNotTimedOut_(startTime, 'getLogsPageData');
     var ss = SpreadsheetApp.openById(SHEET_ID);
     var sheet = ss.getSheetByName('Logs');
     if (!sheet) {
@@ -209,7 +210,7 @@ function getLogsPageData(offsetStr, limitStr) {
     })).setMimeType(ContentService.MimeType.JSON);
 }
 
-function getPendingVotesData(qid) {
+function getPendingVotesData(qid, startTime) {
   var v = getVotesVersionCached();
   var cacheKey = "pending_votes_" + v + "_" + qid;
   var cached = getLargeCache(cacheKey);
@@ -217,6 +218,7 @@ function getPendingVotesData(qid) {
     return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getPendingVotesData');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var voteSheet = ss.getSheetByName("Votes");
   var result = [];
@@ -245,7 +247,7 @@ function getPendingVotesData(qid) {
   return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
 }
 
-function getPendingReportsData(qid) {
+function getPendingReportsData(qid, startTime) {
   var v = getVotesVersionCached();
   var cacheKey = "pending_reports_" + v + "_" + qid;
   var cached = getLargeCache(cacheKey);
@@ -253,6 +255,7 @@ function getPendingReportsData(qid) {
     return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getPendingReportsData');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName("Report");
   var result = [];
@@ -280,7 +283,7 @@ function getPendingReportsData(qid) {
 // T1.1: Bulk endpoint — คืน pending votes + reports ของทุกข้อในวิชาเดียว (sparse map ตาม qid)
 // แคชทั้งก้อนต่อวิชาโดยผูกกับ votes-version key (โหวต/รายงาน 1 ครั้ง = ล้างแคชครั้งเดียว)
 // value ต่อ qid มีรูปแบบเดียวกับ endpoint per-qid เดิม (votes -> {votes,thresholds}, reports -> {reports,threshold})
-function getPendingVotesReportsData(subjectParam) {
+function getPendingVotesReportsData(subjectParam, startTime) {
   var v = getVotesVersionCached();
   var cleanFilter = subjectParam ? String(subjectParam).trim().toUpperCase() : "all";
   var cacheKey = "pending_vr_" + v + "_" + cleanFilter;
@@ -289,16 +292,18 @@ function getPendingVotesReportsData(subjectParam) {
     return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getPendingVotesReportsData:start');
   var ss = SpreadsheetApp.openById(SHEET_ID);
 
   // สร้างเซ็ตของ qid ที่อยู่ในวิชานี้ (ผ่าน category->subject map + คำถามที่แคชไว้)
   // ใช้ตัวคำถามเป็นเกณฑ์เพื่อความถูกต้อง โดยไม่ขึ้นกับความกำกวมของคอลัมน์ subject ในชีต Votes/Report
   var subjectQids = null; // null = รับทุก qid (กรณี subject = all)
   if (cleanFilter !== "all") {
-    var catToSubj = getCategoryToSubjectMapCached(ss);
-    var qData = getAllQuestionsCached(ss);
+    var catToSubj = getCategoryToSubjectMapCached(ss, startTime);
+    var qData = getAllQuestionsCached(ss, startTime);
     subjectQids = {};
     for (var qi = 0; qi < qData.length; qi++) {
+      if (qi % 500 === 0 && startTime) assertNotTimedOut_(startTime, 'getPendingVotesReportsData:qData_loop');
       var cats = [];
       try {
         var craw = String(qData[qi][6]).trim();
@@ -313,6 +318,7 @@ function getPendingVotesReportsData(subjectParam) {
     }
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getPendingVotesReportsData:before_votes');
   // --- Votes (สถานะ Pending หรือ Approved) ---
   var votesMap = {};
   var voteSheet = ss.getSheetByName("Votes");
@@ -332,6 +338,7 @@ function getPendingVotesReportsData(subjectParam) {
     }
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getPendingVotesReportsData:before_reports');
   // --- Reports (สถานะ Pending) ---
   var reportsMap = {};
   var reportSheet = ss.getSheetByName("Report");
@@ -382,11 +389,11 @@ function getAnnouncementsDataCached(ss) {
   return data;
 }
 
-function getStructureData(filterSubject) {
+function getStructureData(filterSubject, startTime) {
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
 
-  var rows = getStructureSheetDataCached(ss);
+  var rows = getStructureSheetDataCached(ss, startTime);
   var structData = [];
   for (var i = 1; i < rows.length; i++) {
     if (cleanFilter !== "" && String(rows[i][1]).trim().toUpperCase() !== cleanFilter) continue;
@@ -398,7 +405,7 @@ function getStructureData(filterSubject) {
     });
   }
 
-  var catRows = getCategorySheetDataCached(ss);
+  var catRows = getCategorySheetDataCached(ss, startTime);
   var categoryData = [];
   for (var i = 1; i < catRows.length; i++) {
     if (cleanFilter !== "" && String(catRows[i][1]).trim().toUpperCase() !== cleanFilter) continue;
@@ -425,9 +432,9 @@ function getQuestionsArray(filterSubject, ss, startTime) {
   if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
 
-  var categoryToSubjectMap = getCategoryToSubjectMapCached(ss);
+  var categoryToSubjectMap = getCategoryToSubjectMapCached(ss, startTime);
 
-  var qData = getAllQuestionsCached(ss);
+  var qData = getAllQuestionsCached(ss, startTime);
   if (qData.length === 0) return [];
 
   // นอก .map callback เสมอ — ข้างในมี catch(err) ของตัวเองที่จะกลืน throw ของ assertNotTimedOut_ ถ้าเช็คในนั้น
@@ -459,18 +466,20 @@ function getQuestionsArray(filterSubject, ss, startTime) {
   });
 }
 
-function getQuestionsData(filterSubject, ss) {
-  var questions = getQuestionsArray(filterSubject, ss);
+function getQuestionsData(filterSubject, ss, startTime) {
+  var questions = getQuestionsArray(filterSubject, ss, startTime);
+  if (startTime) assertNotTimedOut_(startTime, 'getQuestionsData:end');
   return ContentService.createTextOutput(JSON.stringify(questions)).setMimeType(ContentService.MimeType.JSON);
 }
 
-function getChangedSinceTimestamp(sinceStr, filterSubject) {
+function getChangedSinceTimestamp(sinceStr, filterSubject, startTime) {
+  if (startTime) assertNotTimedOut_(startTime, 'getChangedSinceTimestamp:start');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sinceMs = parseInt(sinceStr) || 0;
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "";
 
   // --- Build Category → Subject map ---
-  var catToSubjectMap = getCategoryToSubjectMapCached(ss);
+  var catToSubjectMap = getCategoryToSubjectMapCached(ss, startTime);
 
   // --- Scan Logs sheet using cached or fresh data ---
   var logDataJson = getLargeCache("logs_data_cache");
@@ -484,6 +493,7 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
     }
   }
   if (!logData) {
+    if (startTime) assertNotTimedOut_(startTime, 'getChangedSinceTimestamp:before_logs');
     var logSheet = ss.getSheetByName('Logs');
     if (logSheet) {
       var lastRow = logSheet.getLastRow();
@@ -502,7 +512,7 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
           // Fallback to full read only if client has no sinceMs or is extremely outdated
           logData = logSheet.getDataRange().getValues();
         }
-        putLargeCache("logs_data_cache", JSON.stringify(logData), 15); // Cache for 15s to block stamps
+        putLargeCache("logs_data_cache", JSON.stringify(logData), 15, startTime); // Cache for 15s to block stamps
       } else {
         logData = [];
       }
@@ -515,6 +525,7 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
 
   if (logData.length > 1) {
     for (var i = 1; i < logData.length; i++) {
+      if (i % 1000 === 0 && startTime) assertNotTimedOut_(startTime, 'getChangedSinceTimestamp:log_loop');
       var logTime = new Date(logData[i][0]).getTime();
       var actionGroup = String(logData[i][3]);
       var targetId = String(logData[i][5]).trim();
@@ -541,10 +552,11 @@ function getChangedSinceTimestamp(sinceStr, filterSubject) {
   }
 
   // --- Fetch changed rows from cached Questions instead of sheet ---
-  var qData = getAllQuestionsCached(ss);
+  var qData = getAllQuestionsCached(ss, startTime);
   var changedQuestions = [];
 
   for (var i = 0; i < qData.length; i++) {
+    if (i % 500 === 0 && startTime) assertNotTimedOut_(startTime, 'getChangedSinceTimestamp:qData_loop');
     var qId = String(qData[i][0]).trim();
     if (!changedIds[qId]) continue;
 

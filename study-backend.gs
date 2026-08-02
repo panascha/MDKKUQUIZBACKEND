@@ -248,7 +248,7 @@ function runQuestionRelationsBatch() {
 }
 
 // อ่าน relations ของวิชาหนึ่งเป็น map { questionId: [{relatedId, score}, ...] } — chunked cache, อ่านอย่างเดียว
-function getRelatedQuestionsData(subject) {
+function getRelatedQuestionsData(subject, startTime) {
   var v = getVersionCached();
   var cleanFilter = subject ? String(subject).trim().toUpperCase() : "all";
   var cacheKey = "relations_" + v + "_" + cleanFilter;
@@ -258,13 +258,14 @@ function getRelatedQuestionsData(subject) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getRelatedQuestionsData');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var relations = {};
 
   var sheet = ss.getSheetByName(QUESTION_RELATIONS_SHEET_NAME);
   if (sheet && sheet.getLastRow() > 1) {
     // ชีตไม่มีคอลัมน์ subject (สคีมา A-F ตายตัว) → กรองด้วยเซ็ต questionId ของวิชานี้
-    var qJson = getQuestionsDataCached(subject, ss).getContent();
+    var qJson = getQuestionsDataCached(subject, ss, startTime).getContent();
     var subjQuestions = [];
     try { subjQuestions = JSON.parse(qJson) || []; } catch (e) { subjQuestions = []; }
     var idSet = {};
@@ -282,7 +283,7 @@ function getRelatedQuestionsData(subject) {
   }
 
   var payload = JSON.stringify({ result: 'success', relations: relations });
-  putLargeCache(cacheKey, payload, 1800); // 30 นาที (คีย์ผูก version อยู่แล้ว)
+  putLargeCache(cacheKey, payload, 1800, startTime); // 30 นาที (คีย์ผูก version อยู่แล้ว)
   return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -415,7 +416,9 @@ function ingestKBChunks(subject, source, markdown, categoryId) {
 
 // อ่าน KB chunks ของวิชาหนึ่ง (public, chunked cache) — mirror getRelatedQuestionsData
 // degrade เป็น chunks:[] เมื่อยังไม่มีชีต/ไม่มีแถวของวิชานี้
-function getKBData(subject) {
+// อ่าน KB chunks ของวิชาหนึ่ง (public, chunked cache) — mirror getRelatedQuestionsData
+// degrade เป็น chunks:[] เมื่อยังไม่มีชีต/ไม่มีแถวของวิชานี้
+function getKBData(subject, startTime) {
   var v = getVersionCached();
   var cleanFilter = subject ? String(subject).trim().toUpperCase() : "all";
   var cacheKey = "kb_" + v + "_" + cleanFilter;
@@ -425,6 +428,7 @@ function getKBData(subject) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getKBData');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var chunks = [];
   var sheet = ss.getSheetByName(KB_CHUNKS_SHEET_NAME);
@@ -447,7 +451,7 @@ function getKBData(subject) {
   }
 
   var payload = JSON.stringify({ result: 'success', chunks: chunks });
-  putLargeCache(cacheKey, payload, 1800); // 30 นาที (คีย์ผูก version อยู่แล้ว)
+  putLargeCache(cacheKey, payload, 1800, startTime); // 30 นาที (คีย์ผูก version อยู่แล้ว)
   return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -513,7 +517,7 @@ function invalidateGlossaryCache(subject) {
 }
 
 // อ่าน glossary ของวิชา (public, chunked cache) — mirror getKBData. degrade เป็น terms:[] เมื่อไม่มีชีต/แถว
-function getGlossaryData(subject) {
+function getGlossaryData(subject, startTime) {
   var v = getVersionCached();
   var cleanFilter = subject ? String(subject).trim().toUpperCase() : "all";
   var cacheKey = "glossary_" + v + "_" + cleanFilter;
@@ -523,6 +527,7 @@ function getGlossaryData(subject) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getGlossaryData');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var terms = [];
   var sheet = ss.getSheetByName(GLOSSARY_SHEET_NAME);
@@ -537,7 +542,7 @@ function getGlossaryData(subject) {
   }
 
   var payload = JSON.stringify({ result: 'success', terms: terms });
-  putLargeCache(cacheKey, payload, 1800); // 30 นาที (คีย์ผูก version อยู่แล้ว)
+  putLargeCache(cacheKey, payload, 1800, startTime); // 30 นาที (คีย์ผูก version อยู่แล้ว)
   return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -820,7 +825,7 @@ function invalidateHighYieldCache(category) {
 }
 
 // อ่านชีทสรุปของหมวดหนึ่ง (public, chunked cache) — mirror getGlossaryData. degrade เป็น highyield:null เมื่อไม่มีชีต/แถว
-function getHighYieldData(category) {
+function getHighYieldData(category, startTime) {
   var v = getVersionCached();
   var clean = normalizeHighYieldCategory(category);
   var cacheKey = "highyield_" + v + "_" + (clean || "all");
@@ -830,6 +835,7 @@ function getHighYieldData(category) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getHighYieldData');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var hy = null;
   var sheet = ss.getSheetByName(HIGHYIELD_SHEET_NAME);
@@ -842,7 +848,7 @@ function getHighYieldData(category) {
   }
 
   var payload = JSON.stringify({ result: 'success', highyield: hy });
-  putLargeCache(cacheKey, payload, 1800); // 30 นาที (คีย์ผูก version + invalidate ตอนเขียน/โหวต)
+  putLargeCache(cacheKey, payload, 1800, startTime); // 30 นาที (คีย์ผูก version + invalidate ตอนเขียน/โหวต)
   return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -1122,7 +1128,7 @@ function invalidateKeywordIndexCache(category) {
 
 // อ่านดัชนีคำสำคัญของหมวดหนึ่ง (public, chunked cache) — mirror getHighYieldData แต่คืน "list" ของทุก keyword ในหมวด
 // จัดอันดับ Freq desc. degrade เป็น keywords:[] เมื่อไม่มีชีต/ไม่มีแถว (สะอาด — §6.3 review surface โชว์ "ยังไม่มี")
-function getKeywordIndexData(category) {
+function getKeywordIndexData(category, startTime) {
   var v = getVersionCached();
   var clean = normalizeHighYieldCategory(category);
   var cacheKey = "keywordindex_" + v + "_" + (clean || "all");
@@ -1132,6 +1138,7 @@ function getKeywordIndexData(category) {
     return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getKeywordIndexData');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var list = [];
   var sheet = ss.getSheetByName(KEYWORD_INDEX_SHEET_NAME);
@@ -1146,7 +1153,7 @@ function getKeywordIndexData(category) {
   }
 
   var payload = JSON.stringify({ result: 'success', keywords: list });
-  putLargeCache(cacheKey, payload, 1800); // 30 นาที (คีย์ผูก version + invalidate ตอนเขียน)
+  putLargeCache(cacheKey, payload, 1800, startTime); // 30 นาที (คีย์ผูก version + invalidate ตอนเขียน)
   return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
 }
 

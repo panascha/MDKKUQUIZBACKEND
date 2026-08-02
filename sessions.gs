@@ -126,7 +126,8 @@ function verifySessionToken(token) {
   return null;
 }
 
-// ตรวจ token ของ "ใครก็ได้" (Admin หรือ Student) — ใช้เฉพาะ endpoint sync ความคืบหน้า + verifySession
+// ตรวจ token ของ "ใครก็ได้" (Admin หรือ Student) — ใช้กับ endpoint ที่เปิดให้ทั้งสอง role เช่น
+// sync ความคืบหน้า, verifySession, deleteGlossaryTerm, Discussion (postComment/deleteComment)
 // ห้ามใช้แทน verifySessionToken ใน action ฝั่งแอดมิน: token ของ Student ต้องผ่านไม่ได้
 function verifyAnySession(token) {
   if (!token) return null;

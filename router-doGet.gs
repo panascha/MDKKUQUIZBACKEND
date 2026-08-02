@@ -42,7 +42,7 @@ function doGet_(e) {
   if (action == 'checkVersion') {
     return ContentService.createTextOutput(JSON.stringify({ v: serverVer })).setMimeType(ContentService.MimeType.JSON);
   }
-  if (action == 'getStructure') return getStructureDataCached(e.parameter.subject);
+  if (action == 'getStructure') return getStructureDataCached(e.parameter.subject, __startTime);
   if (action == 'getQuestions') {
     // ไม่มี caller ปัจจุบัน (REAL) เรียกโดยไม่มี subject — บล็อกเส้นทางดึงคำถามทั้งหมดแบบไม่กรองที่ไม่เคยถูกใช้จริง
     if (!e.parameter.subject) {
@@ -51,21 +51,21 @@ function doGet_(e) {
         message: 'subject is required for getQuestions - please filter by subject'
       })).setMimeType(ContentService.MimeType.JSON);
     }
-    return getQuestionsDataCached(e.parameter.subject);
+    return getQuestionsDataCached(e.parameter.subject, null, __startTime);
   }
-  if (action == 'getPendingVotes') return getPendingVotesData(e.parameter.qid);
-  if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid);
-  if (action == 'getPendingVotesReports') return getPendingVotesReportsData(e.parameter.subject);
+  if (action == 'getPendingVotes') return getPendingVotesData(e.parameter.qid, __startTime);
+  if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid, __startTime);
+  if (action == 'getPendingVotesReports') return getPendingVotesReportsData(e.parameter.subject, __startTime);
   if (action == 'getAllData') return getAllDataForAdminCached(__startTime);
-  if (action == 'getLogsPage') return getLogsPageData(e.parameter.offset, e.parameter.limit);
-  if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject);
-  if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject);
-  if (action == 'getRelatedQuestions') return getRelatedQuestionsData(e.parameter.subject); // Feature 4: relations map ต่อวิชา (อ่านอย่างเดียว, chunked cache)
-  if (action == 'getKB') return getKBData(e.parameter.subject); // §1.8 KB corpus: chunks ต่อวิชา (public read, chunked cache)
-  if (action == 'getGlossary') return getGlossaryData(e.parameter.subject); // Feature 2: glossary ต่อวิชา (public read, chunked cache)
-  if (action == 'getHighYield') return getHighYieldData(e.parameter.category); // Feature 3: ชีทสรุป high-yield ต่อหมวด (public read, chunked cache)
-  if (action == 'getKeywordIndex') return getKeywordIndexData(e.parameter.category); // Feature 6: คำสำคัญที่ออกบ่อย ต่อหมวด (public read, chunked cache — list)
-  if (action == 'getDiscussion') return getDiscussionData(e.parameter.qid); // Feature 4 (main-task): comments+reports+revisions ต่อ qid (public read, cache disc_<qid> 5 นาที)
+  if (action == 'getLogsPage') return getLogsPageData(e.parameter.offset, e.parameter.limit, __startTime);
+  if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject, __startTime);
+  if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject, __startTime);
+  if (action == 'getRelatedQuestions') return getRelatedQuestionsData(e.parameter.subject, __startTime); // Feature 4: relations map ต่อวิชา (อ่านอย่างเดียว, chunked cache)
+  if (action == 'getKB') return getKBData(e.parameter.subject, __startTime); // §1.8 KB corpus: chunks ต่อวิชา (public read, chunked cache)
+  if (action == 'getGlossary') return getGlossaryData(e.parameter.subject, __startTime); // Feature 2: glossary ต่อวิชา (public read, chunked cache)
+  if (action == 'getHighYield') return getHighYieldData(e.parameter.category, __startTime); // Feature 3: ชีทสรุป high-yield ต่อหมวด (public read, chunked cache)
+  if (action == 'getKeywordIndex') return getKeywordIndexData(e.parameter.category, __startTime); // Feature 6: คำสำคัญที่ออกบ่อย ต่อหมวด (public read, chunked cache — list)
+  if (action == 'getDiscussion') return getDiscussionData(e.parameter.qid, __startTime); // Feature 4 (main-task): comments+reports+revisions ต่อ qid (public read, cache disc_<qid> 5 นาที)
   if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
   if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
   if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)

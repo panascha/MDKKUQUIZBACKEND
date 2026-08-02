@@ -156,7 +156,7 @@ function uploadToDrive(base64Data, filename, mimeType) {
   }
 }
 
-function getPendingReportCount(filterSubject) {
+function getPendingReportCount(filterSubject, startTime) {
   var v = getVotesVersionCached();
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";
   var cacheKey = "pending_report_count_" + v + "_" + cleanFilter;
@@ -165,6 +165,7 @@ function getPendingReportCount(filterSubject) {
     return ContentService.createTextOutput(cached).setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (startTime) assertNotTimedOut_(startTime, 'getPendingReportCount');
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName("Report");
   if (!sheet) {
@@ -198,7 +199,7 @@ function getPendingReportCount(filterSubject) {
     subject: cleanFilter === "all" ? "ALL" : cleanFilter
   };
   var responseStr = JSON.stringify(responseObj);
-  putLargeCache(cacheKey, responseStr, 300); // 5 minutes cache
+  putLargeCache(cacheKey, responseStr, 300, startTime); // 5 minutes cache
   return ContentService.createTextOutput(responseStr).setMimeType(ContentService.MimeType.JSON);
 }
 
