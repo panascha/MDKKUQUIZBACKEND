@@ -858,22 +858,22 @@ var INTELSPHERE_ENDPOINT = "https://gen.ai.kku.ac.th/api/v1/chat/completions";
 var INTELSPHERE_QUOTA_FLOOR = 0.05; // skip a provider whose remaining < 5% of its daily limit
 
 var INTELSPHERE_LIMITS = {
-  "Deepseek": 1000000, "Gemini": 350000, "Meta": 200000, "Nova": 200000, "xAI": 100000,
-  "Qwen": 100000, "OpenAI": 200000, "Claude": 200000, "Mistral": 100000, "MiniMax": 100000,
+  "Deepseek": 1000000, "Gemini": 350000, "Nova": 200000, "xAI": 100000,
+  "Qwen": 100000, "OpenAI": 200000, "Claude": 200000, "MiniMax": 100000,
   "MoonshotAI": 100000
   // Perplexity intentionally excluded — no published model ID
 };
 
 var INTELSPHERE_PROVIDER_PRIORITY = [
-  "Deepseek", "Gemini", "Meta", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "Mistral", "MiniMax", "MoonshotAI"
+  "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "MiniMax", "MoonshotAI"
 ];
 
 // One flagship model per provider — used ONLY when rotation moves to a provider
 // other than the one the student explicitly requested.
 var PROVIDER_MODEL_MAP = {
-  "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-3.6-flash",   "Meta": "llama-4-maverick",
+  "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-3.6-flash",
   "Nova":     "nova-pro-v1",       "xAI":    "grok-4",             "Qwen": "qwen3.7-plus",
-  "OpenAI":   "gpt-5-mini",        "Claude": "claude-sonnet-4.5",  "Mistral": "mistral-medium-3",
+  "OpenAI":   "gpt-5-mini",        "Claude": "claude-sonnet-4.5",
   "MiniMax":  "minimax-m3",        "MoonshotAI": "kimi-k3"
 };
 
@@ -882,12 +882,8 @@ var PROVIDER_MODELS_FALLBACK = {
   "Claude":   ["claude-sonnet-5","claude-sonnet-4.6","claude-sonnet-4.5","claude-haiku-4.5","claude-sonnet-4","claude-3.7-sonnet"],
   "Deepseek": ["deepseek-v4-pro","deepseek-v4-flash","deepseek-v3.2","deepseek-v3.2-exp","deepseek-chat-v3.1"],
   "Gemini":   ["gemini-3.6-flash","gemini-3.5-flash","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
-  "Meta":     ["llama-4-maverick","llama-4-scout"],
   "MiniMax":  ["minimax-m3"],
   "MoonshotAI": ["kimi-k3"],
-  // devstral-medium ถอดออก 2026-07-29 — IntelSphere map ไป mistralai/devstral-medium บน OpenRouter ซึ่งถูกปลดแล้ว
-  // ("No endpoints found") → นิสิตเลือกได้ก็ยิงไม่ติด. ใส่กลับได้เมื่อ live catalog ยืนยันว่ารับ slug นี้จริง
-  "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","codestral-2508","codestral-2501"],
   "Nova":     ["nova-2-lite-v1","nova-pro-v1"],
   "OpenAI":   ["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano","gpt-5.2","gpt-5.1","gpt-5.1-codex","gpt-5","gpt-5-mini","gpt-5-nano","gpt-5.5"],
   "Qwen":     ["qwen3.7-plus","qwen3.7-max","qwen3.6-flash","qwen3.5-9b","qwen3-235b-a22b-2507","qwen3-next-80b-a3b-instruct","qwen3-coder-flash","qwen3-coder","qwen3-vl-32b-instruct"],

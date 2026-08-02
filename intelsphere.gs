@@ -3,10 +3,8 @@ function inferProviderFromModel(modelId) {
   if (/^claude-/i.test(modelId))                          return "Claude";
   if (/^deepseek-/i.test(modelId))                         return "Deepseek";
   if (/^gemini-/i.test(modelId))                           return "Gemini";
-  if (/^llama-/i.test(modelId))                            return "Meta";
   if (/^minimax-/i.test(modelId))                          return "MiniMax";
   if (/^kimi/i.test(modelId))                              return "MoonshotAI";
-  if (/^(mistral-|codestral-|devstral-)/i.test(modelId))   return "Mistral";
   if (/^nova-/i.test(modelId))                             return "Nova";
   if (/^gpt-/i.test(modelId))                              return "OpenAI";
   if (/^qwen/i.test(modelId))                              return "Qwen";
@@ -425,15 +423,13 @@ function generateAgentQueryOwnerSecret() {
 }
 
 // Priority แยกจาก INTELSPHERE_PROVIDER_PRIORITY โดยเจตนา — agent ต้องการโมเดลแรงสุดก่อน ไม่ใช่ถูกสุดก่อน
-var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Mistral", "MoonshotAI", "Qwen", "OpenAI", "Gemini", "xAI", "Meta", "Nova", "MiniMax"];
+var AGENT_QUERY_PROVIDER_PRIORITY = ["Gemini", "Claude", "Deepseek", "MoonshotAI", "Qwen", "OpenAI", "xAI", "Nova", "MiniMax"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
-var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Mistral": 128000, "MoonshotAI": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
+var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "MoonshotAI": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
 // Overflow tier: providers ที่มีโควต้าเหลือเยอะแต่จง "ใช้เป็น buffer หลัง Deepseek/Qwen/OpenAI" ไม่ใช่ workhorse หลัก
-// (ไม่งั้น quota-sort ใน orderAgentProviders จะดันขึ้นหน้าเพราะโควต้าสูงสุด) — Deepseek ยังเป็น coding model หลัก
-// Meta/Nova/MiniMax เป็น buffer ล้วน (โควต้าเหลือเยอะสุดตอนเพิ่ม: Meta/Nova ~2.8M, MiniMax ~1.4M)
-// → ต้องอยู่ overflow ไม่งั้น quota-sort ดันขึ้นหน้า Deepseek แล้วโมเดลอ่อนกลายเป็น workhorse
-var AGENT_QUERY_OVERFLOW_PROVIDERS = { "Gemini": true, "xAI": true, "Meta": true, "Nova": true, "MiniMax": true };
+// (ไม่งั้น quota-sort ใน orderAgentProviders จะดันขึ้นหน้าเพราะโควต้าสูงสุด) — เอา Gemini ออกจาก overflow เพื่อให้ถูกเรียกก่อน
+var AGENT_QUERY_OVERFLOW_PROVIDERS = { "xAI": true, "Nova": true, "MiniMax": true };
 // โมเดลเฉพาะ agentQuery ต่อ overflow provider — override PROVIDER_MODEL_MAP โดยไม่แตะ path ของ chatbot นิสิต
 // Mistral: เคย override เป็น devstral-medium (agentic-coding) แต่ IntelSphere map ไป mistralai/devstral-medium
 // บน OpenRouter ซึ่งถูกปลด ("No endpoints found") → ตอนนี้ปล่อยให้ตกไป PROVIDER_MODEL_MAP.Mistral = mistral-medium-3
