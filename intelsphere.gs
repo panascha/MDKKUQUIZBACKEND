@@ -422,13 +422,12 @@ function generateAgentQueryOwnerSecret() {
   return secret;
 }
 
-// Priority แยกจาก INTELSPHERE_PROVIDER_PRIORITY โดยเจตนา — agent ต้องการโมเดลแรงสุดก่อน ไม่ใช่ถูกสุดก่อน
+// Priority สำหรับ Agent Query: ดัน Gemini ขึ้นมาเป็นอันดับแรกสุดเพื่อให้ถูกใช้งานก่อนตัวอื่น
 var AGENT_QUERY_PROVIDER_PRIORITY = ["Gemini", "Claude", "Deepseek", "MoonshotAI", "Qwen", "OpenAI", "xAI", "Nova", "MiniMax"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
 var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "MoonshotAI": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
-// Overflow tier: providers ที่มีโควต้าเหลือเยอะแต่จง "ใช้เป็น buffer หลัง Deepseek/Qwen/OpenAI" ไม่ใช่ workhorse หลัก
-// (ไม่งั้น quota-sort ใน orderAgentProviders จะดันขึ้นหน้าเพราะโควต้าสูงสุด) — เอา Gemini ออกจาก overflow เพื่อให้ถูกเรียกก่อน
+// Overflow tier: เอา Gemini ออกจากกลุ่ม Overflow เพื่อไม่ให้ระบบมองว่าเป็นแค่ตัวสำรองท้ายแถว
 var AGENT_QUERY_OVERFLOW_PROVIDERS = { "xAI": true, "Nova": true, "MiniMax": true };
 // โมเดลเฉพาะ agentQuery ต่อ overflow provider — override PROVIDER_MODEL_MAP โดยไม่แตะ path ของ chatbot นิสิต
 // Mistral: เคย override เป็น devstral-medium (agentic-coding) แต่ IntelSphere map ไป mistralai/devstral-medium
@@ -518,12 +517,15 @@ function orderAgentProviders(request, quotaTotals) {
   });
   var hasClaude = eligible.indexOf("Claude") >= 0;
   var byQuota = function(a, b) { return (quotaTotals[b] || 0) - (quotaTotals[a] || 0); };
-  // non-Claude แยกเป็น primary (Deepseek/Qwen/OpenAI) เรียงตามโควต้า แล้วต่อด้วย overflow (Gemini/xAI) ท้ายสุด —
+  // non-Claude แยกเป็น primary (Deepseek/Qwen/OpenAI) เรียงตามโควต้า แล้วต่อด้วย overflow (xAI/Nova/MiniMax) ท้ายสุด —
   // overflow มีโควต้าเยอะสุดแต่จงเป็น buffer ไม่ใช่ workhorse หลัก จึงไม่ปล่อยให้ quota-sort ดันขึ้นหน้า
+  // Gemini ดึงออกมาอยู่หน้าสุดเสมอ (bypass byQuota) — มี 4.88M แต่ Deepseek 8.1M เรียงทับ ยังไม่เคยถูกเรียก
   var nonClaude = eligible.filter(function(p) { return p !== "Claude"; });
-  var primary  = nonClaude.filter(function(p) { return !AGENT_QUERY_OVERFLOW_PROVIDERS[p]; }).sort(byQuota);
-  var overflow = nonClaude.filter(function(p) { return  AGENT_QUERY_OVERFLOW_PROVIDERS[p]; }).sort(byQuota);
-  var rest = primary.concat(overflow);
+  var hasGemini = nonClaude.indexOf("Gemini") >= 0;
+  var others = nonClaude.filter(function(p) { return p !== "Gemini"; });
+  var primary  = others.filter(function(p) { return !AGENT_QUERY_OVERFLOW_PROVIDERS[p]; }).sort(byQuota);
+  var overflow = others.filter(function(p) { return  AGENT_QUERY_OVERFLOW_PROVIDERS[p]; }).sort(byQuota);
+  var rest = (hasGemini ? ["Gemini"] : []).concat(primary).concat(overflow);
   var order = /haiku/i.test(request.model || "")
     ? rest.concat(hasClaude ? ["Claude"] : [])
     : (hasClaude ? ["Claude"] : []).concat(rest);
