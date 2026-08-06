@@ -309,7 +309,9 @@ function doPost(e) {
       }
 
       var provider = data.provider || "Gemini";
-      var apiKeyInfo = getAvailableAIKey(provider);
+      // AI Expert/chatbot = ปริมาณสูง → ปักหมุด flash-lite (RPD 500) ไม่ปล่อยตาม Priority ทะเบียน
+      // ถ้าโควต้าตัวนี้หมด getAvailableAIKey จะตกไป Priority ปกติเอง (ai-gemini.gs:306-313)
+      var apiKeyInfo = getAvailableAIKey(provider, "gemini-3.5-flash-lite");
 
       if (!apiKeyInfo) {
         return ContentService.createTextOutput(JSON.stringify({
@@ -367,7 +369,9 @@ function doPost(e) {
           result: 'error', message: 'ส่งได้สูงสุด 20 หน้าต่อชุด กรุณาลด batch size'
         })).setMimeType(ContentService.MimeType.JSON);
       }
-      var pcKeyInfo = getAvailableAIKey("Gemini");
+      // Student PDF converter = งานหนัก/คุณภาพต้องมาก่อน → ปักหมุด flash tier
+      // (ไม่งั้นได้ flash-lite ตาม Priority 1 ในทะเบียน); หมดโควต้าแล้วค่อยตกตาม Priority
+      var pcKeyInfo = getAvailableAIKey("Gemini", "gemini-3.5-flash");
       if (!pcKeyInfo) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: 'ขณะนี้ไม่มี Gemini API Key ที่พร้อมใช้งาน (โควต้ารายวันเต็มทุก Key) กรุณาลองใหม่พรุ่งนี้'

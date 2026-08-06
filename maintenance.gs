@@ -816,7 +816,7 @@ var KB_CHUNK_MAX_WORDS = 500;   // section ที่ยาวเกินนี�
 // ── Feature 2: Glossary (root-word + Thai↔English, §2.1–§2.6) ──
 // tap/select miss-path = askGlossaryTerm (public, standalone block, LLM lock-free); เสิร์ฟผ่าน getGlossary
 var GLOSSARY_SHEET_NAME = "Glossary";
-var GLOSSARY_MODEL = "gemini-2.5-flash";  // cheap flash tier; executeChatbotQuery rotate ต่อถ้า Gemini หมดโควต้า
+var GLOSSARY_MODEL = "gemini-3.5-flash-lite";  // flash-lite tier (ปริมาณสูง/ต้นทุนต่ำ); executeChatbotQuery rotate ต่อถ้า Gemini หมดโควต้า
 var GLOSSARY_ASK_RATE_LIMIT = 20;         // ต่อ token/'anon' ต่อชั่วโมง (public token-spending + write; กัน spam)
 var GLOSSARY_BATCH_BUDGET_MS = 300000;    // งบเวลา nightly ~5 นาที (ต่ำกว่าลิมิต 6 นาทีของ GAS)
 var GLOSSARY_CHECKPOINT_KEY = "GLOSSARY_BATCH_CHECKPOINT";
@@ -827,7 +827,7 @@ var GLOSSARY_BATCH_CHARS = 6000;          // ขนาดก้อนข้อ�
 // mnemonic vote = voteHighYieldMnemonic (standalone block, 15s tryLock = localized tier); เสิร์ฟผ่าน getHighYield (doGet, chunked cache)
 // batch = generateHighYieldForSubject / runHighYieldBatch (checkpointed) + runHighYieldBatchManual (admin tier). trigger เว้นไว้ไม่ติดตั้ง
 var HIGHYIELD_SHEET_NAME = "HighYield_Cache";
-var HIGHYIELD_MODEL = "gemini-2.5-flash";  // cheap flash tier — เหมือน glossary; executeChatbotQuery rotate ต่อถ้าโควต้าหมด
+var HIGHYIELD_MODEL = "gemini-3.5-flash-lite";  // flash-lite tier — เหมือน glossary; executeChatbotQuery rotate ต่อถ้าโควต้าหมด
 var HIGHYIELD_MAX_TOKENS = 8192;           // output ก้อนใหญ่ (summary+mnemonics+keywords) — 8192 รองรับ Thai Unicode overhead + JSON เต็ม
 var HIGHYIELD_GEN_RATE_LIMIT = 6;          // ต่อ token/'anon' ต่อชั่วโมง (call ใหญ่/แพงกว่า glossary มาก → เข้มกว่า 20)
 var HIGHYIELD_VOTE_RATE_LIMIT = 40;        // 👍/🚩 mnemonic เบามาก — กัน spam อย่างเดียว
@@ -860,12 +860,12 @@ var INTELSPHERE_QUOTA_FLOOR = 0.05; // skip a provider whose remaining < 5% of i
 var INTELSPHERE_LIMITS = {
   "Deepseek": 1000000, "Gemini": 350000, "Nova": 200000, "xAI": 100000,
   "Qwen": 100000, "OpenAI": 200000, "Claude": 200000, "MiniMax": 100000,
-  "MoonshotAI": 100000
+  "MoonshotAI": 100000, "Meta": 100000, "Mistral": 100000
   // Perplexity intentionally excluded — no published model ID
 };
 
 var INTELSPHERE_PROVIDER_PRIORITY = [
-  "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "MiniMax", "MoonshotAI"
+  "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "MiniMax", "MoonshotAI", "Meta", "Mistral"
 ];
 
 // One flagship model per provider — used ONLY when rotation moves to a provider
@@ -874,7 +874,8 @@ var PROVIDER_MODEL_MAP = {
   "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-3.6-flash",
   "Nova":     "nova-pro-v1",       "xAI":    "grok-4",             "Qwen": "qwen3.7-plus",
   "OpenAI":   "gpt-5-mini",        "Claude": "claude-sonnet-4.5",
-  "MiniMax":  "minimax-m3",        "MoonshotAI": "kimi-k3"
+  "MiniMax":  "minimax-m3",        "MoonshotAI": "kimi-k3",
+  "Meta":     "llama-4-maverick",  "Mistral": "mistral-medium-3"
 };
 
 // Hardcoded fallback catalog — used ONLY when the live GET /models fetch fails.
@@ -882,7 +883,9 @@ var PROVIDER_MODELS_FALLBACK = {
   "Claude":   ["claude-sonnet-5","claude-sonnet-4.6","claude-sonnet-4.5","claude-haiku-4.5","claude-sonnet-4","claude-3.7-sonnet"],
   "Deepseek": ["deepseek-v4-pro","deepseek-v4-flash","deepseek-v3.2","deepseek-v3.2-exp","deepseek-chat-v3.1"],
   "Gemini":   ["gemini-3.6-flash","gemini-3.5-flash","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
+  "Meta":     ["llama-4-maverick","llama-4-scout"],
   "MiniMax":  ["minimax-m3"],
+  "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","codestral-2508","codestral-2501"],
   "MoonshotAI": ["kimi-k3"],
   "Nova":     ["nova-2-lite-v1","nova-pro-v1"],
   "OpenAI":   ["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano","gpt-5.2","gpt-5.1","gpt-5.1-codex","gpt-5","gpt-5-mini","gpt-5-nano","gpt-5.5"],

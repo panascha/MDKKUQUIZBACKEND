@@ -1270,7 +1270,9 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
 // D13: fallback chain สำรองกรณีทะเบียน AI_Models อ่านไม่ได้ (ปกติ chain มาจาก apiKeyInfo.fallbackModels)
 // gemini-3.5-flash-lite เพิ่ม 2026-07-24: auto-discovered+auto-ranked+probe-passed แล้ว (Active, RPD 500,
 // priority 0 ใน AI_Models) — ตัวนี้ผ่าน tool-capability gate จริง จึงเติมใน static backup ด้วย
-var CONVERTER_FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-3.1-flash-lite"];
+// 2026-08-07 จัดลำดับใหม่ตาม tier policy: converter = flash tier ก่อน (3.5 → 3.6 → 2.5),
+// flash-lite เหลือไว้ท้ายแถวเป็นตัวสำรองสุดท้าย ไม่ตัดออก (converter ไม่ใช้ tools จึงใส่ 3.6-flash ได้)
+var CONVERTER_FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
 

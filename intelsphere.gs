@@ -3,7 +3,9 @@ function inferProviderFromModel(modelId) {
   if (/^claude-/i.test(modelId))                          return "Claude";
   if (/^deepseek-/i.test(modelId))                         return "Deepseek";
   if (/^gemini-/i.test(modelId))                           return "Gemini";
+  if (/^llama-/i.test(modelId))                            return "Meta";
   if (/^minimax-/i.test(modelId))                          return "MiniMax";
+  if (/^(mistral-|codestral-|devstral-)/i.test(modelId))   return "Mistral";
   if (/^kimi/i.test(modelId))                              return "MoonshotAI";
   if (/^nova-/i.test(modelId))                             return "Nova";
   if (/^gpt-/i.test(modelId))                              return "OpenAI";
@@ -176,6 +178,68 @@ function installKeySweepTrigger() {
   return 'installed';
 }
 
+// ── Daily unconditional quota reset (ไม่พึ่ง traffic) ──
+// getActiveIntelSphereKey() ด้านล่างมี lazy reset ต่อแถวอยู่แล้ว แต่ทำงานเฉพาะตอนมีอะไรเรียกเข้ามา
+// (chatbot หรือ agentQuery) — วันที่ไม่มี traffic เข้า GAS เลย (เช่น router tier 1 local-direct
+// ข้าม GAS ไปเรียก provider ตรง) โควต้าจะไม่ reset จนกว่าจะมี call จริงเข้ามาก่อน
+// ฟังก์ชันนี้ทำ reset แบบ unconditional จาก trigger รายวัน — เกณฑ์เดียวกับ lazy reset:
+// แถว Active ที่ Last_Reset_Date ไม่ตรงวันนี้ (Asia/Bangkok) → เติม {Provider}_Remaining
+// กลับเป็น INTELSPHERE_LIMITS แล้วเซ็ต Last_Reset_Date = วันนี้ แถวที่ reset ไปแล้ว (จาก cron
+// หรือจาก traffic จริง) ถูกข้าม — เกณฑ์คือ Last_Reset_Date ไม่ใช่ว่าฟังก์ชันไหนเป็นคนรัน
+function runIntelSphereDailyReset() {
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
+  if (!sheet) { console.warn("[intelSphereReset] ไม่พบ sheet " + INTELSPHERE_SHEET_NAME); return { checked: 0, reset: 0 }; }
+
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var colStatus = headers.indexOf("Status");
+  var colLastReset = headers.indexOf("Last_Reset_Date");
+  if (colStatus < 0 || colLastReset < 0) {
+    console.warn("[intelSphereReset] ไม่พบคอลัมน์ Status/Last_Reset_Date");
+    return { checked: 0, reset: 0 };
+  }
+
+  var tz = "Asia/Bangkok"; // อย่าใช้ timezone ของ script (อาจเป็น UTC — reset ช้า 7 ชม.)
+  var todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+
+  var checked = 0, reset = 0;
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (row[colStatus] !== "Active") continue;
+    checked++;
+
+    var lastResetStr = row[colLastReset]
+      ? Utilities.formatDate(new Date(row[colLastReset]), tz, "yyyy-MM-dd") : "";
+    if (lastResetStr === todayStr) continue;
+
+    (function(rowIndex) {
+      aiSheetRetry_(function() {
+        for (var p = 0; p < INTELSPHERE_PROVIDER_PRIORITY.length; p++) {
+          var provider = INTELSPHERE_PROVIDER_PRIORITY[p];
+          var rc = headers.indexOf(provider + "_Remaining");
+          if (rc >= 0) sheet.getRange(rowIndex + 1, rc + 1).setValue(INTELSPHERE_LIMITS[provider]);
+        }
+        sheet.getRange(rowIndex + 1, colLastReset + 1).setValue(todayStr);
+      });
+    })(i);
+    reset++;
+  }
+  if (reset) SpreadsheetApp.flush();
+  console.log("[intelSphereReset] checked=" + checked + " reset=" + reset);
+  return { checked: checked, reset: reset };
+}
+
+// ติดตั้ง time-driven trigger รันทุกวัน ~ตี 5 (idempotent) — คนละ handler จาก runIntelSphereKeySweep
+// ที่ตั้งไว้ตี 5 เหมือนกัน ก็รันแยกกันได้ปกติ ไม่ชนกัน (คนละ trigger, คนละ execution)
+function installIntelSphereResetTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'runIntelSphereDailyReset') ScriptApp.deleteTrigger(triggers[i]);
+  }
+  ScriptApp.newTrigger('runIntelSphereDailyReset').timeBased().everyDays(1).atHour(5).create();
+  return 'installed';
+}
+
 // เลือก (key, provider) ที่ยังมีโควต้า — weighted-random ตาม remaining tokens
 // (กับ key เดียวในระบบ พฤติกรรมเทียบเท่า top-down scan; รองรับหลาย key อัตโนมัติเมื่อมีผู้บริจาคเพิ่ม)
 // reservedKeySet: ชุดของ API_Key ที่ห้ามใช้ (จองไว้ให้ public) — {} = ไม่มี reserve
@@ -273,7 +337,8 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, imageUr
   if (!keyObj) {
     // Legacy fallback: ใช้ Gemini pool เดิมถ้า IntelSphere หมดทุก key
     if (typeof getAvailableAIKey === "function" && typeof callGeminiAI === "function") {
-      var fallbackKey = getAvailableAIKey("Gemini");
+      // chatbot tier เดียวกับ askAIExpert → ปักหมุด flash-lite (RPD 500) ให้ตรงกัน
+      var fallbackKey = getAvailableAIKey("Gemini", "gemini-3.5-flash-lite");
       if (!fallbackKey) throw new Error("โควต้า AI หมดแล้วสำหรับวันนี้ กรุณารอจนถึงเที่ยงคืนเพื่อรีเซ็ตโควต้า");
       // callGeminiAI รับ prompt เป็น string เท่านั้น → รูปหลุดแน่นอน ต้องบอก frontend
       return {
@@ -423,10 +488,10 @@ function generateAgentQueryOwnerSecret() {
 }
 
 // Priority สำหรับ Agent Query: ดัน Gemini ขึ้นมาเป็นอันดับแรกสุดเพื่อให้ถูกใช้งานก่อนตัวอื่น
-var AGENT_QUERY_PROVIDER_PRIORITY = ["Gemini", "Claude", "Deepseek", "MoonshotAI", "Qwen", "OpenAI", "xAI", "Nova", "MiniMax"];
+var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "MiniMax", "MoonshotAI", "Meta", "Mistral"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
-var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "MoonshotAI": 128000, "Qwen": 131072, "OpenAI": 128000, "Gemini": 1000000, "xAI": 256000 };
+var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Gemini": 1000000, "Nova": 200000, "xAI": 256000, "Qwen": 131072, "OpenAI": 128000, "MiniMax": 128000, "MoonshotAI": 128000, "Meta": 128000, "Mistral": 128000 };
 // Overflow tier: เอา Gemini ออกจากกลุ่ม Overflow เพื่อไม่ให้ระบบมองว่าเป็นแค่ตัวสำรองท้ายแถว
 var AGENT_QUERY_OVERFLOW_PROVIDERS = { "xAI": true, "Nova": true, "MiniMax": true };
 // โมเดลเฉพาะ agentQuery ต่อ overflow provider — override PROVIDER_MODEL_MAP โดยไม่แตะ path ของ chatbot นิสิต
