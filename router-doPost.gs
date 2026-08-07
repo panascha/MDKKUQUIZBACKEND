@@ -1281,11 +1281,14 @@ function doPost(e) {
 
         var urls = [];
         var successCount = 0;
+        // ใช้ร่วมกันทั้ง batch — กัน getQuestionRoutingInfo/getFoldersByName รันซ้ำต่อรูป
+        var batchRouteCache = {};
+        var batchFolderCache = {};
         for (var bi = 0; bi < images.length; bi++) {
           var item = images[bi] || {};
           try {
             if (!item.base64) { urls.push({ error: 'missing base64' }); continue; }
-            var fileUrl = uploadQuestionImageToDrive(item.base64, item.questionId, item.type, item.subject, item.year);
+            var fileUrl = uploadQuestionImageToDrive(item.base64, item.questionId, item.type, item.subject, item.year, batchRouteCache, batchFolderCache);
             urls.push(fileUrl);
             successCount++;
           } catch (err) {

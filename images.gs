@@ -5,9 +5,15 @@
 */
 
 // 1. ฟังก์ชันช่วยหาหรือสร้าง Folder (MD > Y[ปี] > [วิชา])
-function getOrCreateFolder(parentFolder, folderName) {
+// folderCache: optional {} shared across a batch call — memoizes getFoldersByName lookups
+// so repeated images to the same folder don't re-hit Drive every iteration
+function getOrCreateFolder(parentFolder, folderName, folderCache) {
+  var cacheKey = folderCache ? (parentFolder.getId() + '::' + folderName) : null;
+  if (folderCache && folderCache[cacheKey]) return folderCache[cacheKey];
   var folders = parentFolder.getFoldersByName(folderName);
-  return folders.hasNext() ? folders.next() : parentFolder.createFolder(folderName);
+  var folder = folders.hasNext() ? folders.next() : parentFolder.createFolder(folderName);
+  if (folderCache) folderCache[cacheKey] = folder;
+  return folder;
 }
 
 // 2. ฟังก์ชันแกะรหัสเพื่อหาที่อยู่โฟลเดอร์
@@ -44,37 +50,53 @@ function getQuestionRoutingInfo(questionId) {
 }
 
 // 3. ฟังก์ชันอัปโหลดรูป
-function uploadQuestionImageToDrive(base64Data, questionId, typeIdentifier) {
+// routeCache/folderCache: optional {} shared across a uploadImagesBatch call — memoizes
+// getQuestionRoutingInfo (SpreadsheetApp.openById) and folder lookups (DriveApp.getFoldersByName)
+// so they don't re-run per image when a batch shares the same question/subject/year
+function uploadQuestionImageToDrive(base64Data, questionId, typeIdentifier, subjectHint, yearHint, routeCache, folderCache) {
   var maxRetries = 3;
   var lastError;
 
   for (var i = 0; i < maxRetries; i++) {
     try {
-      var routeInfo = getQuestionRoutingInfo(questionId);
-      var rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
-      
-      var mdFolder = getOrCreateFolder(rootFolder, "MD");
-      var yearFolder = getOrCreateFolder(mdFolder, "Y" + routeInfo.year);
-      var targetFolder = getOrCreateFolder(yearFolder, routeInfo.subject);
+      var routeInfo;
+      if (routeCache && routeCache[questionId]) {
+        routeInfo = routeCache[questionId];
+      } else {
+        routeInfo = getQuestionRoutingInfo(questionId);
+        if (routeCache) routeCache[questionId] = routeInfo;
+      }
+
+      var rootFolder;
+      if (folderCache && folderCache['__root__']) {
+        rootFolder = folderCache['__root__'];
+      } else {
+        rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+        if (folderCache) folderCache['__root__'] = rootFolder;
+      }
+
+      var mdFolder = getOrCreateFolder(rootFolder, "MD", folderCache);
+      var yearFolder = getOrCreateFolder(mdFolder, "Y" + routeInfo.year, folderCache);
+      var targetFolder = getOrCreateFolder(yearFolder, routeInfo.subject, folderCache);
 
       // Logic จัดเก็บแยกลง Sub-folder
       if (questionId && questionId.indexOf('_') > -1) {
-        var parts = questionId.split('_'); 
+        var parts = questionId.split('_');
         if (parts.length >= 2) {
-          var yearType = parts[1].trim(); 
+          var yearType = parts[1].trim();
           if (/^\d{2}/.test(yearType)) {
-            var examYear = yearType.substring(0, 2); 
-            var examGroup = yearType.substring(2) || "General"; 
-            var examYearFolder = getOrCreateFolder(targetFolder, examYear);
-            targetFolder = getOrCreateFolder(examYearFolder, examGroup); 
+            var examYear = yearType.substring(0, 2);
+            var examGroup = yearType.substring(2) || "General";
+            var examYearFolder = getOrCreateFolder(targetFolder, examYear, folderCache);
+            targetFolder = getOrCreateFolder(examYearFolder, examGroup, folderCache);
           } else {
-            targetFolder = getOrCreateFolder(targetFolder, yearType);
+            targetFolder = getOrCreateFolder(targetFolder, yearType, folderCache);
           }
         }
       }
 
       if (typeIdentifier === 'Explain') {
-        targetFolder = getOrCreateFolder(targetFolder, 'Explanation');
+        targetFolder = getOrCreateFolder(targetFolder, 'Explanation', folderCache);
       }
 
       var mimeType = "image/png";
