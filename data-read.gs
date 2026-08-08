@@ -472,6 +472,102 @@ function getQuestionsData(filterSubject, ss, startTime) {
   return ContentService.createTextOutput(JSON.stringify(questions)).setMimeType(ContentService.MimeType.JSON);
 }
 
+// Prior Year Audit — เตือนแอดมินถ้าวิชาใดยังไม่มีข้อสอบ "รุ่นก่อนหน้า" + เทียบกลุ่มข้อสอบ (MCQ1/MCQ2/FMT ฯลฯ) ระหว่างรุ่นล่าสุดกับรุ่นก่อนหน้า
+// "รุ่น" (year) ในที่นี้คือเลขรุ่นสอบที่ฝังอยู่ใน categoryId (เช่น CVS_52FMT1 = รุ่น 52) — ไม่ใช่คอลัมน์ year ของ Structure sheet (นั่นคือชั้นปีหลักสูตร 1-6)
+// เฉพาะ Structure/Category sheet เท่านั้น ไม่แตะ Questions sheet เลย — ข้อมูลเล็ก ไม่มีความเสี่ยง timeout
+function getPriorYearAuditData(startTime) {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var catRows = getCategorySheetDataCached(ss, startTime);
+  var structRows = getStructureSheetDataCached(ss, startTime);
+
+  var subjectNameById = {};
+  for (var s = 1; s < structRows.length; s++) {
+    var sid = String(structRows[s][1] || '').trim();
+    if (sid && !subjectNameById[sid]) subjectNameById[sid] = String(structRows[s][2] || '').trim();
+  }
+
+  // subjectId -> { year(number) -> { groupKey: true } }
+  var bySubject = {};
+  // กลุ่มข้อสอบ = ตัวเลขรุ่น 2 หลัก + ตัวอักษรประเภท + เลขกลุ่ม(ถ้ามี) — ยอมรับส่วนขยายท้าย เช่น "_Alltopics"/"_AnatomyPhysiology" (ของจริงในชีท)
+  // แต่ตัด junk suffix ที่ไม่ใช่หัวข้อจริง (_Extracted, _Modified, by AI) ออกก่อนเช็ค — ไม่งั้นจะกลายเป็นกลุ่มปลอมซ้ำ
+  var groupRe = /^(\d{2})_?([A-Za-z]+)(\d*)/;
+  var junkSuffixRe = /_Extracted|_Modified|by AI/i;
+
+  for (var i = 1; i < catRows.length; i++) {
+    if (i % 500 === 0 && startTime) assertNotTimedOut_(startTime, 'getPriorYearAuditData:cat_loop');
+    var categoryId = String(catRows[i][0] || '').trim();
+    var subjectRef = String(catRows[i][1] || '').trim();
+    if (!categoryId || !subjectRef) continue;
+
+    var prefix = subjectRef + '_';
+    if (categoryId.indexOf(prefix) !== 0) continue;
+
+    var rest = categoryId.slice(prefix.length);
+    if (junkSuffixRe.test(rest)) continue;
+
+    var m = groupRe.exec(rest);
+    if (!m) continue;
+
+    var year = parseInt(m[1], 10);
+    var groupKey = (m[2] + m[3]).toUpperCase();
+
+    if (!bySubject[subjectRef]) bySubject[subjectRef] = {};
+    if (!bySubject[subjectRef][year]) bySubject[subjectRef][year] = {};
+    bySubject[subjectRef][year][groupKey] = true;
+  }
+
+  var subjects = [];
+  var missingPriorCount = 0;
+  var mismatchCount = 0;
+
+  Object.keys(bySubject).sort().forEach(function (subjectId) {
+    var yearMap = bySubject[subjectId];
+    var years = Object.keys(yearMap).map(Number).sort(function (a, b) { return b - a; });
+    if (years.length === 0) return;
+
+    var latestYear = years[0];
+    var priorYear = latestYear - 1;
+    var priorYearExists = yearMap.hasOwnProperty(priorYear);
+
+    var latestGroups = Object.keys(yearMap[latestYear]).sort();
+    var priorGroups = priorYearExists ? Object.keys(yearMap[priorYear]).sort() : [];
+
+    var structuralDiff = null;
+    if (priorYearExists) {
+      var onlyInLatest = latestGroups.filter(function (g) { return priorGroups.indexOf(g) === -1; });
+      var onlyInPrior = priorGroups.filter(function (g) { return latestGroups.indexOf(g) === -1; });
+      var matched = latestGroups.filter(function (g) { return priorGroups.indexOf(g) !== -1; });
+      structuralDiff = { onlyInLatest: onlyInLatest, onlyInPrior: onlyInPrior, matched: matched };
+      if (onlyInLatest.length > 0 || onlyInPrior.length > 0) mismatchCount++;
+    } else {
+      missingPriorCount++;
+    }
+
+    subjects.push({
+      subjectId: subjectId,
+      subjectName: subjectNameById[subjectId] || subjectId,
+      years: years,
+      latestYear: latestYear,
+      priorYear: priorYear,
+      priorYearExists: priorYearExists,
+      latestGroups: latestGroups,
+      priorGroups: priorGroups,
+      structuralDiff: structuralDiff
+    });
+  });
+
+  return ContentService.createTextOutput(JSON.stringify({
+    status: 'success',
+    serverTime: Date.now(),
+    summary: {
+      totalSubjects: subjects.length,
+      missingPriorCount: missingPriorCount,
+      mismatchCount: mismatchCount
+    },
+    subjects: subjects
+  })).setMimeType(ContentService.MimeType.JSON);
+}
+
 function getChangedSinceTimestamp(sinceStr, filterSubject, startTime) {
   if (startTime) assertNotTimedOut_(startTime, 'getChangedSinceTimestamp:start');
   var ss = SpreadsheetApp.openById(SHEET_ID);

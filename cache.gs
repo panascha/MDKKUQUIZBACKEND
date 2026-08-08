@@ -87,6 +87,22 @@ function getLargeCache(key) {
   return value;
 }
 
+function getPriorYearAuditDataCached(startTime) {
+  var v = getVersionCached();
+  var cacheKey = "prior_year_audit_" + v;
+
+  var cachedStr = getLargeCache(cacheKey);
+  if (cachedStr != null) {
+    return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (startTime) assertNotTimedOut_(startTime, 'getPriorYearAuditDataCached:start');
+  var response = getPriorYearAuditData(startTime);
+  var responseStr = response.getContent();
+  putLargeCache(cacheKey, responseStr, 1800); // 30 minutes — no startTime: data already built, write regardless of time
+  return response;
+}
+
 function getStructureDataCached(filterSubject, startTime) {
   var v = getVersionCached();
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";

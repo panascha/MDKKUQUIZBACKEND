@@ -17,7 +17,13 @@ function getOrCreateFolder(parentFolder, folderName, folderCache) {
 }
 
 // 2. ฟังก์ชันแกะรหัสเพื่อหาที่อยู่โฟลเดอร์
-function getQuestionRoutingInfo(questionId) {
+// subjectHint/yearHint: ผู้เรียกที่รู้ปลายทางอยู่แล้ว (เช่น converter ที่ยังไม่ได้บันทึกข้อลงชีต)
+// ส่งมาได้เลย → ข้ามการอ่าน Questions/Category/Structure ทั้งใบ (3 full-sheet read ต่อรูป)
+function getQuestionRoutingInfo(questionId, subjectHint, yearHint) {
+  if (subjectHint && yearHint) {
+    return { year: String(yearHint).trim(), subject: String(subjectHint).trim() };
+  }
+
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var qSheet = ss.getSheetByName('Questions');
   var qData = qSheet.getDataRange().getValues();
@@ -60,7 +66,10 @@ function uploadQuestionImageToDrive(base64Data, questionId, typeIdentifier, subj
   for (var i = 0; i < maxRetries; i++) {
     try {
       var routeInfo;
-      if (routeCache && routeCache[questionId]) {
+      if (subjectHint && yearHint) {
+        // hint ครบ → ไม่ต้องแตะชีตและไม่ต้องใช้ cache เลย
+        routeInfo = getQuestionRoutingInfo(questionId, subjectHint, yearHint);
+      } else if (routeCache && routeCache[questionId]) {
         routeInfo = routeCache[questionId];
       } else {
         routeInfo = getQuestionRoutingInfo(questionId);

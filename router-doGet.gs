@@ -43,6 +43,7 @@ function doGet_(e) {
     return ContentService.createTextOutput(JSON.stringify({ v: serverVer })).setMimeType(ContentService.MimeType.JSON);
   }
   if (action == 'getStructure') return getStructureDataCached(e.parameter.subject, __startTime);
+  if (action == 'checkPriorYearAudit') return getPriorYearAuditDataCached(__startTime); // อ่านเฉพาะ Structure/Category sheet — เบา ไม่มีความเสี่ยง timeout
   if (action == 'getQuestions') {
     // ไม่มี caller ปัจจุบัน (REAL) เรียกโดยไม่มี subject — บล็อกเส้นทางดึงคำถามทั้งหมดแบบไม่กรองที่ไม่เคยถูกใช้จริง
     if (!e.parameter.subject) {
