@@ -1268,11 +1268,10 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
 */
 
 // D13: fallback chain สำรองกรณีทะเบียน AI_Models อ่านไม่ได้ (ปกติ chain มาจาก apiKeyInfo.fallbackModels)
-// gemini-3.5-flash-lite เพิ่ม 2026-07-24: auto-discovered+auto-ranked+probe-passed แล้ว (Active, RPD 500,
-// priority 0 ใน AI_Models) — ตัวนี้ผ่าน tool-capability gate จริง จึงเติมใน static backup ด้วย
-// 2026-08-07 จัดลำดับใหม่ตาม tier policy: converter = flash tier ก่อน (3.5 → 3.6 → 2.5),
-// flash-lite เหลือไว้ท้ายแถวเป็นตัวสำรองสุดท้าย ไม่ตัดออก (converter ไม่ใช้ tools จึงใส่ 3.6-flash ได้)
-var CONVERTER_FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
+// 2026-08-09: ตัด flash-lite ออกทั้งหมด — คุณภาพแปลงข้อสอบต่ำเกินรับได้
+// converter ใช้ full flash เท่านั้น (3.6 → 3.5 → 2.5); การกรองจริงอยู่ใน callGeminiConverter
+// เพราะ chain ที่ใช้จริงมาจากทะเบียน AI_Models ซึ่งยังมี lite อยู่ (โมดูลอื่นยังใช้ lite ได้ตามเดิม)
+var CONVERTER_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
 
@@ -1286,7 +1285,13 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
   var chain = (apiKeyInfo.fallbackModels && apiKeyInfo.fallbackModels.length)
     ? apiKeyInfo.fallbackModels : CONVERTER_FALLBACK_MODELS;
   var models = [apiKeyInfo.model].concat(chain)
-    .filter(function (m, i, arr) { return m && arr.indexOf(m) === i; });
+    .filter(function (m, i, arr) { return m && arr.indexOf(m) === i; })
+    // converter ห้ามใช้ flash-lite เด็ดขาด — กรองทั้ง apiKeyInfo.model และ chain จากทะเบียน AI_Models
+    // (ทะเบียนคืนโมเดล Active ทุกตัวรวม lite; โมดูลอื่น เช่น askAIExpert/IntelSphere ยังใช้ lite ได้ตามเดิม)
+    .filter(function (m) { return !/flash-lite/i.test(m); });
+  if (models.length === 0) {
+    throw new Error("แปลงไม่สำเร็จ: โควต้าโมเดล flash เต็มแล้ว (ตัวแปลง PDF ไม่ใช้ flash-lite) กรุณาลองใหม่ภายหลัง");
+  }
 
   var attempts = 0;
   var lastErr = "";
