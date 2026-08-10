@@ -338,12 +338,14 @@ function doPost(e) {
     // Gemini proxy แปลง PDF→คำถามผ่าน AI_Config Gemini pool — lock-free tier (ไม่มี sheet write นอกจาก quota column, แบบเดียวกับ askAIExpert)
     // AUTH GATE: ต้องมี session KKU (Admin/Student — verifyAnySession) หรือ username+adminPass เดิมของ DATABASE
     //   — กันคนนอกใช้เป็น open Gemini proxy เผาโควต้า pool (advisor must-fix)
-    // Rate limit 20 POST/ชม. ต่อ user ≈ 5 conversions/ชม. ตาม D11 (PDF ใหญ่แบ่ง batch ละ 1 POST, ~4 batch/ไฟล์)
+    // Rate limit 40 POST/ชม. ต่อ user — ขึ้นจาก 20 เมื่อ 2026-08-09
+    //   เดิมคิดบน "~4 batch/ไฟล์" แต่ฝั่ง client ซอยชุดตามจำนวนข้อแล้ว (~15 ข้อ/ชุด)
+    //   ไฟล์ 90 ข้อ = 7 POST ดังนั้น 20/ชม. เหลือแค่ 2 ไฟล์/ชม. ซึ่งน้อยเกินใช้งานจริง
     // ----------------------------------------------------
     if (action === 'convertPdfBatch') {
       // rate-limit ก่อน auth (กัน flood ด้วย garbage token — mirror saveProgress)
       var pcRlKey = data.sessionToken || data.username || data.clientId || 'anon';
-      if (!checkActionRateLimit('rl_pdfconv_', pcRlKey, 20)) {
+      if (!checkActionRateLimit('rl_pdfconv_', pcRlKey, 40)) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: 'แปลง PDF บ่อยเกินไป (จำกัดต่อชั่วโมง) กรุณาลองใหม่ภายหลัง'
         })).setMimeType(ContentService.MimeType.JSON);
@@ -384,6 +386,7 @@ function doPost(e) {
           raw: pcRes.raw,
           finishReason: pcRes.finishReason,
           servedModel: pcRes.model,
+          usage: pcRes.usage || null, // token counts — ใช้แยกว่า "ข้อหาย" เพราะโมเดลออกไม่ครบ หรือคำตอบถูกตัด
           quota: (pcKeyInfo.usage + 1) + "/" + pcKeyInfo.limit
         })).setMimeType(ContentService.MimeType.JSON);
       } catch (pcErr) {
@@ -532,6 +535,28 @@ function doPost(e) {
       } finally {
         fbLock.releaseLock();
       }
+    }
+
+    // ----------------------------------------------------
+    // getSubjectPopularity — merge server-side subject selection counts into local
+    // auth via verifyAnySession (Student/Admin), lock-free read
+    // ----------------------------------------------------
+    if (action === 'getSubjectPopularity') {
+      var spUser = verifyAnySession(data.sessionToken);
+      if (!spUser || !spUser.email) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'login_required' }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+      var spSheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName('Subjects_Popularity');
+      var spData = spSheet ? spSheet.getDataRange().getValues() : [];
+      var spCounts = {};
+      for (var si = 0; si < spData.length; si++) {
+        if (spData[si][0] === spUser.email) {
+          spCounts[String(spData[si][1])] = Math.max(spCounts[String(spData[si][1])] || 0, Number(spData[si][2]) || 0);
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success', counts: spCounts }))
+        .setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------
@@ -823,7 +848,7 @@ function doPost(e) {
     // ----------------------------------------------------
     // LOCALIZED LOCK GROUP (Locks briefly for writes, tryLock 15s)
     // ----------------------------------------------------
-    var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'deleteSession', 'saveStudentId'];
+    var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'deleteSession', 'saveStudentId', 'syncSubjectPopularity'];
     if (localizedActions.indexOf(action) > -1) {
       var lock = LockService.getScriptLock();
       var acquired = lock.tryLock(15000);
@@ -886,6 +911,51 @@ function doPost(e) {
           updateVersion();
           writeAdminLog(sidUser.displayName || myEmail, sidUser.role || "", "AUTH", "VERIFY_SID", "Admins", "ยืนยันตัวตนด้วยรหัสนักศึกษา", "", "", "");
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success', 'studentId': newSid })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // syncSubjectPopularity — อัปเดตจำนวนครั้งที่เลือกวิชา (upsert ต่อคู่ email+subjectId)
+        // ยิงมาจาก beacon ทุกครั้งที่ผู้ใช้เลือกวิชา = ความถี่สูงและใช้ shared lock ร่วมกับ submitVote/submitReport
+        // จึงต้องมี rate limit เหมือน localized action อื่น (rl_kb_/rl_appfb_) กันคนเดียวยิงรัวจนแย่ง lock
+        if (action === 'syncSubjectPopularity') {
+          if (!checkActionRateLimit('rl_subjpop_', data.sessionToken || 'anon', 60)) {
+            // fire-and-forget ฝั่ง client → ตอบ success (dropped) ไม่ให้ขึ้น error ให้ผู้ใช้เห็น
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'success', 'dropped': true })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var popUser = verifyAnySession(data.sessionToken);
+          if (!popUser || !popUser.email) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'session_expired' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var popSubjectId = String(data.subjectId || '').trim();
+          var popCount = Number(data.count) || 0;
+          if (!popSubjectId || popCount < 1) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'invalid_subject' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var popEmail = String(popUser.email);
+          var popSheet = doc.getSheetByName('Subjects_Popularity');
+          if (!popSheet) {
+            popSheet = doc.insertSheet('Subjects_Popularity');
+            popSheet.appendRow(['Email', 'SubjectId', 'Count', 'LastUsed']);
+          }
+          var popData = popSheet.getDataRange().getValues();
+          var popRowIdx = -1;
+          for (var pi = 1; pi < popData.length; pi++) {
+            if (String(popData[pi][0]) === popEmail && String(popData[pi][1]) === popSubjectId) {
+              popRowIdx = pi + 1;
+              break;
+            }
+          }
+          if (popRowIdx !== -1) {
+            // max() ไม่ใช่ทับตรงๆ — client ส่งยอดสะสมของ "เครื่องนั้น" มา
+            // ถ้าผู้ใช้ล้าง localStorage หรือเปิดเครื่องใหม่ ยอดที่ส่งมาจะต่ำกว่าของจริง การทับตรงๆ = ข้อมูลหาย
+            var popExisting = Number(popSheet.getRange(popRowIdx, 3).getValue()) || 0;
+            if (popCount > popExisting) {
+              popSheet.getRange(popRowIdx, 3).setValue(popCount);
+              popSheet.getRange(popRowIdx, 4).setValue(new Date());
+            }
+          } else {
+            popSheet.appendRow([popEmail, popSubjectId, popCount, new Date()]);
+          }
+          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
 
         if (action === 'submitVote') {

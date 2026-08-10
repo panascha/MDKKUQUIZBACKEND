@@ -1307,7 +1307,7 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
       var res = tryConverterCall_(prompt, apiKeyInfo.key, models[mi], variants[vi], pdfB64, images, convTemp);
       if (res.ok) {
         updateAIUsage(apiKeyInfo, models[mi]); // หักโควต้าโมเดลที่ใช้จริง (อาจเป็น fallback ไม่ใช่ตัวที่เลือกตอนแรก)
-        return { raw: res.raw, finishReason: res.finishReason, model: models[mi] };
+        return { raw: res.raw, finishReason: res.finishReason, model: models[mi], usage: res.usage || null };
       }
       lastErr = models[mi] + ": " + res.error;
       if (res.fatal) throw new Error("แปลงไม่สำเร็จ: " + lastErr);
@@ -1378,12 +1378,25 @@ function tryConverterCall_(prompt, apiKey, model, disableThinking, pdfB64, image
           if (!rp[i].thought && rp[i].text) raw += rp[i].text;
         }
       }
+      // usageMetadata = หลักฐานเดียวที่แยกออกว่า "ข้อหาย" เพราะอะไร:
+      //   outputTokens ต่ำ + finishReason STOP  → โมเดลออกข้อไม่ครบเอง (ไม่ใช่ถูกตัด)
+      //   finishReason MAX_TOKENS               → คำตอบถูกตัดจริง
+      //   thoughtTokens สูงทั้งที่สั่ง thinkingBudget:0 → โมเดลเมิน thinkingBudget แล้วกินโควต้า output ไป
+      var um = resJson.usageMetadata || {};
+      var usage = {
+        promptTokens: um.promptTokenCount || 0,
+        outputTokens: um.candidatesTokenCount || 0,
+        thoughtTokens: um.thoughtsTokenCount || 0,
+        totalTokens: um.totalTokenCount || 0,
+        thinkingRequestedOff: !!disableThinking,
+        thinkingIgnored: !!disableThinking && (um.thoughtsTokenCount || 0) > 0
+      };
       if (!raw.trim()) {
         // silent-empty (เจอได้กับ JSON mode + thinkingBudget:0 บางรุ่น) → ให้ caller ลอง variant/โมเดลถัดไป
         var fr = (candidate && candidate.finishReason) || "NO_CONTENT";
-        return { ok: false, error: "คำตอบว่าง (finishReason: " + fr + ")", recitation: fr === "RECITATION" };
+        return { ok: false, error: "คำตอบว่าง (finishReason: " + fr + ")", recitation: fr === "RECITATION", usage: usage };
       }
-      return { ok: true, raw: raw, finishReason: (candidate && candidate.finishReason) || "STOP" };
+      return { ok: true, raw: raw, finishReason: (candidate && candidate.finishReason) || "STOP", usage: usage };
     }
 
     var msg = (resJson.error && resJson.error.message) || ("HTTP " + code);
