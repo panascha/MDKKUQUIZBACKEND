@@ -879,17 +879,18 @@ var PROVIDER_MODEL_MAP = {
 };
 
 // Hardcoded fallback catalog — used ONLY when the live GET /models fetch fails.
+// Synced 2026-08-17 against the IntelSphere platform's live model list.
 var PROVIDER_MODELS_FALLBACK = {
   "Claude":   ["claude-sonnet-5","claude-sonnet-4.6","claude-sonnet-4.5","claude-haiku-4.5","claude-sonnet-4","claude-3.7-sonnet"],
   "Deepseek": ["deepseek-v4-pro","deepseek-v4-flash","deepseek-v3.2","deepseek-v3.2-exp","deepseek-chat-v3.1"],
-  "Gemini":   ["gemini-3.6-flash","gemini-3.5-flash","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
+  "Gemini":   ["gemini-3.5-flash","gemini-3.6-flash","gemini-3.7-flash","gemini-3.5-flash-lite","gemini-3.1-pro-preview","gemini-3.1-flash-lite","gemini-3.1-flash-lite-preview","gemini-3-flash-preview","gemini-2.5-pro","gemini-2.5-flash","gemini-2.5-flash-lite","gemini-3-pro-preview"],
   "Meta":     ["llama-4-maverick","llama-4-scout"],
   "MiniMax":  ["minimax-m3"],
-  "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","codestral-2508","codestral-2501"],
+  "Mistral":  ["mistral-small-2603","mistral-large-2512","mistral-medium-3","devstral-medium"],
   "MoonshotAI": ["kimi-k3"],
   "Nova":     ["nova-2-lite-v1","nova-pro-v1"],
-  "OpenAI":   ["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano","gpt-5.2","gpt-5.1","gpt-5.1-codex","gpt-5","gpt-5-mini","gpt-5-nano","gpt-5.5"],
-  "Qwen":     ["qwen3.7-plus","qwen3.7-max","qwen3.6-flash","qwen3.5-9b","qwen3-235b-a22b-2507","qwen3-next-80b-a3b-instruct","qwen3-coder-flash","qwen3-coder","qwen3-vl-32b-instruct"],
-  "xAI":      ["grok-4.3","grok-4.1-fast","grok-4","grok-3"]
+  "OpenAI":   ["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano","gpt-5.2","gpt-5.1","gpt-5.1-codex","gpt-5","gpt-5-mini","gpt-5-nano","gpt-5.6-terra"],
+  "Qwen":     ["qwen3.7-plus","qwen3.7-max","qwen3.6-flash","qwen3.5-9b","qwen3-235b-a22b-2507","qwen3-next-80b-a3b-instruct","qwen3-coder-flash","qwen3-coder"],
+  "xAI":      ["grok-4.3","grok-4.5","grok-4.1-fast","grok-4","grok-3"]
 };
 
