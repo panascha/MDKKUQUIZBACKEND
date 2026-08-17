@@ -12,13 +12,17 @@ var AI_MODELS_SHEET_NAME = "AI_Models";
 var AI_CONFIG_FIXED_HEADERS = ["API_Key", "Donor_Name", "Status", "Last_Used", "Last_Reset_Date"];
 
 // ค่าตั้งต้นทะเบียนโมเดล ตามหน้า Rate Limit free tier ของ AI Studio (RPD ต่อโมเดล ต่อ key)
-// ทุกตัว = ID ที่ยืนยันจาก models.list จริง (discoverGeminiModels) — gemini-3-flash/gemini-3.1-pro ถูกตัดออก
-// เพราะไม่มีใน list (มีแต่ -preview) เป็น seed ปลอม; priority คงเลขเดิมของตัวที่รอด (ช่องว่างไม่เป็นไร)
+// gemini-3-flash/gemini-3.1-pro ถูกตัดออกเพราะไม่มีใน models.list จริง (มีแต่ -preview) เป็น seed ปลอม
+// (ดู purgeFakeGeminiModelRows); 2026-08-17 เพิ่ม 3.7-flash/3.6-flash/3.5-flash-lite ตาม RPD ที่ยืนยันจากหน้า
+// Rate Limit ของ AI Studio โดยตรง (ยังไม่ผ่าน discoverGeminiModels) — priority คงเลขเดิมของตัวที่รอด (ช่องว่างไม่เป็นไร)
 var AI_MODELS_DEFAULTS = [
   // [Model, RPD_Limit, Priority, Status, Notes]
+  ["gemini-3.7-flash",      20,  0, "Active",   "flagship flash ล่าสุด"],
   ["gemini-3.5-flash",      20,  1, "Active",   "text-out หลัก"],
+  ["gemini-3.6-flash",      20,  2, "Active",   ""],
   ["gemini-2.5-flash",      20,  3, "Active",   ""],
   ["gemini-3.1-flash-lite", 500, 4, "Active",   "RPD สูงสุดใน free tier"],
+  ["gemini-3.5-flash-lite", 500, 4, "Active",   "RPD สูงสุดใน free tier"],
   ["gemini-2.5-flash-lite", 20,  5, "Active",   ""],
   ["gemini-2.5-pro",        0,  91, "Disabled", "free tier RPD = 0"]
 ];
@@ -1269,9 +1273,9 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
 
 // D13: fallback chain สำรองกรณีทะเบียน AI_Models อ่านไม่ได้ (ปกติ chain มาจาก apiKeyInfo.fallbackModels)
 // 2026-08-09: ตัด flash-lite ออกทั้งหมด — คุณภาพแปลงข้อสอบต่ำเกินรับได้
-// converter ใช้ full flash เท่านั้น (3.6 → 3.5 → 2.5); การกรองจริงอยู่ใน callGeminiConverter
+// converter ใช้ full flash เท่านั้น (3.7 → 3.6 → 3.5 → 2.5); การกรองจริงอยู่ใน callGeminiConverter
 // เพราะ chain ที่ใช้จริงมาจากทะเบียน AI_Models ซึ่งยังมี lite อยู่ (โมดูลอื่นยังใช้ lite ได้ตามเดิม)
-var CONVERTER_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
+var CONVERTER_FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
 
