@@ -397,6 +397,30 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // verifyQuestionBatch — 2-model debate + arbiter consensus verification (admin-tier auth, lock-free LLM execution)
+    // Auth: verifyAdmin OR verifySessionToken. NO lock during LLM calls (advisory rule).
+    // Models hardcoded: DeepSeek-V4-Pro + Claude-Sonnet-4.5 via executeChatbotQuery, judge = Gemini-3.5-Flash via callGeminiAI.
+    // ----------------------------------------------------
+    if (action === 'verifyQuestionBatch') {
+      var vqUser = null;
+      if (data.sessionToken) vqUser = verifySessionToken(data.sessionToken);
+      if (!vqUser && data.username) vqUser = verifyAdmin(data.username, data.adminPass);
+      if (!vqUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var vqRes = verifyQuestionBatch(data.questions, vqUser);
+        return ContentService.createTextOutput(JSON.stringify(vqRes)).setMimeType(ContentService.MimeType.JSON);
+      } catch (vqErr) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: vqErr.message || String(vqErr)
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // ----------------------------------------------------
     // logUserInteraction — ระบบ log ใหม่ (แทน batchLog/UserActivity เดิมที่ถูกถอดออก)
     // เขียนลงไฟล์ audit แยก (getAuditSheetId) → overflow ไม่แตะคลังข้อสอบ (SHEET_ID)
     // อยู่ lock-free tier: append-only ต่อแถว, return ก่อนขอ Lock ใด ๆ
