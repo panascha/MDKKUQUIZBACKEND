@@ -31,8 +31,42 @@ function verifyQuestionBatch(questions, adminUser) {
     var q = questions[i];
     try {
       // 1) Solve with both models (LLM calls outside lock)
-      var solveA = solveWithModel_(q, VERIFY_SOLVER_A);
-      var solveB = solveWithModel_(q, VERIFY_SOLVER_B);
+      // แยก try ต่อโมเดล — provider เดียวล่ม/timeout ต้องไม่ลากอีกตัวที่ตอบสำเร็จตกไปด้วย
+      var solveA = null, solveB = null;
+      var solverErrors = [];
+      try {
+        solveA = solveWithModel_(q, VERIFY_SOLVER_A);
+      } catch (eA) {
+        solverErrors.push({ model: VERIFY_SOLVER_A, error: eA.message || String(eA) });
+      }
+      try {
+        solveB = solveWithModel_(q, VERIFY_SOLVER_B);
+      } catch (eB) {
+        solverErrors.push({ model: VERIFY_SOLVER_B, error: eB.message || String(eB) });
+      }
+
+      if (!solveA && !solveB) {
+        throw new Error('ทั้งสองโมเดลตอบไม่สำเร็จ — ' + solverErrors.map(function (x) {
+          return x.model + ': ' + x.error;
+        }).join(' | '));
+      }
+
+      // เหลือโมเดลเดียว = ไม่มีสัญญาณ consensus เลย ห้ามส่งเข้า judge
+      // (buildJudgePrompt_ ออกแบบมาสำหรับสองความเห็น จะตัดสินมั่นใจเกินจริงจากความเห็นเดียว)
+      if (!solveA || !solveB) {
+        var only = solveA || solveB;
+        verified.push({
+          qid: q.qid,
+          verifiedAnswer: only.choice,
+          confidence: 'single-model',
+          models: [only.model],
+          judgeUsed: false,
+          solvers: [{ model: only.model, choice: only.choice, rationale: only.rationale }],
+          solverErrors: solverErrors,
+          rationale: only.rationale || ''
+        });
+        continue;
+      }
 
       var dbAnswer = Number(q.correctAnswer);
 
@@ -92,10 +126,40 @@ function solveWithModel_(q, model) {
   } catch (e) {
     throw new Error('Solver ' + model + ' returned non-JSON: ' + raw.content.slice(0, 200));
   }
-  if (typeof parsed.choice !== 'number' || parsed.choice < 0 || parsed.choice >= q.choices.length) {
+  var idx = normalizeChoiceIndex_(parsed.choice, q.choices.length);
+  if (idx === null) {
     throw new Error('Solver ' + model + ' returned invalid choice: ' + parsed.choice);
   }
-  return { choice: parsed.choice, rationale: String(parsed.rationale || '') };
+  return { model: model, choice: idx, rationale: String(parsed.rationale || '') };
+}
+
+/**
+ * แปลงค่า choice ที่โมเดลคืนมาให้เป็น index 0-based
+ * รับได้: number, ตัวเลขในรูป string ("2"), ตัวอักษร A/B/C
+ * หมายเหตุ: ค่าที่อยู่ในช่วงอยู่แล้วจะไม่ถูกแตะ — เลข 1 แบบ 0-based กับแบบ 1-based
+ * แยกจากกันไม่ได้ ถ้าเดาแล้วลบ 1 จะทำให้คำตอบที่ถูกอยู่แล้วกลายเป็นผิด
+ * กรณีเดียวที่ยืนยันได้ว่าเป็น 1-based คือค่าเท่ากับจำนวนตัวเลือกพอดี (เกินช่วงบนไป 1)
+ * @returns {number|null} index 0-based หรือ null ถ้าตีความไม่ได้
+ */
+function normalizeChoiceIndex_(raw, len) {
+  var n = null;
+  var fromLetter = false;
+  if (typeof raw === 'number') {
+    n = raw;
+  } else if (typeof raw === 'string') {
+    var t = raw.trim();
+    if (/^[0-9]+$/.test(t)) {
+      n = Number(t);
+    } else if (/^[A-Za-z]$/.test(t)) {
+      n = t.toUpperCase().charCodeAt(0) - 65; // A -> 0, B -> 1, C -> 2
+      fromLetter = true;
+    }
+  }
+  if (n === null || isNaN(n) || n !== Math.floor(n)) return null;
+  if (n >= 0 && n < len) return n;
+  // ตัวอักษรไม่มีปัญหา 0-based/1-based — 'E' ของข้อ 4 ตัวเลือกคือเกินช่วงจริง ไม่ใช่ off-by-one
+  if (!fromLetter && n === len && len > 0) return n - 1; // 1-based ชัดเจน (4 ตัวเลือก แล้วตอบ 4)
+  return null;
 }
 
 /**
@@ -155,6 +219,7 @@ function buildVerifyPrompt_(q) {
   lines.push('1. Your answer (choice number only).');
   lines.push('2. Clinical rationale (pathophysiology, differential diagnosis, guideline references).');
   lines.push('');
+  lines.push('Write all rationales and explanations in Thai mixed with English medical terminology in a single continuous paragraph (no bullet points or newlines).');
   lines.push('Format as JSON: {"choice": N, "rationale": "..."}');
   return lines.join('\n');
 }
@@ -191,6 +256,7 @@ function buildJudgePrompt_(q, solveA, solveB) {
   lines.push('3. Why each wrong choice is a distractor (trap, edge case, outdated guideline).');
   lines.push('4. Confidence: "high" (clear guideline) or "moderate" (clinical judgment call).');
   lines.push('');
+  lines.push('Write all rationales and explanations in Thai mixed with English medical terminology in a single continuous paragraph (no bullet points or newlines).');
   lines.push('Format as JSON:');
   lines.push('{');
   lines.push('  "verifiedAnswer": N,');
