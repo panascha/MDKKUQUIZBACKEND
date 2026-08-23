@@ -43,7 +43,12 @@ function verifyQuestionBatch(questions, adminUser) {
           verifiedAnswer: solveA.choice,
           confidence: 'consensus-verified',
           models: [VERIFY_SOLVER_A, VERIFY_SOLVER_B],
-          judgeUsed: false
+          judgeUsed: false,
+          solvers: [
+            { model: VERIFY_SOLVER_A, choice: solveA.choice, rationale: solveA.rationale },
+            { model: VERIFY_SOLVER_B, choice: solveB.choice, rationale: solveB.rationale }
+          ],
+          rationale: solveA.rationale || ''
         });
         continue;
       }
@@ -53,10 +58,17 @@ function verifyQuestionBatch(questions, adminUser) {
       verified.push({
         qid: q.qid,
         verifiedAnswer: judgeRes.verifiedAnswer,
-        confidence: judgeRes.confidence,
+        // confidence = สถานะ flow (frontend อ่านเพื่อเลือก badge); ความมั่นใจของ arbiter อยู่ที่ judgeConfidence
+        confidence: 'debate-resolved',
+        judgeConfidence: judgeRes.confidence,
         models: [VERIFY_SOLVER_A, VERIFY_SOLVER_B],
         judgeModel: VERIFY_JUDGE,
         judgeUsed: true,
+        solvers: [
+          { model: VERIFY_SOLVER_A, choice: solveA.choice, rationale: solveA.rationale },
+          { model: VERIFY_SOLVER_B, choice: solveB.choice, rationale: solveB.rationale }
+        ],
+        distractors: judgeRes.distractors || {},
         rationale: judgeRes.correctRationale || ''
       });
     } catch (err) {
@@ -80,7 +92,7 @@ function solveWithModel_(q, model) {
   } catch (e) {
     throw new Error('Solver ' + model + ' returned non-JSON: ' + raw.content.slice(0, 200));
   }
-  if (typeof parsed.choice !== 'number' || parsed.choice < 0 || parsed.choice >= choices.length) {
+  if (typeof parsed.choice !== 'number' || parsed.choice < 0 || parsed.choice >= q.choices.length) {
     throw new Error('Solver ' + model + ' returned invalid choice: ' + parsed.choice);
   }
   return { choice: parsed.choice, rationale: String(parsed.rationale || '') };
