@@ -148,8 +148,8 @@ function processReports(doc) {
         var questionText = String(qv[qRowIndex-1][1] || "");
         applyReportCorrection(qSheet, qRowIndex, suggestedAns, suggestedExplain, questionText, choicesArray, qId);
 
-        reportSheet.getRange(i+1, 10).setValue("AutoResolved");
-        reportSheet.getRange(i+1, 11).setValue("Auto-applied by community vote (" + voteCount + "/" + REPORT_VOTE_THRESHOLD + ")");
+        // Status(10) + AdminNote(11) + Done(12) — Done ต้องเป็น TRUE ด้วย ไม่งั้นแดชบอร์ดยังนับเป็น pending
+        reportSheet.getRange(i+1, 10, 1, 3).setValues([["AutoResolved", "Auto-applied by community vote (" + voteCount + "/" + REPORT_VOTE_THRESHOLD + ")", "TRUE"]]);
         changed = true;
     }
     if (changed) updateVersion();
