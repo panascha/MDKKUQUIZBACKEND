@@ -9,9 +9,13 @@
    Lock: 25s admin lock ONLY around orchestration; LLM calls outside lock.
 */
 
-// Hardcoded models for v1 (not user-selectable)
-var VERIFY_SOLVER_A = "deepseek-v4-pro";
-var VERIFY_SOLVER_B = "claude-sonnet-4.5";
+// Solver models อ้างอิง PROVIDER_MODEL_MAP (maintenance.gs) — แพลตฟอร์มเปลี่ยนชื่อรุ่นเมื่อไหร่
+// ไฟล์นี้ตามไปเอง ไม่ต้องแก้สองที่. maintenance.gs โหลดก่อน verify-questions.gs (เรียงตามชื่อไฟล์)
+// และ var hoisting ทำให้ typeof guard ปลอดภัยแม้ลำดับโหลดเปลี่ยน — ตกไปใช้ literal เดิม
+var VERIFY_SOLVER_A = (typeof PROVIDER_MODEL_MAP !== 'undefined' && PROVIDER_MODEL_MAP && PROVIDER_MODEL_MAP["Deepseek"]) || "deepseek-v4-pro";
+var VERIFY_SOLVER_B = (typeof PROVIDER_MODEL_MAP !== 'undefined' && PROVIDER_MODEL_MAP && PROVIDER_MODEL_MAP["Claude"]) || "claude-sonnet-4.5";
+// judge ไม่ derive จาก map โดยตั้งใจ — PROVIDER_MODEL_MAP.Gemini คือ 3.6-flash แต่หมายเหตุ
+// Grounding OFF ผูกกับ 3.5-flash ตัวนี้โดยเฉพาะ
 var VERIFY_JUDGE = "gemini-3.5-flash"; // cheap, high RPD; Grounding OFF (commented at ai-gemini.gs:1212)
 
 /**
@@ -29,6 +33,12 @@ function verifyQuestionBatch(questions, adminUser) {
 
   for (var i = 0; i < questions.length; i++) {
     var q = questions[i];
+    // งบ execution ใกล้หมด — ข้อนี้ต้องยิง LLM อย่างน้อย 2 ครั้ง เริ่มไปก็โดน GAS ตัดกลางคัน
+    // ใช้ continue ไม่ใช่ break เพื่อให้ทุกข้อที่เหลือมี entry ใน errors[] (frontend อ่าน errors[0].error)
+    if (execRemainingMs_() < 30000) {
+      errors.push({ qid: q.qid, error: 'งบเวลาประมวลผลใกล้หมด — ข้อนี้ยังไม่ได้ตรวจ กรุณาลองใหม่อีกครั้ง' });
+      continue;
+    }
     try {
       // 1) Solve with both models (LLM calls outside lock)
       // แยก try ต่อโมเดล — provider เดียวล่ม/timeout ต้องไม่ลากอีกตัวที่ตอบสำเร็จตกไปด้วย
@@ -88,7 +98,36 @@ function verifyQuestionBatch(questions, adminUser) {
       }
 
       // 3) Escalate to judge
-      var judgeRes = judgeDisagreement_(q, solveA, solveB);
+      // judgeDisagreement_ throw เสมอเมื่อล้ม (โควต้าหมด / JSON เพี้ยน) ไม่เคยคืน null
+      // ถ้าปล่อยหลุดขึ้นไป catch ด้านนอก rationale ของ solver ทั้งสองตัวจะหายไปทั้งหมด
+      var judgeRes = null, judgeError = null;
+      try {
+        judgeRes = judgeDisagreement_(q, solveA, solveB);
+      } catch (eJ) {
+        judgeError = eJ.message || String(eJ);
+      }
+
+      if (!judgeRes) {
+        // arbiter ไม่ได้ตัดสิน = ยังไม่ verified. verifiedAnswer คืนเฉลยเดิมใน DB ไว้เป็น
+        // placeholder ให้ frontend เรนเดอร์ได้เท่านั้น ห้ามตีความว่าผ่านการตรวจ
+        // (frontend ต้องอ่าน confidence นี้แล้วขึ้น badge เตือน + ซ่อนปุ่ม Apply)
+        verified.push({
+          qid: q.qid,
+          verifiedAnswer: dbAnswer,
+          confidence: 'judge-failed-fallback',
+          judgeError: judgeError,
+          models: [VERIFY_SOLVER_A, VERIFY_SOLVER_B],
+          judgeModel: VERIFY_JUDGE,
+          judgeUsed: false,
+          solvers: [
+            { model: VERIFY_SOLVER_A, choice: solveA.choice, rationale: solveA.rationale },
+            { model: VERIFY_SOLVER_B, choice: solveB.choice, rationale: solveB.rationale }
+          ],
+          rationale: ''   // ไหลเข้า data('mv').explanation — ห้ามใส่ข้อความที่ยังไม่ผ่านการตัดสิน
+        });
+        continue;
+      }
+
       verified.push({
         qid: q.qid,
         verifiedAnswer: judgeRes.verifiedAnswer,
