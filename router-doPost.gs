@@ -883,7 +883,7 @@ function doPost(e) {
         if (action === 'saveStudentId') {
           var sidUser = verifyAnySession(data.sessionToken);
           if (!sidUser || !sidUser.email) {
-            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่' })).setMimeType(ContentService.MimeType.JSON);
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'session_expired' })).setMimeType(ContentService.MimeType.JSON);
           }
           var newSid = String(data.studentId || '').trim();
           if (!/^\d{6,12}$/.test(newSid)) {

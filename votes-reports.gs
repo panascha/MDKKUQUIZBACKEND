@@ -175,18 +175,22 @@ function applyReportCorrection(qSheet, qRowIndex, newAnswer, suggestedExplain, q
 }
 
 function buildExplainPrompt(questionText, choicesArray, correctAnswer) {
-    var choicesText = choicesArray.map(function(c, i) {
+    var choicesText = choicesArray.map(function(c) {
         var display = (c.startsWith('http') || c.startsWith('<svg')) ? '[รูปภาพ]' : c;
-        return String.fromCharCode(65 + i) + ". " + display;
+        return "- " + display;
     }).join("\n");
     return "คุณเป็นอาจารย์แพทย์ผู้เชี่ยวชาญ กรุณาเขียนคำอธิบายเฉลยข้อสอบแพทย์ต่อไปนี้เป็น paragraph เดียวต่อเนื่อง " +
         "(ห้ามใช้ bullet points หรือขึ้นบรรทัดใหม่) โดยใช้ภาษาไทยผสมคำศัพท์ทางการแพทย์ภาษาอังกฤษ ห้ามใช้ภาษาอังกฤษล้วน\n\n" +
         "โจทย์: " + questionText + "\n\n" +
         "ตัวเลือก:\n" + choicesText + "\n\n" +
         "เฉลยที่ถูกต้อง: " + correctAnswer + "\n\n" +
-        "คำอธิบายต้องครอบคลุม: 1) Key concept/การวินิจฉัย 2) เหตุผลที่เฉลยถูก พร้อมชี้ clues จากโจทย์ " +
-        "3) อธิบายว่าทำไมตัวเลือกที่ผิดแต่ละข้อถึงผิด 4) Clinical pearl ถ้ามี\n\n" +
-        "เขียนเป็น paragraph เดียว ห้ามมี newline ในคำตอบ:";
+        "คำอธิบายต้องครอบคลุมตามลำดับดังนี้:\n" +
+        "1) ชี้ diagnostic clues ในโจทย์และกลไกพยาธิสรีรวิทยา (Causal mechanism X → Y → Z) ที่นำไปสู่เฉลยที่ถูกต้อง\n" +
+        "2) อธิบายแจกแจงตัวเลือกที่ผิด 'ครบทุกข้อที่เหลือ' (Process of elimination) โดยระบุชัดเจนว่าแต่ละข้อผิดเพราะอะไร และถ้าจะถูกต้องเป็นโรค/ภาวะใด " +
+        "**ห้ามอ้างอิงตัวเลือกด้วยตัวอักษร A/B/C/D หรือหมายเลขข้อโดยเด็ดขาด** เพราะลำดับตัวเลือกถูกสลับใหม่ทุกครั้งที่แสดงผล ให้อ้างอิงด้วย 'ข้อความของตัวเลือก' ในเครื่องหมายคำพูดแทนเสมอ " +
+        "(เช่น 'ส่วนตัวเลือก \"...\" ผิดเพราะ... ซึ่งจะพบในภาวะ...')\n" +
+        "3) ปิดท้ายด้วย Clinical pearl หรือ High-yield point สั้นๆ\n\n" +
+        "เขียนเป็น 1 paragraph ต่อเนื่อง ความยาวกระชับ ไม่เกิน ~300 คำ ห้ามมี newline หรือ bullet ในคำตอบ:";
 }
 
 function updateQuestionCategory(qSheet, qIdMap, qId, categoryToAdd) {

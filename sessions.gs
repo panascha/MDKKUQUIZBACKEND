@@ -92,8 +92,8 @@ function createSession(email, userObj) {
     sheet.appendRow(["Token", "Email", "CreatedAt", "ExpiresAt", "LastUsed"]);
     sheet.getRange(1, 1, 1, 5).setFontWeight("bold");
   }
-  // Multi-device: เก็บได้สูงสุด 5 session ต่ออีเมล (ลบอันเก่าสุดเกินโควต้า ไม่ลบทั้งหมดแบบเดิม)
-  capSessionsByEmail(sheet, email, 4);
+  // Multi-device: เก็บได้สูงสุด 10 session ต่ออีเมล (ลบอันเก่าสุดเกินโควต้า ไม่ลบทั้งหมดแบบเดิม)
+  capSessionsByEmail(sheet, email, 10);
   var token = generateSessionToken();
   var now = new Date();
   var expiry = new Date(now.getTime() + SESSION_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
