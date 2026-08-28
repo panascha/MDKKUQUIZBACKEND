@@ -1280,7 +1280,7 @@ function callGeminiForSlipOCR(dataUrl) {
   var comma = dataUrl.indexOf(',');
   var mimeMatch = dataUrl.match(/^data:(.*?);/);
   if (comma < 0 || !mimeMatch) return { ok: false, error: 'รูปสลิปไม่ถูกต้อง' };
-  var imgB64 = dataUrl.substring(comma + 1);
+  var imgB64 = dataUrl.substring(comma + 1).replace(/\s/g, ''); // strip whitespace/newlines — เว้นวรรคใน base64 = 400 INVALID_ARGUMENT
   var imgMime = mimeMatch[1];
 
   var prompt =
@@ -1299,36 +1299,49 @@ function callGeminiForSlipOCR(dataUrl) {
   for (var mi = 0; mi < models.length && mi < 3; mi++) {
     var model = models[mi];
     var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKeyInfo.key;
-    var payload = {
-      contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: imgMime, data: imgB64 } }] }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } }
-    };
-    try {
-      var resp = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
-      var code = resp.getResponseCode();
-      var body = resp.getContentText();
-      var rj; try { rj = JSON.parse(body); } catch (pe) { rj = {}; }
-      if (code === 200) {
-        var cand = rj.candidates && rj.candidates[0];
-        var raw = "";
-        if (cand && cand.content && cand.content.parts) {
-          cand.content.parts.forEach(function (p) { if (!p.thought && p.text) raw += p.text; });
+    // variant true = ส่ง thinkingBudget:0 (กันคิดยาวกินโควต้า output 2048) ; false = ไม่ส่ง thinkingConfig
+    // บางรุ่น (เช่น gemini-3.5-flash-lite) reject thinkingBudget:0 → 400 "Request contains an invalid argument"
+    // จึงมี variant สำรองเหมือน tryConverterCall_ แทนการ break ทิ้งทั้งโมเดลบน 400
+    var variants = [true, false];
+    for (var vi = 0; vi < variants.length; vi++) {
+      var genCfg = { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 2048 };
+      if (variants[vi]) genCfg.thinkingConfig = { thinkingBudget: 0 };
+      var payload = {
+        contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: imgMime, data: imgB64 } }] }],
+        generationConfig: genCfg
+      };
+      try {
+        var resp = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
+        var code = resp.getResponseCode();
+        var body = resp.getContentText();
+        var rj; try { rj = JSON.parse(body); } catch (pe) { rj = {}; }
+        if (code === 200) {
+          var cand = rj.candidates && rj.candidates[0];
+          var raw = "";
+          if (cand && cand.content && cand.content.parts) {
+            cand.content.parts.forEach(function (p) { if (!p.thought && p.text) raw += p.text; });
+          }
+          // ว่าง (เจอได้กับ thinkingBudget:0 บางรุ่น) → ลอง variant ไม่ส่ง thinkingConfig ก่อนตกโมเดลถัดไป
+          if (!raw.trim()) { lastErr = 'empty (finishReason: ' + ((cand && cand.finishReason) || '?') + ')'; continue; }
+          updateAIUsage(apiKeyInfo, model); // หักโควต้าโมเดลที่ใช้จริง
+          var parsed = null;
+          try { parsed = JSON.parse(raw); } catch (je) {
+            var m = raw.match(/\{[\s\S]*\}/);
+            if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { } }
+          }
+          if (!parsed) { lastErr = 'parse_fail'; continue; }
+          return { ok: true, data: parsed, model: model };
         }
-        if (!raw.trim()) { lastErr = 'empty (finishReason: ' + ((cand && cand.finishReason) || '?') + ')'; continue; }
-        updateAIUsage(apiKeyInfo, model); // หักโควต้าโมเดลที่ใช้จริง
-        var parsed = null;
-        try { parsed = JSON.parse(raw); } catch (je) {
-          var m = raw.match(/\{[\s\S]*\}/);
-          if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { } }
+        if (code === 401 || code === 403) { // key ใช้ไม่ได้ — เปลี่ยนโมเดล/variant ก็ไม่ช่วย
+          lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
+          return { ok: false, error: 'อ่านสลิปไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
         }
-        if (!parsed) { lastErr = 'parse_fail'; continue; }
-        return { ok: true, data: parsed, model: model };
-      }
-      if (code === 429) { handleGemini429_(apiKeyInfo, model, body, resp.getAllHeaders()); lastErr = '429'; continue; }
-      if (code === 404 || code >= 500) { lastErr = 'HTTP ' + code; continue; }
-      lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
-      break; // 400/401/403 — เปลี่ยนโมเดลไม่ช่วย
-    } catch (fe) { lastErr = fe.message; }
+        if (code === 429) { handleGemini429_(apiKeyInfo, model, body, resp.getAllHeaders()); lastErr = '429'; break; } // → โมเดลถัดไป
+        if (code === 404 || code >= 500) { lastErr = 'HTTP ' + code; break; } // ไม่มีรุ่น/overloaded → โมเดลถัดไป
+        // 400 — เช่น reject thinkingConfig → วน variant ไม่ส่ง thinkingConfig ; หมด variant แล้วตกไปโมเดลถัดไป
+        lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
+      } catch (fe) { lastErr = fe.message; }
+    }
   }
   return { ok: false, error: 'อ่านสลิปไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
 }
