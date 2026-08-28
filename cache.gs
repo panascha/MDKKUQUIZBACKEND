@@ -40,6 +40,36 @@ function updateVotesVersion() {
   return newVer;
 }
 
+// --- Reviews version key (แยกจาก v/v_votes) — submitReview/updateReviewStatus bump แล้วล้าง cache รีวิวทันที ---
+function getReviewsVersionCached() {
+  var cache = CacheService.getScriptCache();
+  var v = cache.get("v_reviews_cache");
+  if (v == null) {
+    v = PropertiesService.getScriptProperties().getProperty('v_reviews') || "0";
+    try { cache.put("v_reviews_cache", v, 60); } catch (e) { console.warn("Reviews version cache write error: " + e.message); }
+  }
+  return v;
+}
+
+function updateReviewsVersion() {
+  var newVer = new Date().getTime().toString();
+  PropertiesService.getScriptProperties().setProperty('v_reviews', newVer);
+  try { CacheService.getScriptCache().put("v_reviews_cache", newVer, 60); } catch (e) { console.warn("Reviews version cache put failed: " + e.message); }
+  return newVer;
+}
+
+// public getReviews cache (chunked, 10 นาที) — คีย์ผูก v_reviews จึงถูกล้างทันทีเมื่อมีรีวิวใหม่/เปลี่ยนสถานะ
+function getReviewsDataCached(subjectId, startTime) {
+  var v = getReviewsVersionCached();
+  var cleanFilter = subjectId ? String(subjectId).trim().toUpperCase() : "all";
+  var cacheKey = "reviews_" + v + "_" + cleanFilter;
+  var cachedStr = getLargeCache(cacheKey);
+  if (cachedStr != null) return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
+  var response = getReviewsData(subjectId, startTime);
+  putLargeCache(cacheKey, response.getContent(), 600); // 10 นาที
+  return response;
+}
+
 function putLargeCache(key, value, ttl, startTime) {
   if (!value) return;
   var cache = CacheService.getScriptCache();

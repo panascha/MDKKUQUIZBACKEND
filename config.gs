@@ -5,6 +5,14 @@ var VOTE_THRESHOLD_CONFIRM = 2;
 
 var REPORT_VOTE_THRESHOLD = 5;
 
+// ชื่อผู้รับโอนจริง (PromptPay) — ใช้ที่เดียวทั้ง prompt OCR สลิป + ตรวจ recipient match (donations.gs)
+// ★ นิยามครั้งเดียวที่นี่ ห้าม hardcode ซ้ำใน prompt/การตรวจแยกกัน
+var DONATION_RECIPIENT_NAME = 'ปาณัสม์ จังตระกูล';
+
+// salt สำหรับ SHA-256(studentId) — dedup รีวิว 1 คน/วิชา (reviews.gs::hashStudentId_)
+// ★ อยู่ฝั่ง server เท่านั้น: ห้ามส่งออก client, ห้ามหมุน (หมุน = hash เปลี่ยน = คนเดิมรีวิวซ้ำได้)
+var STUDENT_ID_SALT = 'mdkku_reviews_salt_2026_v1';
+
 // ────────────────────────────────────────────────────────────────────────────
 // EXECUTION BUDGET — GAS ตัด execution ที่ ~6 นาที (หน้า Executions โชว์ 369.99s ซ้ำๆ = ชนเพดาน)
 // UrlFetchApp ไม่มีพารามิเตอร์ timeout ให้ตั้ง → กันชนเพดานได้ทางเดียวคือ "ไม่เริ่มรอบใหม่"

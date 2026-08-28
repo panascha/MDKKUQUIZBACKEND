@@ -95,14 +95,18 @@ function getIntelSphereModelCatalog() {
 // ตรวจ key กับ IntelSphere จริงก่อนบันทึก — คืน 'valid' | 'invalid' | 'unavailable'
 // GET /models ใช้ไม่ได้ (endpoint สาธารณะ ตอบ 200 แม้ไม่มี auth — ยืนยัน 2026-07-03) ต้องยิง chat 1 token แทน
 // 401 "reached daily limit" = key จริงแต่โควต้าวันนี้หมด → ถือว่า valid (พรุ่งนี้ใช้ได้)
+//
+// โมเดล probe ปักตายที่ PROVIDER_MODEL_MAP["Deepseek"] (2026-08-26): เดิมหยิบ catalog[p][0]
+// ซึ่งทั้ง live catalogue และ PROVIDER_MODELS_FALLBACK เรียง "Claude" ไว้หัวแถว → probe
+// ยิง claude-sonnet-5 — น่าจะโดน 401 ทั้ง 21 ใบ → sweep เขียน Invalid ทับ key ที่ยังดีอยู่ทั้งแผ่น
+// (ข้อความ 401 ของ claude-sonnet-5 ยังไม่ได้ probe ยืนยัน—อนุมานจากลำดับ catalogue; แต่ fail-safe ด้านล่างครอบ 401 ทุกแบบอยู่แล้ว)
+// (ยืนยันสด: key เดิมยิง deepseek-v4-pro ตอบ HTTP 200)
+//
+// 401 ใดก็ตามที่ไม่ใช่ลายเซ็นเพิกถอนจริง "Invalid API key" → 'unavailable' ไม่ใช่ 'invalid'
+// เพราะผลสองอย่างนี้ไม่สมมาตร: 'unavailable' = ไม่แตะสถานะ (เสียแค่รอบ sweep),
+// ส่วน 'invalid' = เขียนทับ sheet และตัด key ออกจาก pool ทั้ง tier 1 และ tier 2
 function validateIntelSphereKeyLive(apiKey) {
   var model = PROVIDER_MODEL_MAP["Deepseek"];
-  try {
-    var catalog = getIntelSphereModelCatalog();
-    for (var p in catalog) {
-      if (catalog[p] && catalog[p].length > 0) { model = catalog[p][0]; break; }
-    }
-  } catch (e) { /* ใช้ flagship fallback */ }
 
   try {
     var resp = UrlFetchApp.fetch(INTELSPHERE_ENDPOINT, {
@@ -119,11 +123,9 @@ function validateIntelSphereKeyLive(apiKey) {
       try { errText = JSON.parse(resp.getContentText()).error || resp.getContentText(); }
       catch (e2) { errText = resp.getContentText(); }
       if (errText.indexOf("reached daily limit") >= 0) return 'valid';
-      if (errText.indexOf("Invalid model") >= 0) {
-        CacheService.getScriptCache().remove("intelsphere_catalog"); // catalog drift — ให้รอบหน้าดึงใหม่
-        return 'unavailable';
-      }
-      return 'invalid';
+      // ลายเซ็นเดียวที่ยืนยันว่า key ถูกเพิกถอน—gateway ตอบ {"error":"Invalid API key"} ตอนไม่ส่ง auth
+      if (errText.indexOf("Invalid API key") >= 0) return 'invalid';
+      return 'unavailable';
     }
     return 'unavailable';
   } catch (e3) {
@@ -433,9 +435,11 @@ function executeChatbotQuery(prompt, requestedModel, attempt, maxTokens, imageUr
       throw new Error("เกิดข้อผิดพลาดในการตั้งค่าโมเดล AI กรุณาแจ้งทีม IT");
     }
 
-    // Key เสีย/ถูกเพิกถอนจริงๆ
-    sheet2.getRange(keyObj.rowIndex, headers2.indexOf("Status") + 1).setValue("Invalid");
-    SpreadsheetApp.flush();
+    // ลายเซ็นเดียวที่ยืนยันว่า key ถูกเพิกถอนจริง—401 อื่นๆ ไม่แตะ Status (เสียแค่รอบนี้, ไม่ตัด key ดีออกจาก pool — เทียบ runIntelSphereKeySweep)
+    if (errText.indexOf("Invalid API key") >= 0) {
+      sheet2.getRange(keyObj.rowIndex, headers2.indexOf("Status") + 1).setValue("Invalid");
+      SpreadsheetApp.flush();
+    }
     return executeChatbotQuery(prompt, requestedModel, attempt + 1, maxTokens, imageUrls);
   }
 
@@ -714,9 +718,11 @@ function executeAgentQuery(request) {
         skip[provider] = true;
         continue;
       }
-      // Key เสีย/ถูกเพิกถอน
-      sheet2.getRange(keyObj.rowIndex, headers2.indexOf("Status") + 1).setValue("Invalid");
-      SpreadsheetApp.flush();
+      // ลายเซ็นเดียวที่ยืนยันว่า key ถูกเพิกถอนจริง—401 อื่นๆ ไม่แตะ Status (เสียแค่รอบนี้, ไม่ตัด key ดีออกจาก pool — เทียบ runIntelSphereKeySweep)
+      if (errText.indexOf("Invalid API key") >= 0) {
+        sheet2.getRange(keyObj.rowIndex, headers2.indexOf("Status") + 1).setValue("Invalid");
+        SpreadsheetApp.flush();
+      }
       continue;
     }
 

@@ -1263,6 +1263,76 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
   }
 }
 
+/* =========================================================
+   Slip OCR — อ่านสลิปโอนเงิน PromptPay (คนละ tuning กับ callGeminiAI/converter):
+   รูปเดียว, JSON mode, temp 0, ปิด thinking, ไม่มี systemInstruction การแพทย์
+   คืน { ok:true, data:{transRef,amount,dateTime,recipientNameRaw,isRecipientMatch,matchConfidence} }
+        หรือ { ok:false, error }
+   เรียกจาก donations.gs::submitDonation "นอก lock" (UrlFetchApp ห้ามใต้ LockService)
+   ========================================================= */
+// สลิป = รูปเดียวเล็ก → ใช้ lite ได้ (ประหยัดโควต้า) — ห้ามเอา flash-lite filter ของ converter มาใช้
+var SLIP_OCR_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-3.5-flash"];
+
+function callGeminiForSlipOCR(dataUrl) {
+  var apiKeyInfo = getAvailableAIKey("Gemini"); // reserve 0 (default) — donation ไม่แย่งโควต้าสำรอง
+  if (!apiKeyInfo || !apiKeyInfo.key) return { ok: false, error: 'ระบบตรวจสลิปไม่พร้อมใช้งานชั่วคราว (ไม่มีโควต้า AI) กรุณาลองใหม่ภายหลัง' };
+
+  var comma = dataUrl.indexOf(',');
+  var mimeMatch = dataUrl.match(/^data:(.*?);/);
+  if (comma < 0 || !mimeMatch) return { ok: false, error: 'รูปสลิปไม่ถูกต้อง' };
+  var imgB64 = dataUrl.substring(comma + 1);
+  var imgMime = mimeMatch[1];
+
+  var prompt =
+    'คุณคือระบบอ่านสลิปโอนเงินธนาคาร/พร้อมเพย์ของไทย อ่านรูปสลิปแล้วตอบเป็น JSON บรรทัดเดียวเท่านั้น (ห้ามมีข้อความอื่นนอก JSON):\n' +
+    '{"transRef":"เลขที่อ้างอิง/รหัสอ้างอิงธุรกรรม (Ref/รหัส) ถ้าไม่พบใส่ค่าว่าง",' +
+    '"amount":จำนวนเงินเป็นตัวเลขบาทไม่มีคอมม่า ถ้าไม่พบใส่ 0,' +
+    '"dateTime":"วันเวลาที่โอนตามที่เห็น หรือค่าว่าง",' +
+    '"recipientNameRaw":"ชื่อผู้รับเงินตามที่เห็นในสลิป อาจถูกปิดบางส่วนด้วย x หรือ * เช่น ปาณั*** จ*** ให้คัดมาตามจริงรวมส่วนที่ถูกปิด",' +
+    '"isRecipientMatch":true หรือ false ว่าชื่อผู้รับตรงกับ "' + DONATION_RECIPIENT_NAME + '" หรือไม่ (ยอมรับชื่อที่ถูกปิดบางตัวอักษรถ้าส่วนที่เห็นตรงกัน),' +
+    '"matchConfidence":"high" ถ้ามั่นใจว่าตรง / "low" ถ้าเห็นไม่ชัดหรือถูกปิดจนไม่แน่ใจ / "none" ถ้าเป็นคนละชื่อชัดเจน}';
+
+  var models = SLIP_OCR_MODELS.slice();
+  if (apiKeyInfo.model && models.indexOf(apiKeyInfo.model) < 0) models.unshift(apiKeyInfo.model);
+
+  var lastErr = '';
+  for (var mi = 0; mi < models.length && mi < 3; mi++) {
+    var model = models[mi];
+    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKeyInfo.key;
+    var payload = {
+      contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: imgMime, data: imgB64 } }] }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } }
+    };
+    try {
+      var resp = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
+      var code = resp.getResponseCode();
+      var body = resp.getContentText();
+      var rj; try { rj = JSON.parse(body); } catch (pe) { rj = {}; }
+      if (code === 200) {
+        var cand = rj.candidates && rj.candidates[0];
+        var raw = "";
+        if (cand && cand.content && cand.content.parts) {
+          cand.content.parts.forEach(function (p) { if (!p.thought && p.text) raw += p.text; });
+        }
+        if (!raw.trim()) { lastErr = 'empty (finishReason: ' + ((cand && cand.finishReason) || '?') + ')'; continue; }
+        updateAIUsage(apiKeyInfo, model); // หักโควต้าโมเดลที่ใช้จริง
+        var parsed = null;
+        try { parsed = JSON.parse(raw); } catch (je) {
+          var m = raw.match(/\{[\s\S]*\}/);
+          if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { } }
+        }
+        if (!parsed) { lastErr = 'parse_fail'; continue; }
+        return { ok: true, data: parsed, model: model };
+      }
+      if (code === 429) { handleGemini429_(apiKeyInfo, model, body, resp.getAllHeaders()); lastErr = '429'; continue; }
+      if (code === 404 || code >= 500) { lastErr = 'HTTP ' + code; continue; }
+      lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
+      break; // 400/401/403 — เปลี่ยนโมเดลไม่ช่วย
+    } catch (fe) { lastErr = fe.message; }
+  }
+  return { ok: false, error: 'อ่านสลิปไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
+}
+
 
 /*
    =========================================

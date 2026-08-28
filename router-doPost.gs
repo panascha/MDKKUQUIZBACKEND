@@ -603,6 +603,65 @@ function doPost(e) {
       return getFeedbackRows();
     }
 
+    // ====================================================
+    // REVIEWS + DONATIONS (2026-08-28) — reviews.gs / donations.gs
+    // submit* = localized-15s (lock ภายในฟังก์ชัน แบบ saveProgress/submitFeedback)
+    // update*/get*Admin = auth ที่ router แล้วเรียกฟังก์ชัน (getReviewsForAdmin/updateReviewStatus จัดการ lock/read เอง)
+    // ====================================================
+
+    // student write รีวิว (localized-15s, upsert 1 คน/วิชา) — auth ทำใน submitReview (verifyAnySession)
+    if (action === 'submitReview') {
+      if (!checkActionRateLimit('rl_review_', data.sessionToken || data.clientId || 'anon', 5)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ส่งรีวิวบ่อยเกินไป (สูงสุด 5 ครั้ง/ชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return submitReview(doc, data);
+    }
+
+    // donation write + slip OCR (localized-15s; OCR/Drive นอก lock ใน submitDonation) — login ไม่บังคับ
+    if (action === 'submitDonation') {
+      if (contents.length > 10485760) { // 10MB payload guard (รูปสลิป base64)
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ขนาดข้อมูลใหญ่เกินไป กรุณาลดขนาดรูปสลิป'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (!checkActionRateLimit('rl_donate_', data.sessionToken || data.clientId || 'anon', 5)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ส่งสลิปบ่อยเกินไป (สูงสุด 5 ครั้ง/ชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return submitDonation(doc, data);
+    }
+
+    // admin read: รีวิวทุกสถานะ (dual-auth: sessionToken admin หรือ username+adminPass — เหมือน getFeedback)
+    if (action === 'getReviewsAdmin') {
+      var graUser = data.sessionToken ? verifySessionToken(data.sessionToken) : (data.username ? verifyAdmin(data.username, data.adminPass) : null);
+      if (!graUser) return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'session_expired' })).setMimeType(ContentService.MimeType.JSON);
+      return getReviewsForAdmin();
+    }
+
+    // admin read: donations ทุกแถว รวม SlipDriveUrl (owner-only PII → ห้ามไปรวมใน getAllData ที่ไม่ auth)
+    if (action === 'getDonations') {
+      var gdnUser = data.sessionToken ? verifySessionToken(data.sessionToken) : (data.username ? verifyAdmin(data.username, data.adminPass) : null);
+      if (!gdnUser) return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'session_expired' })).setMimeType(ContentService.MimeType.JSON);
+      return getDonationsForAdmin();
+    }
+
+    // admin moderate รีวิว (25s lock ใน updateReviewStatus) — verifySessionToken = admin-only (Student token → null)
+    if (action === 'updateReviewStatus') {
+      var ursUser = data.sessionToken ? verifySessionToken(data.sessionToken) : (data.username ? verifyAdmin(data.username, data.adminPass) : null);
+      if (!ursUser) return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'session_expired' })).setMimeType(ContentService.MimeType.JSON);
+      return updateReviewStatus(doc, data);
+    }
+
+    // admin override สถานะบริจาค (25s lock ใน updateDonationStatus)
+    if (action === 'updateDonationStatus') {
+      var udsUser = data.sessionToken ? verifySessionToken(data.sessionToken) : (data.username ? verifyAdmin(data.username, data.adminPass) : null);
+      if (!udsUser) return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'session_expired' })).setMimeType(ContentService.MimeType.JSON);
+      return updateDonationStatus(doc, data);
+    }
+
     // ----------------------------------------------------
     // getAdminSync — delta-sync แดชบอร์ดแอดมิน: NOT_MODIFIED หรือ {small slices + question delta}
     // pure read → lock-free. dual auth แบบ getFeedback (sessionToken admin หรือ username+adminPass)

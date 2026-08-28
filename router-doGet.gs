@@ -67,6 +67,8 @@ function doGet_(e) {
   if (action == 'getHighYield') return getHighYieldData(e.parameter.category, __startTime); // Feature 3: ชีทสรุป high-yield ต่อหมวด (public read, chunked cache)
   if (action == 'getKeywordIndex') return getKeywordIndexData(e.parameter.category, __startTime); // Feature 6: คำสำคัญที่ออกบ่อย ต่อหมวด (public read, chunked cache — list)
   if (action == 'getDiscussion') return getDiscussionData(e.parameter.qid, __startTime); // Feature 4 (main-task): comments+reports+revisions ต่อ qid (public read, cache disc_<qid> 5 นาที)
+  if (action == 'getReviews') return getReviewsDataCached(e.parameter.subject, __startTime); // Reviews: avg+รายรีวิว ต่อวิชา (public read, Approved-only, chunked cache v_reviews). อย่าส่ง clientVer มา action นี้ (จะโดน NOT_MODIFIED ของ v หลัก)
+  if (action == 'setupReviews') return setupReviewsWithSeed_(); // idempotent one-off: สร้างชีต Reviews + seed mock ใต้วิชา DEMO
   if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
   if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
   if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)
