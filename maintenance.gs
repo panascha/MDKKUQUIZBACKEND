@@ -871,9 +871,9 @@ var INTELSPHERE_PROVIDER_PRIORITY = [
 // One flagship model per provider — used ONLY when rotation moves to a provider
 // other than the one the student explicitly requested.
 var PROVIDER_MODEL_MAP = {
-  "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-3.6-flash",
-  "Nova":     "nova-pro-v1",       "xAI":    "grok-4",             "Qwen": "qwen3.7-plus",
-  "OpenAI":   "gpt-5-mini",        "Claude": "claude-sonnet-4.5",
+  "Deepseek": "deepseek-v4-pro",  "Gemini": "gemini-3.7-flash",
+  "Nova":     "nova-pro-v1",       "xAI":    "grok-4.5",           "Qwen": "qwen3.7-plus",
+  "OpenAI":   "gpt-5.6-luna",      "Claude": "claude-sonnet-5",
   "MiniMax":  "minimax-m3",        "MoonshotAI": "kimi-k3",
   "Meta":     "llama-4-maverick",  "Mistral": "mistral-medium-3"
 };

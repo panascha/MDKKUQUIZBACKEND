@@ -498,13 +498,18 @@ var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens �
 var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Gemini": 1000000, "Nova": 200000, "xAI": 256000, "Qwen": 131072, "OpenAI": 128000, "MiniMax": 128000, "MoonshotAI": 128000, "Meta": 128000, "Mistral": 128000 };
 // Overflow tier: เอา Gemini ออกจากกลุ่ม Overflow เพื่อไม่ให้ระบบมองว่าเป็นแค่ตัวสำรองท้ายแถว
 var AGENT_QUERY_OVERFLOW_PROVIDERS = { "xAI": true, "Nova": true, "MiniMax": true };
+// เจ้าที่ hand-write pseudo tool call เป็น plain text (เช่น "[terminal(command=...)]") แทนที่จะ emit
+// structured tool_calls JSON — router (formatOpenAIToAnthropic) อ่านไม่ออก tool เลยเงียบไม่ยิง.
+// ตัดออกจาก chain เฉพาะตอน request มี tools schema. Meta/llama-4-maverick เป็นเจ้าที่รู้ว่าทำแบบนี้.
+// Mirror SUPPORTS_NATIVE_TOOLS ใน router localPool.ts — ไม่มีใน map = default รองรับ (true).
+var AGENT_QUERY_TOOL_INCAPABLE_PROVIDERS = { "Meta": true };
 // โมเดลเฉพาะ agentQuery ต่อ overflow provider — override PROVIDER_MODEL_MAP โดยไม่แตะ path ของ chatbot นิสิต
 // Mistral: เคย override เป็น devstral-medium (agentic-coding) แต่ IntelSphere map ไป mistralai/devstral-medium
 // บน OpenRouter ซึ่งถูกปลด ("No endpoints found") → ตอนนี้ปล่อยให้ตกไป PROVIDER_MODEL_MAP.Mistral = mistral-medium-3
 // (slug เดียวกับ chatbot นิสิต, verified live). ใส่ override กลับได้เมื่อยืนยัน devstral slug ที่ IntelSphere รับจริง
 // Gemini: 3.5-flash → 3.6-flash 2026-07-26 (live catalog ยืนยันว่ารับทั้งคู่) — tier นี้ถือโควต้าเหลือมากสุด
 // (~4.87M) แต่ serve 0 req; override ตัวนี้คือค่าที่ pickAgentModel ใช้จริง ไม่ใช่ PROVIDER_MODEL_MAP.Gemini
-var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-3.6-flash", "xAI": "grok-4.3" };
+var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-3.7-flash", "xAI": "grok-4.5" };
 // จอง key ไว้สำหรับผู้ใช้สาธารณะ — agentQuery (owner proxy) จะไม่ใช้ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก
 // (key = 1 API_Key ใช้ได้ทุก provider → reserve ทั้ง key ไม่ใช่แยก provider)
 var AGENT_QUERY_KEY_RESERVE_COUNT = 1;
@@ -580,7 +585,10 @@ function orderAgentProviders(request, quotaTotals) {
   var estTokens = Math.ceil(JSON.stringify(request.messages || []).length / 4)
                 + Math.ceil(JSON.stringify(request.tools || []).length / 4);
   var need = estTokens + AGENT_QUERY_MAX_OUTPUT_TOKENS;
+  // request ที่แนบ tools schema ต้องได้เจ้าที่ emit tool_calls JSON จริง — ตัด tool-incapable ออก
+  var hasTools = Array.isArray(request.tools) && request.tools.length > 0;
   var eligible = AGENT_QUERY_PROVIDER_PRIORITY.filter(function(p) {
+    if (hasTools && AGENT_QUERY_TOOL_INCAPABLE_PROVIDERS[p]) return false;
     // provider ที่ไม่มีใน map → ใช้ 128k conservative แทนการหลุด chain เงียบๆ (NaN filter)
     return need <= (AGENT_PROVIDER_CONTEXT[p] || 128000) * 0.95;
   });
