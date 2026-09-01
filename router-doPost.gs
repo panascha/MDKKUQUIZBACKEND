@@ -1117,6 +1117,15 @@ function doPost(e) {
         }
 
         if (action === 'voteOnReport') {
+          // Auth + rate limit — mirror syncSubjectPopularity (same localized tier).
+          // เดิมไม่มีเช็คเลย → คนไม่ล็อกอินยิงซ้ำ 5 ครั้งดัน report แตะ threshold ได้ (T-report-vote)
+          if (!checkActionRateLimit('rl_reportvote_', data.sessionToken || 'anon', 30)) {
+            return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'rate_limited' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var rvUser = verifyAnySession(data.sessionToken);
+          if (!rvUser || !rvUser.email) {
+            return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'session_expired' })).setMimeType(ContentService.MimeType.JSON);
+          }
           var reportSheet = doc.getSheetByName("Report");
           if (!reportSheet) {
             return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'Report sheet not found' })).setMimeType(ContentService.MimeType.JSON);
