@@ -939,6 +939,46 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // Feature 5 (Item 5): setCommentStatus — ปัก/ยกเลิกปักหมุด "เฉลยที่ดีที่สุด" (admin-only, localized-15s)
+    // auth เหมือน getDiscussionAdmin/getFeedback: verifySessionToken (admin เท่านั้น — Student token คืน null)
+    // หรือ username+adminPass ของ DATABASE. ***ห้ามใช้ verifyAnySession*** (นั่นรับ Student ด้วย)
+    // ----------------------------------------------------
+    if (action === 'setCommentStatus') {
+      var scsUser = null;
+      if (data.sessionToken) scsUser = verifySessionToken(data.sessionToken);
+      else if (data.username) scsUser = verifyAdmin(data.username, data.adminPass);
+      if (!scsUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var scsQid = String(data.qid || '').trim();
+      var scsTs = String(data.timestamp || '').trim();
+      var scsStatus = String(data.newStatus || '').trim();
+      if (!scsQid || !scsTs) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'ข้อมูลไม่ครบ' })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (scsStatus !== 'pinned' && scsStatus !== 'visible') {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'สถานะไม่ถูกต้อง' })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var scsLock = LockService.getScriptLock();
+      if (!scsLock.tryLock(15000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var scsRes = setDiscussionCommentStatusLocked_(scsQid, scsTs, scsStatus);
+        if (!scsRes.ok) {
+          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: scsRes.message })).setMimeType(ContentService.MimeType.JSON);
+        }
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
+      } finally {
+        scsLock.releaseLock();
+      }
+    }
+
+    // ----------------------------------------------------
     // §3.6 generateHighYield — lazy-generate-then-cache miss-path (public, self-populating). โครงเดียวกับ askGlossaryTerm:
     // rate-limit → dedup(cache) ก่อนยิง LLM → LLM ทำ "นอก lock" → เขียน 1 แถวใต้ localized-15s lock. ***ห้ามยิง LLM ใต้ lock***
     // ไม่อยู่ใน admin tier — guest กดสร้างชีทสรุปได้ (เป็น UX หลักของ feature). subject resolve จาก categoryId ฝั่ง server

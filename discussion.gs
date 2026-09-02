@@ -35,13 +35,16 @@ function readDiscussionComments_(qid, ss) {
   var sheet = ss.getSheetByName(DISCUSSION_SHEET_NAME);
   if (!sheet || sheet.getLastRow() < 2) return [];
   var rows = sheet.getDataRange().getValues();
-  var out = [];
+  // pinned แยกกอง แล้ว concat ให้ขึ้นก่อน (ไม่พึ่ง sort-stability); ในแต่ละกองยังเก่าสุด→ใหม่สุดตามลำดับ appendRow
+  var pinned = [], rest = [];
   for (var i = 1; i < rows.length; i++) {
-    if (String(rows[i][1]).trim() !== qid || rows[i][6] !== "visible") continue;
+    var st = rows[i][6];
+    if (String(rows[i][1]).trim() !== qid || (st !== "visible" && st !== "pinned")) continue;
     var ts = rows[i][0] instanceof Date ? rows[i][0].toISOString() : String(rows[i][0]);
-    out.push({ timestamp: ts, nickname: rows[i][3], tag: rows[i][4], text: rows[i][5] });
+    var obj = { timestamp: ts, nickname: rows[i][3], tag: rows[i][4], text: rows[i][5], status: st };
+    if (st === "pinned") pinned.push(obj); else rest.push(obj);
   }
-  return out; // เก่าสุดก่อนอยู่แล้ว (ลำดับ appendRow) — ตาม decision #10
+  return pinned.concat(rest); // decision #10 + Item5: pinned บนสุด
 }
 
 // Report sheet columns: From,Category,QuestionID,Question,Image,Choices,SuggestedAnswer,ReportDetail,Time,Status,AdminNote,Done,SuggestedExplain,VoteCount
@@ -168,7 +171,7 @@ function postDiscussionCommentLocked_(qid, email, nickname, text) {
   var rows = sheet.getDataRange().getValues();
   var count = 0;
   for (var i = 1; i < rows.length; i++) {
-    if (String(rows[i][1]).trim() === qid && rows[i][6] === "visible") count++;
+    if (String(rows[i][1]).trim() === qid && (rows[i][6] === "visible" || rows[i][6] === "pinned")) count++;
   }
   if (count >= DISCUSSION_MAX_COMMENTS) {
     return { ok: false, message: "กระทู้เต็มแล้ว (สูงสุด " + DISCUSSION_MAX_COMMENTS + " ความคิดเห็น)" };
@@ -200,6 +203,35 @@ function deleteDiscussionCommentLocked_(qid, timestamp, requestorEmail, isAdmin)
     return { ok: true };
   }
   return { ok: false, message: "ไม่พบความคิดเห็น" };
+}
+
+// เรียกใต้ localized-15s lock เท่านั้น — admin-only (gate ที่ router). ตั้ง Status เป็น 'pinned' หรือ 'visible'
+// single-pin (decision Q8): ตอน pin ปลด pinned เดิมของ qid เดียวกันในรอบสแกนเดียว (ไม่อ่านชีตซ้ำ)
+// ห้ามแตะแถวที่ status='deleted' — กัน unpin (set visible) เผลอกู้ comment ที่ลบไปแล้วให้โผล่ใหม่
+function setDiscussionCommentStatusLocked_(qid, timestamp, newStatus) {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(DISCUSSION_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return { ok: false, message: "ไม่พบความคิดเห็น" };
+  var rows = sheet.getDataRange().getValues();
+  var target = -1;
+  for (var i = 1; i < rows.length; i++) {
+    var rowTs = rows[i][0] instanceof Date ? rows[i][0].toISOString() : String(rows[i][0]);
+    if (String(rows[i][1]).trim() === qid && rowTs === timestamp) { target = i; break; }
+  }
+  if (target === -1) return { ok: false, message: "ไม่พบความคิดเห็น" };
+  if (rows[target][6] === "deleted") return { ok: false, message: "ความคิดเห็นนี้ถูกลบไปแล้ว" };
+  if (newStatus === "pinned") {
+    for (var j = 1; j < rows.length; j++) {
+      if (j === target) continue;
+      if (String(rows[j][1]).trim() === qid && rows[j][6] === "pinned") {
+        sheet.getRange(j + 1, 7).setValue("visible");
+      }
+    }
+  }
+  sheet.getRange(target + 1, 7).setValue(newStatus);
+  // purge ด้วย qid จากแถวจริง (เหตุผลเดียวกับ deleteDiscussionCommentLocked_)
+  CacheService.getScriptCache().remove("disc_" + String(rows[target][1]).trim());
+  return { ok: true };
 }
 
 // อ่านทุกแถว Discussion (รวม deleted + email) สำหรับหน้า moderation ฝั่ง DATABASE — admin เท่านั้น (มี PII)
