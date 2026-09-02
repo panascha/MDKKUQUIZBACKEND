@@ -831,6 +831,86 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // Feature 4: postComment — เขียน Discussion 1 แถว (login-only, localized-15s)
+    // rate-limit rl_disc_ 10/hr ก่อน auth (mirror deleteGlossaryTerm); เพดาน 100 comment เช็คใต้ lock ใน helper
+    // ----------------------------------------------------
+    if (action === 'postComment') {
+      if (!checkActionRateLimit('rl_disc_', data.sessionToken || 'anon', 10)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'แสดงความคิดเห็นบ่อยเกินไป (สูงสุด 10 ครั้ง/ชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var pcUser2 = verifyAnySession(data.sessionToken);
+      if (!pcUser2) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ต้องเข้าสู่ระบบก่อนแสดงความคิดเห็น'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var pcQid = String(data.qid || '').trim();
+      var pcText = String(data.text || '').trim();
+      var pcNick = String(data.nickname || '').trim() || pcUser2.displayName || String(pcUser2.email).split('@')[0];
+      if (pcNick.length > 40) pcNick = pcNick.slice(0, 40);
+      if (!pcQid) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'missing qid' })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (!pcText) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'ข้อความว่างเปล่า' })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (pcText.length > DISCUSSION_MAX_CHARS) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'ข้อความยาวเกิน ' + DISCUSSION_MAX_CHARS + ' ตัวอักษร' })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var pcLock = LockService.getScriptLock();
+      if (!pcLock.tryLock(15000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var pcRes = postDiscussionCommentLocked_(pcQid, pcUser2.email, pcNick, pcText);
+        if (!pcRes.ok) {
+          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: pcRes.message })).setMimeType(ContentService.MimeType.JSON);
+        }
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success', comment: pcRes.comment })).setMimeType(ContentService.MimeType.JSON);
+      } finally {
+        pcLock.releaseLock();
+      }
+    }
+
+    // ----------------------------------------------------
+    // Feature 4: deleteComment — soft-delete Discussion 1 แถว (login-only, localized-15s)
+    // สิทธิ์: เจ้าของ (email ตรง) หรือ admin (role !== 'Student'); ตรวจใน helper ใต้ lock. ไม่ rate-limit (decision #6)
+    // ----------------------------------------------------
+    if (action === 'deleteComment') {
+      var dcUser = verifyAnySession(data.sessionToken);
+      if (!dcUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var dcQid = String(data.qid || '').trim();
+      var dcTs = String(data.timestamp || '').trim();
+      if (!dcQid || !dcTs) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'ข้อมูลไม่ครบ' })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var dcIsAdmin = dcUser.role !== 'Student';
+      var dcLock = LockService.getScriptLock();
+      if (!dcLock.tryLock(15000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        var dcRes = deleteDiscussionCommentLocked_(dcQid, dcTs, dcUser.email, dcIsAdmin);
+        if (!dcRes.ok) {
+          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: dcRes.message })).setMimeType(ContentService.MimeType.JSON);
+        }
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
+      } finally {
+        dcLock.releaseLock();
+      }
+    }
+
+    // ----------------------------------------------------
     // §3.6 generateHighYield — lazy-generate-then-cache miss-path (public, self-populating). โครงเดียวกับ askGlossaryTerm:
     // rate-limit → dedup(cache) ก่อนยิง LLM → LLM ทำ "นอก lock" → เขียน 1 แถวใต้ localized-15s lock. ***ห้ามยิง LLM ใต้ lock***
     // ไม่อยู่ใน admin tier — guest กดสร้างชีทสรุปได้ (เป็น UX หลักของ feature). subject resolve จาก categoryId ฝั่ง server

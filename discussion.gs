@@ -37,7 +37,7 @@ function readDiscussionComments_(qid, ss) {
   var rows = sheet.getDataRange().getValues();
   var out = [];
   for (var i = 1; i < rows.length; i++) {
-    if (rows[i][1] !== qid || rows[i][6] !== "visible") continue;
+    if (String(rows[i][1]).trim() !== qid || rows[i][6] !== "visible") continue;
     var ts = rows[i][0] instanceof Date ? rows[i][0].toISOString() : String(rows[i][0]);
     out.push({ timestamp: ts, nickname: rows[i][3], tag: rows[i][4], text: rows[i][5] });
   }
@@ -168,7 +168,7 @@ function postDiscussionCommentLocked_(qid, email, nickname, text) {
   var rows = sheet.getDataRange().getValues();
   var count = 0;
   for (var i = 1; i < rows.length; i++) {
-    if (rows[i][1] === qid && rows[i][6] === "visible") count++;
+    if (String(rows[i][1]).trim() === qid && rows[i][6] === "visible") count++;
   }
   if (count >= DISCUSSION_MAX_COMMENTS) {
     return { ok: false, message: "กระทู้เต็มแล้ว (สูงสุด " + DISCUSSION_MAX_COMMENTS + " ความคิดเห็น)" };
@@ -189,7 +189,7 @@ function deleteDiscussionCommentLocked_(qid, timestamp, requestorEmail, isAdmin)
   var rows = sheet.getDataRange().getValues();
   for (var i = 1; i < rows.length; i++) {
     var rowTs = rows[i][0] instanceof Date ? rows[i][0].toISOString() : String(rows[i][0]);
-    if (rows[i][1] !== qid || rowTs !== timestamp) continue;
+    if (String(rows[i][1]).trim() !== qid || rowTs !== timestamp) continue;
     if (!isAdmin && rows[i][2] !== requestorEmail) {
       return { ok: false, message: "ไม่มีสิทธิ์ลบความคิดเห็นนี้" };
     }
