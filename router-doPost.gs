@@ -881,7 +881,13 @@ function doPost(e) {
     // สิทธิ์: เจ้าของ (email ตรง) หรือ admin (role !== 'Student'); ตรวจใน helper ใต้ lock. ไม่ rate-limit (decision #6)
     // ----------------------------------------------------
     if (action === 'deleteComment') {
+      // dual-auth: Google sessionToken (REAL self-delete/admin) หรือ username+adminPass (DATABASE moderation)
+      var dcViaPassword = false;
       var dcUser = verifyAnySession(data.sessionToken);
+      if (!dcUser && data.username) {
+        dcUser = verifyAdmin(data.username, data.adminPass);
+        dcViaPassword = !!dcUser;
+      }
       if (!dcUser) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: 'session_expired'
@@ -892,7 +898,8 @@ function doPost(e) {
       if (!dcQid || !dcTs) {
         return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'ข้อมูลไม่ครบ' })).setMimeType(ContentService.MimeType.JSON);
       }
-      var dcIsAdmin = dcUser.role !== 'Student';
+      // username+adminPass ผ่าน verifyAdmin แปลว่าเป็นแอดมินโดยนิยาม → admin เสมอ (ไม่พึ่ง role field ที่อาจว่าง)
+      var dcIsAdmin = dcViaPassword || dcUser.role !== 'Student';
       var dcLock = LockService.getScriptLock();
       if (!dcLock.tryLock(15000)) {
         return ContentService.createTextOutput(JSON.stringify({
@@ -908,6 +915,27 @@ function doPost(e) {
       } finally {
         dcLock.releaseLock();
       }
+    }
+
+    // ----------------------------------------------------
+    // Feature 4: getDiscussionAdmin — อ่านทุกแถว Discussion (รวม deleted + email PII) สำหรับ moderation ฝั่ง DATABASE
+    // pure read → lock-free. dual-auth แบบ getFeedback (sessionToken admin หรือ username+adminPass). ห้ามไปรวมใน getAllData ที่ไม่ auth
+    // ----------------------------------------------------
+    if (action === 'getDiscussionAdmin') {
+      var gdaUser = null;
+      if (data.sessionToken) {
+        gdaUser = verifySessionToken(data.sessionToken);
+      } else if (data.username) {
+        gdaUser = verifyAdmin(data.username, data.adminPass);
+      }
+      if (!gdaUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        result: 'success', discussion: readAllDiscussionForAdmin_()
+      })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------

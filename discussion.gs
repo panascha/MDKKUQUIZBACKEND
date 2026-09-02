@@ -194,8 +194,34 @@ function deleteDiscussionCommentLocked_(qid, timestamp, requestorEmail, isAdmin)
       return { ok: false, message: "ไม่มีสิทธิ์ลบความคิดเห็นนี้" };
     }
     sheet.getRange(i + 1, 7).setValue("deleted");
-    CacheService.getScriptCache().remove("disc_" + rows[i][1]);
+    // purge ด้วย qid ที่ trim แล้ว ให้ตรง cacheKey ของ getDiscussionData ("disc_"+qid.trim()) — ไม่งั้น
+    // ถ้า cell มี whitespace/coerce เป็น Number, purge key เพี้ยน → REAL เห็น comment ที่ลบไปอีก 5 นาที
+    CacheService.getScriptCache().remove("disc_" + String(rows[i][1]).trim());
     return { ok: true };
   }
   return { ok: false, message: "ไม่พบความคิดเห็น" };
+}
+
+// อ่านทุกแถว Discussion (รวม deleted + email) สำหรับหน้า moderation ฝั่ง DATABASE — admin เท่านั้น (มี PII)
+// timestamp round-trip เหมือน readDiscussionComments_/deleteDiscussionCommentLocked_ เป๊ะ ให้ค่าที่คืนไป
+// ใช้เป็น key ลบได้ตรง ๆ (deleteComment match ด้วย qid+timestamp string เดียวกันนี้)
+function readAllDiscussionForAdmin_() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(DISCUSSION_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  var rows = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < rows.length; i++) {
+    var ts = rows[i][0] instanceof Date ? rows[i][0].toISOString() : String(rows[i][0]);
+    out.push({
+      timestamp: ts,
+      qid: String(rows[i][1]).trim(),
+      email: rows[i][2],
+      nickname: rows[i][3],
+      tag: rows[i][4],
+      text: rows[i][5],
+      status: rows[i][6]
+    });
+  }
+  return out;
 }
