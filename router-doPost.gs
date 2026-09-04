@@ -1245,12 +1245,24 @@ function doPost(e) {
 
               if (newVote < 0) {
                 voteSheet.deleteRow(foundRowIndex);
+                sbMirrorVoteDeleted_(data.questionId, category);
               } else {
                 voteSheet.getRange(foundRowIndex, 4).setValue(newVote);
                 voteSheet.getRange(foundRowIndex, 5).setValue(timestamp);
+                // VoteCount = ค่าสุดท้าย ไม่ใช่ delta — RPC ไม่บวกซ้ำให้
+                sbMirrorVoteRow_({
+                  QuestionID: data.questionId, Question: voteData[foundRowIndex - 1][1],
+                  SuggestedTopic: category, VoteCount: newVote,
+                  Time: timestamp.toISOString(), Status: voteData[foundRowIndex - 1][5]
+                });
               }
             } else if (delta > 0) {
               voteSheet.appendRow([data.questionId, data.questionText, category, 1, timestamp, "Pending"]);
+              sbMirrorVoteRow_({
+                QuestionID: data.questionId, Question: data.questionText,
+                SuggestedTopic: category, VoteCount: 1,
+                Time: timestamp.toISOString(), Status: "Pending"
+              });
             }
           });
           updateVotesVersion();
@@ -1277,6 +1289,9 @@ function doPost(e) {
           var qImg = (data.questionImages && data.questionImages.indexOf("http") === 0) ? data.questionImages.split("///")[0] : "";
           var ansSug = data.suggestedChoice || "";
 
+          // Time คือคีย์ธรรมชาติของ reports (§9.11 ข้อ 7) ⇒ ต้องเป็นค่าเดียวกันทั้งชีทและ mirror
+          var reportTime = new Date().toISOString();
+
           sheet.appendRow([
             data.from || "User",
             data.category || "",
@@ -1286,7 +1301,7 @@ function doPost(e) {
             data.allChoices || "",
             ansSug,
             data.report || "",
-            new Date().toISOString(),
+            reportTime,
             "Pending",
             "",
             "FALSE",
@@ -1295,6 +1310,13 @@ function doPost(e) {
           ]);
 
           updateVotesVersion();
+          sbMirrorReportRow_({
+            Time: reportTime, From: data.from || "User", Category: data.category || "",
+            QuestionID: data.questionId || "", Question: data.question || "", Image: qImg,
+            Choices: data.allChoices || "", SuggestedAnswer: ansSug,
+            ReportDetail: data.report || "", Status: "Pending", AdminNote: "", Done: "FALSE",
+            SuggestedExplain: data.suggestedExplain || "", VoteCount: 1
+          });
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
 
@@ -1328,6 +1350,8 @@ function doPost(e) {
           var newVotes = Math.max(0, (parseInt(rv[foundIdx][13]) || 0) + delta);
           reportSheet.getRange(foundIdx + 1, 14).setValue(newVotes);
           updateVotesVersion();
+          // ส่งแค่คีย์ + คอลัมน์ที่เปลี่ยน — คีย์ที่ไม่ส่ง = คอลัมน์ที่ไม่ถูกแตะ (§9.11 ข้อ 3)
+          sbMirrorReportRow_({ Time: targetTs, VoteCount: newVotes });
 
           // T0.2: threshold check เฉพาะแถวนี้ — รัน processReports (ซึ่งอาจเรียก Gemini/UrlFetchApp) เฉพาะเมื่อ
           // รายงานนี้ยัง Pending และแตะเกณฑ์แล้วเท่านั้น และต้องทำ "นอก Lock" เสมอ (ห้ามเรียก UrlFetchApp ใต้ LockService)
@@ -1343,6 +1367,7 @@ function doPost(e) {
         }
       } finally {
         if (!lockReleased) lock.releaseLock(); // อาจถูกปลดไปแล้วใน submitVote/voteOnReport
+        sbFlush_(); // dual-write ไป Postgres — นอก lock เสมอ (D14) และกลืน error ทุกชนิด
       }
     }
 
@@ -1842,6 +1867,7 @@ function doPost(e) {
           ]);
           updateVersion();
           writeAdminLog(user, userRole, "ANNOUNCEMENT", "ADD", data.data.Id, "Added Announcement", "", data.data.Text, metadata);
+          sbMarkSheet_('Announcements');
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
 
@@ -1859,6 +1885,7 @@ function doPost(e) {
               ]]);
               updateVersion();
               writeAdminLog(user, userRole, "ANNOUNCEMENT", "EDIT", data.data.Id, "Updated Announcement", oldText, data.data.Text, metadata);
+              sbMarkSheet_('Announcements');
               return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
             }
           }
@@ -1873,6 +1900,7 @@ function doPost(e) {
               sheet.deleteRow(i + 1);
               updateVersion();
               writeAdminLog(user, userRole, "ANNOUNCEMENT", "DELETE", data.data.Id, "Deleted Announcement", oldText, "DELETED", metadata);
+              sbMarkSheet_('Announcements'); // แถวหายจากชีท ⇒ delete-absent ของ replace_* จัดการให้
               return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
             }
           }
@@ -1895,13 +1923,16 @@ function doPost(e) {
                 [data.data.problem, data.data.img, data.data.choices, data.data.answer, data.data.explain, catToSave]
               ]);
 
+              var splitRes = null;
               try {
                 const catsForSplit = Array.isArray(data.data.category) ? data.data.category : JSON.parse(catToSave);
-                autoCreateSplitCategories(data.data.id, catsForSplit);
+                splitRes = autoCreateSplitCategories(data.data.id, catsForSplit);
               } catch (e) { console.log("Split error in editQuestion: " + e); }
 
               updateVersion();
               writeAdminLog(user, userRole, "QUESTION", "EDIT", data.data.id, "Question Updated", oldRowData, data.data, metadata);
+              // ส่ง data.data.category (array ดิบ) ไม่ใช่ catToSave ที่ stringify แล้ว
+              sbMirrorQuestion_(data.data, splitRes);
 
               return ContentService.createTextOutput(JSON.stringify({
                 'result': 'success'
@@ -1928,6 +1959,8 @@ function doPost(e) {
 
           var applied = 0, skipped = 0;
           var appliedIds = []; // qid จริงสำหรับ delta-feed (getChangedSince split ด้วย comma)
+          var sbMirrorRows = [];
+          var sbSplitChangedSheets = false;
           for (var u = 0; u < updates.length; u++) {
             var upd = updates[u];
             var rowIdx = qIdMap[upd.id];
@@ -1942,15 +1975,30 @@ function doPost(e) {
             cats.push(upd.categoryId);
             sheet.getRange(rowIdx, 7).setValue(JSON.stringify(cats));
 
-            try { autoCreateSplitCategories(upd.id, cats, true); } // skipSort=true — sort ทีเดียวตอนจบ
+            var bulkSplit = null;
+            try { bulkSplit = autoCreateSplitCategories(upd.id, cats, true); } // skipSort=true — sort ทีเดียวตอนจบ
             catch (e) { console.log("Split error in bulkAddQuestionCategories: " + e); }
             applied++;
             appliedIds.push(String(upd.id).trim());
+            // §9.11 ข้อ 3: ส่งแค่ {questionId, category} — คีย์ที่ไม่ส่ง = คอลัมน์ที่ไม่ถูกแตะ
+            // ใช้ finalCategories ถ้ามี เพราะ split เขียนทับคอลัมน์นี้ต่อจากเรา
+            sbMirrorRows.push({
+              questionId: String(upd.id).trim(),
+              category: (bulkSplit && bulkSplit.finalCategories) || cats
+            });
+            if (bulkSplit && bulkSplit.sheetsChanged) sbSplitChangedSheets = true;
           }
 
           if (applied > 0) {
             try { sortCategorySheet(); } catch (e) { console.log("Sort error in bulkAddQuestionCategories: " + e); }
             updateVersion();
+            sbMirrorQuestionRows_(sbMirrorRows);
+            // มาร์คเฉพาะเมื่อ autoCreateSplitCategories เพิ่มแถวจริง — ไม่งั้นทุกรอบ AI categorize
+            // จะลาก replace_categories_all (~1,420 แถว) ไปด้วยโดยไม่มีอะไรเปลี่ยนเลย
+            if (sbSplitChangedSheets) {
+              sbMarkSheet_('Category');
+              sbMarkSheet_('Structure');   // ขั้นที่ 6 ของมัน append ชีท Structure ได้เช่นกัน
+            }
           }
           // targetId = comma-joined qid จริง เพื่อให้ delta-sync เห็นข้อที่เปลี่ยน (เดิม "N items" ทำ delta หลุด)
           writeAdminLog(user, userRole, "QUESTION", "BULK_CATEGORIZE", appliedIds.join(","), "AI batch categorize (" + updates.length + " items)", "", { applied: applied, skipped: skipped }, metadata);
@@ -1975,6 +2023,9 @@ function doPost(e) {
               sheet.deleteRow(i + 1);
               updateVersion();
               writeAdminLog(user, userRole, "QUESTION", "DELETE", data.data.id, "Question Deleted", oldRowData, "DELETED", metadata);
+              // แถวในชีทหายไปแล้ว ⇒ sweep มองไม่เห็นจาก "สภาพปัจจุบัน" ได้อีก
+              // ตัวนี้คือสัญญาณหลัก ส่วน sweep เล่นซ้ำจาก log แถว QUESTION/DELETE เป็นตาข่ายรอง
+              sbMirrorQuestionDeleted_(data.data.id);
 
               return ContentService.createTextOutput(JSON.stringify({
                 'result': 'success'
@@ -2070,6 +2121,7 @@ function doPost(e) {
               writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName,
                 "Upserted Questions: " + appended + " added, " + updated + " updated", "",
                 "Added " + appended + ", Updated " + updated, metadata);
+              sbMirrorQuestionSheetRows_(importData); // แถวดิบคอลัมน์ 0..6, sbFlush_ แบ่งก้อนให้เอง
 
               // Delta-feed: log แถว group QUESTION พร้อม qid จริง (comma-joined) ให้ getChangedSince เห็นข้อที่ import
               // แบ่งรอบละ 1000 qid กัน 50k char/cell limit ของ Sheets
@@ -2110,6 +2162,7 @@ function doPost(e) {
                 targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
                 updateVersion();
                 writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName, "Imported " + finalData.length + " new rows (Skipped " + (importData.length - finalData.length) + " duplicates)", "", "Added " + finalData.length + " rows", metadata);
+                sbMarkSheet_(realSheetName); // Structure / Category → replace ทั้ง slice
 
                 return ContentService.createTextOutput(JSON.stringify({
                   'result': 'success',
@@ -2179,6 +2232,7 @@ function doPost(e) {
               sheet.deleteRow(i + 1);
               updateVersion();
               writeAdminLog(user, userRole, "CATEGORY", "DELETE", data.data.CategoryID, "Category Deleted", catNameOld, "DELETED", metadata);
+              sbMarkSheet_('Category');
               return ContentService.createTextOutput(JSON.stringify({
                 'result': 'success'
               })).setMimeType(ContentService.MimeType.JSON);
@@ -2195,6 +2249,7 @@ function doPost(e) {
               sheet.getRange(i + 1, 4).setValue(data.data.CategoryName);
               updateVersion();
               writeAdminLog(user, userRole, "CATEGORY", "EDIT", data.data.CategoryID, "Renamed Category", oldName, data.data.CategoryName, metadata);
+              sbMarkSheet_('Category');
               return ContentService.createTextOutput(JSON.stringify({
                 'result': 'success'
               })).setMimeType(ContentService.MimeType.JSON);
@@ -2223,6 +2278,8 @@ function doPost(e) {
 
           updateVersion();
           writeAdminLog(user, userRole, "GROUP", "DELETE", data.data.SubjectRef + "_" + data.data.AccordionGroup, "Deleted Group & " + deletedCount + " categories", "", "DELETED", metadata);
+          sbMarkSheet_('Category');
+          sbMarkSheet_('Structure');
           return ContentService.createTextOutput(JSON.stringify({
             'result': 'success'
           })).setMimeType(ContentService.MimeType.JSON);
@@ -2253,6 +2310,8 @@ function doPost(e) {
 
           updateVersion();
           writeAdminLog(user, userRole, "GROUP", "EDIT", subjectId + "_" + oldGroup, "Renamed Group", oldGroup, newGroup, metadata);
+          sbMarkSheet_('Category');
+          sbMarkSheet_('Structure');
           return ContentService.createTextOutput(JSON.stringify({
             'result': 'success',
             'message': 'Updated ' + updatedCount + ' categories'
@@ -2264,6 +2323,7 @@ function doPost(e) {
           sheet.appendRow([data.data.Year, data.data.SubjectID, data.data.SubjectName, "GENERAL"]);
           updateVersion();
           writeAdminLog(user, userRole, "SUBJECT", "ADD", data.data.SubjectID, "Added Subject", "", data.data.SubjectName, metadata);
+          sbMarkSheet_('Structure');
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
 
@@ -2277,6 +2337,7 @@ function doPost(e) {
               sheet.getRange(i + 1, 3).setValue(data.data.SubjectName);
               updateVersion();
               writeAdminLog(user, userRole, "SUBJECT", "EDIT", data.data.SubjectID, "Updated Subject Info", oldName, data.data.SubjectName, metadata);
+              sbMarkSheet_('Structure');
               return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
             }
           }
@@ -2296,6 +2357,8 @@ function doPost(e) {
           }
           updateVersion();
           writeAdminLog(user, userRole, "SUBJECT", "DELETE", subjectId, "Deleted Subject & Related Data", "", "DELETED", metadata);
+          sbMarkSheet_('Structure');
+          sbMarkSheet_('Category');
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
 
@@ -2331,6 +2394,8 @@ function doPost(e) {
           updateVersion();
           sortCategorySheet();
           writeAdminLog(user, userRole, "CATEGORY", "ADD", data.data.CategoryID, "Added Category", "", data.data.CategoryName, metadata);
+          sbMarkSheet_('Category');
+          sbMarkSheet_('Structure'); // อาจ append กลุ่มใหม่ลง Structure ด้านบน
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
         }
       }
@@ -2339,7 +2404,12 @@ function doPost(e) {
         'message': 'Action "' + action + '" not found or logic failed'
       })).setMimeType(ContentService.MimeType.JSON);
     } finally {
+      // ★ ลำดับนี้สำคัญ: ถ่ายภาพชีท "ขณะยังถือ lock" แล้วค่อยปลด แล้วค่อยยิง HTTP
+      //   อ่านชีทหลังปลด lock อาจได้ snapshot ที่ขาดแถว (doPost อีกตัว deleteRow เลื่อนแถว)
+      //   ซึ่งไม่ว่างจึงผ่านการ์ด §Q ของ 004 แล้วแถวที่ขาดจะถูกลบจริงใน Postgres
+      sbSnapshotDirtySheets_();
       adminLock.releaseLock();
+      sbFlush_();
     }
 
   } catch (e) {

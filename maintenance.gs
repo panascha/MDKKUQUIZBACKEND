@@ -52,6 +52,7 @@ function autoCreateSplitCategories(questionId, categories, skipSort) {
   if (!catExists) {
     catSheet.appendRow([newSplitCatId, subjectId, newAccordionGroup, newSplitCatName]);
   }
+  let sheetsChanged = !catExists;
 
   // 6. ตรวจสอบและเพิ่มลงในแผ่นงาน Structure
   const structValues = structSheet.getDataRange().getValues();
@@ -70,11 +71,13 @@ function autoCreateSplitCategories(questionId, categories, skipSort) {
       if (structValues[i][1] === subjectId) { year = structValues[i][0]; break; }
     }
     structSheet.appendRow([year, subjectId, subjectId, newAccordionGroup]);
+    sheetsChanged = true;
   }
 
   // 7. เพิ่ม NewSplitCatId เข้าไปในคำถามนั้น (ถ้ายังไม่มี)
   const qSheet = ss.getSheetByName("Questions");
   const qData = qSheet.getDataRange().getValues();
+  let finalCats = null;
   for (let i = 1; i < qData.length; i++) {
     if (qData[i][0] === questionId) {
       let currentCats = [];
@@ -86,6 +89,7 @@ function autoCreateSplitCategories(questionId, categories, skipSort) {
         currentCats.push(newSplitCatId);
         qSheet.getRange(i + 1, 7).setValue(JSON.stringify(currentCats));
       }
+      finalCats = currentCats;
       break;
     }
   }
@@ -94,6 +98,11 @@ function autoCreateSplitCategories(questionId, categories, skipSort) {
   if (!skipSort) {
     sortCategorySheet();
   }
+
+  // ★ คืนสภาพสุดท้ายให้ผู้เรียก — ขั้นที่ 7 เขียนทับคอลัมน์ category ของคำถาม "หลังจาก"
+  //   editQuestion เขียนไปแล้ว ผู้เรียกที่ mirror ค่าที่ตัวเองส่งมาจึงได้ของเก่าเสมอ
+  //   (ผู้เรียกเดิมทั้งสี่จุดไม่ได้ใช้ค่าคืน — เพิ่มค่าคืนจึงไม่กระทบใคร)
+  return { splitCatId: newSplitCatId, finalCategories: finalCats, sheetsChanged: sheetsChanged };
 }
 
 /**

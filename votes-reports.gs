@@ -27,18 +27,30 @@ function writeAdminLog(user, role, group, type, targetId, details, oldVal, newVa
     var oldStr = (typeof oldVal === 'object') ? JSON.stringify(oldVal) : String(oldVal || "");
     var newStr = (typeof newVal === 'object') ? JSON.stringify(newVal) : String(newVal || "");
 
+    var logTime = new Date();
     sheet.appendRow([
-      new Date(), 
-      user, 
-      role, 
-      group, 
-      type, 
-      targetId, 
-      details, 
-      oldStr, 
-      newStr, 
+      logTime,
+      user,
+      role,
+      group,
+      type,
+      targetId,
+      details,
+      oldStr,
+      newStr,
       meta || ""
     ]);
+
+    // จุดเขียน log จุดเดียวของทั้งระบบ ⇒ hook ที่นี่ครอบทุก action ของแอดมิน รวม REPORT_AUTOFIX
+    // ยกเว้น POSTGRES_MIRROR_FAIL เอง ไม่งั้น mirror ที่ล้มจะพยายาม mirror ความล้มเหลวของตัวเอง
+    if (type !== 'POSTGRES_MIRROR_FAIL') {
+      sbMirrorLogRow_({
+        Timestamp: logTime.toISOString(), User: String(user || ''), Role: String(role || ''),
+        ActionGroup: String(group || ''), ActionType: String(type || ''),
+        TargetID: String(targetId || ''), Details: String(details || ''),
+        OldValue: oldStr, NewValue: newStr, Metadata: String(meta || '')
+      });
+    }
   } catch (e) { console.error("Admin Log Error: " + e.message); }
 }
 
