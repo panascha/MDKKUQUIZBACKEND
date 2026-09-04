@@ -1588,3 +1588,103 @@ function seedGeminiKey(apiKey, donorName) {
 }
 
 
+
+
+/* =========================================================
+   AI Search Overview — สรุปภาพรวมคำค้นหาเหนือผลค้นหา (REAL js/search.js)
+   คนละ tuning กับ callGeminiAI: JSON mode, ไม่มีรูป, maxOutputTokens ต่ำ (~1024)
+   ไม่ส่ง thinkingConfig เลย — flash-lite reject thinkingBudget:0 (400 INVALID_ARGUMENT)
+   และคำขนาดนี้ (~800 token in) ไม่ต้องกันงบคิด
+   คืน { ok:true, data:{summary, examPatterns[], pitfallPoints[], relatedConcepts[]}, model }
+        หรือ { ok:false, error }
+   เรียกจาก router-doPost.gs::getSearchAIOverview (lock-free — UrlFetchApp ห้ามใต้ LockService)
+   ========================================================= */
+var SEARCH_OVERVIEW_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-3.5-flash"];
+
+function callGeminiSearchOverview(keyword, examStats, questionSnippets, apiKeyInfo) {
+  if (!apiKeyInfo || !apiKeyInfo.key) {
+    return { ok: false, error: 'ระบบสรุปภาพรวมไม่พร้อมใช้งานชั่วคราว (ไม่มีโควต้า AI) กรุณาลองใหม่ภายหลัง' };
+  }
+
+  var stats = examStats || {};
+  var statLines = 'จำนวนข้อที่เจอ: ' + (stats.total || 0);
+  if (stats.years && stats.years.length) statLines += '\nปีที่ออก: ' + stats.years.join(', ');
+  if (stats.disciplines && stats.disciplines.length) statLines += '\nหมวดวิชา: ' + stats.disciplines.join(', ');
+
+  var snippetText = (questionSnippets || []).map(function (s, i) {
+    var line = (i + 1) + '. โจทย์: ' + String(s.problem || '').trim();
+    if (s.answer) line += '\n   เฉลย: ' + String(s.answer).trim();
+    if (s.explain) line += '\n   คำอธิบาย: ' + String(s.explain).trim();
+    return line;
+  }).join('\n');
+
+  var prompt =
+    'คุณคืออาจารย์แพทย์ที่ช่วยนักศึกษาแพทย์ทบทวนข้อสอบ นักศึกษาค้นหาคำว่า "' + keyword + '" ในคลังข้อสอบเก่า\n\n' +
+    'สถิติผลค้นหา:\n' + statLines + '\n\n' +
+    'ตัวอย่างข้อสอบที่เจอ:\n' + snippetText + '\n\n' +
+    'จงสรุปภาพรวมเป็นภาษาไทย ตอบเป็น JSON บรรทัดเดียวเท่านั้น (ห้ามมีข้อความอื่นนอก JSON):\n' +
+    '{"summary":"สรุปแนวคิดหลักของ ' + keyword + ' ที่ข้อสอบชุดนี้ถาม 2-3 ประโยค เน้นกลไก/พยาธิสรีรวิทยา",' +
+    '"examPatterns":["แนวการออกข้อสอบที่พบซ้ำ ข้อละ 1 บรรทัดสั้นๆ 2-4 ข้อ"],' +
+    '"pitfallPoints":["จุดที่นักศึกษามักตอบผิดหรือสับสน ข้อละ 1 บรรทัดสั้นๆ 2-4 ข้อ"],' +
+    '"relatedConcepts":["คำศัพท์/หัวข้อใกล้เคียงที่ควรค้นต่อ คำสั้นๆ 4-6 คำ"]}\n' +
+    'ห้ามแต่งข้อมูลที่ไม่มีในข้อสอบข้างต้น ถ้าข้อมูลไม่พอให้สรุปเท่าที่มี\n' +
+    // flash-lite เคยหลุด token ซีริลลิกกลางคำอังกฤษ (เช่น 'พยาธิгенesis') — กันด้วยข้อบังคับ script ตรงๆ
+    // สำรองสุดท้ายคือ sanitizeCyrillic() ใน REAL js/search.js (พรอมต์กันได้ไม่ 100%)
+    'ข้อบังคับตัวอักษร: ใช้เฉพาะอักษรไทยและอังกฤษมาตรฐาน (ASCII A-Z) เท่านั้น ' +
+    'ห้ามใช้อักษรซีริลลิก (Cyrillic) หรือ script ต่างชาติอื่นโดยเด็ดขาด\n' +
+    'ศัพท์แพทย์ภาษาอังกฤษให้เขียนเต็มคำเป็นภาษาอังกฤษทั้งคำ (เช่น "Pathogenesis" ไม่ใช่ "พยาธิgenesis") ห้ามผสมไทย-อังกฤษกลางคำเดียวกัน';
+
+  // ยึด chain ของตัวเองเสมอ ไม่ unshift apiKeyInfo.model เข้ามานำ:
+  // เมื่อ flash-lite หมดโควต้า getAvailableAIKey จะคืนโมเดล priority ดีสุดที่เหลือ (อาจเป็น 3.7-flash ตัวเต็ม)
+  // → สรุปสั้น ~300 token จะไปกินโควต้าโมเดลแพงแทน (บั๊กแบบเดียวกับที่ discussion.js/converter กันไว้)
+  var models = SEARCH_OVERVIEW_MODELS.slice();
+
+  var lastErr = '';
+  for (var mi = 0; mi < models.length && mi < 3; mi++) {
+    var model = models[mi];
+    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKeyInfo.key;
+    var payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.3, maxOutputTokens: 1024 }
+    };
+    try {
+      var resp = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
+      var code = resp.getResponseCode();
+      var body = resp.getContentText();
+      var rj; try { rj = JSON.parse(body); } catch (pe) { rj = {}; }
+
+      if (code === 200) {
+        var cand = rj.candidates && rj.candidates[0];
+        var raw = "";
+        if (cand && cand.content && cand.content.parts) {
+          cand.content.parts.forEach(function (p) { if (!p.thought && p.text) raw += p.text; });
+        }
+        if (!raw.trim()) { lastErr = 'empty (finishReason: ' + ((cand && cand.finishReason) || '?') + ')'; continue; }
+        updateAIUsage(apiKeyInfo, model); // หักโควต้าโมเดลที่ใช้จริง (อาจเป็น fallback ไม่ใช่ตัวที่เลือกตอนแรก)
+        var parsed = null;
+        try { parsed = JSON.parse(raw); } catch (je) {
+          var m = raw.match(/\{[\s\S]*\}/);
+          if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { } }
+        }
+        if (!parsed) { lastErr = 'parse_fail'; continue; }
+        return {
+          ok: true,
+          model: model,
+          data: {
+            summary: String(parsed.summary || '').trim(),
+            examPatterns: Array.isArray(parsed.examPatterns) ? parsed.examPatterns.slice(0, 5).map(String) : [],
+            pitfallPoints: Array.isArray(parsed.pitfallPoints) ? parsed.pitfallPoints.slice(0, 5).map(String) : [],
+            relatedConcepts: Array.isArray(parsed.relatedConcepts) ? parsed.relatedConcepts.slice(0, 8).map(String) : []
+          }
+        };
+      }
+      if (code === 401 || code === 403) { // key ใช้ไม่ได้ — เปลี่ยนโมเดลก็ไม่ช่วย
+        lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
+        return { ok: false, error: 'สรุปภาพรวมไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
+      }
+      if (code === 429) { handleGemini429_(apiKeyInfo, model, body, resp.getAllHeaders()); lastErr = '429'; continue; }
+      lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
+    } catch (fe) { lastErr = fe.message; }
+  }
+  return { ok: false, error: 'สรุปภาพรวมไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
+}

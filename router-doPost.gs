@@ -148,6 +148,40 @@ function doPost(e) {
       return seedIntelSphereKey(data.apiKey, data.donorName, data.notes);
     }
 
+    // AI Search Overview — สรุปภาพรวมคำค้นหา (REAL js/search.js) — lock-free
+    // login-gate ก่อน rate-limit: บังคับ session จริงเพื่อให้ bucket แยกรายคน
+    // (ถ้า fallback เป็น 'anon' guest ทั้งเว็บจะกองใน bucket เดียว 15/ชม. — bug เดียวกับที่ discussion.js กันไว้)
+    if (action === 'getSearchAIOverview') {
+      var soUser = verifyAnySession(data.sessionToken);
+      if (!soUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (!checkActionRateLimit('rl_ai_overview_', soUser.email, 15)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'คุณขอสรุปภาพรวมบ่อยเกินไป (สูงสุด 15 ครั้ง/ชั่วโมง) กรุณาลองใหม่ภายหลัง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var soKeyword = String(data.keyword || '').trim().slice(0, 100);
+      var soSnippets = Array.isArray(data.snippets) ? data.snippets.slice(0, 5) : [];
+      if (!soKeyword || soSnippets.length < 2) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ข้อมูลไม่พอสำหรับสรุปภาพรวม'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var soKeyInfo = getAvailableAIKey("Gemini", "gemini-3.5-flash-lite");
+      var soRes = callGeminiSearchOverview(soKeyword, data.stats || {}, soSnippets, soKeyInfo);
+      if (!soRes.ok) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: soRes.error
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        result: 'success', overview: soRes.data, model: soRes.model
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
     // บริจาค/ปลุก Gemini key ลง AI_Config pool (converter ใช้) — localized lock (sheet write)
     // Rate-limit by donor (session/clientId/username) ก่อน validate — กัน key-testing oracle + garbage spray
     if (action === 'seedGeminiKey') {
