@@ -320,7 +320,9 @@ function runSupabaseMirrorSweep() {
 
   // 0) คีย์ซ้ำ: ตรวจจาก snapshot ที่ถืออยู่แล้ว ไม่มีการอ่านชีทเพิ่ม และไม่แตะ failed
   //    (แถวซ้ำไม่ใช่ของค้างที่ sweep รอบหน้าจะเคลียร์ได้ ⇒ ห้ามใช้มันหยุด cursor)
-  sbWarnDupSlices_(snapshot.slices);
+  //    ครอบ try ไว้เพราะมันยืนขวางหน้าทางเขียนทั้งหมด: ถ้ามันโยน sweep จะตายก่อน
+  //    ยิงอะไรสักอย่าง แล้ว mirror จะหยุดเงียบๆ — ของแถมต้องไม่ล้มของหลัก
+  try { sbWarnDupSlices_(snapshot.slices); } catch (e) { console.error('dup scan: ' + e.message); }
 
   // 1) ลบก่อนเสมอ: ถ้า upsert วิ่งก่อนแล้ว delete ล้ม ข้อที่ลบแล้วจะโผล่กลับมาให้นักศึกษาเห็น
   if (snapshot.deletedQids.length) {
