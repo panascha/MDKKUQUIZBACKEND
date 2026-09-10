@@ -473,15 +473,155 @@ function setupSupabaseMirror() {
 }
 
 /**
- * เช็คสุขภาพ: ยิง data_version() แล้วเทียบจำนวนคำถามกับชีท
+ * นับแถวของ view ผ่าน PostgREST — ใช้ Prefer: count=exact + Range: 0-0
+ * คืนตัวเลข หรือ { error } ไม่เคย throw
+ */
+function sbCountNow_(view) {
+  var cfg = sbConfig_();
+  if (!cfg) return { error: 'no config' };
+  try {
+    // view อาจมี filter ติดมาแล้ว (เช่น 'v_categories?Status=eq.auto_created')
+    // ต่อ '?select=*' ดื้อๆ จะได้ '?' สองตัว แล้ว PostgREST อ่าน filter เพี้ยนทั้งเส้น
+    var sep = (view.indexOf('?') === -1) ? '?' : '&';
+    var res = UrlFetchApp.fetch(cfg.url + '/rest/v1/' + view + sep + 'select=*', {
+      method: 'get',
+      headers: {
+        'apikey': cfg.key,
+        'Authorization': 'Bearer ' + cfg.key,
+        'Prefer': 'count=exact',
+        'Range': '0-0'
+      },
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() >= 300) {
+      return { error: 'HTTP ' + res.getResponseCode() + ' ' + String(res.getContentText()).slice(0, 200) };
+    }
+    // GAS ให้ header มาโดยไม่รับประกันตัวพิมพ์ — กวาดหาแบบไม่สนตัวพิมพ์
+    var all = res.getAllHeaders(), cr = null;
+    for (var h in all) if (String(h).toLowerCase() === 'content-range') cr = all[h];
+    if (!cr) return { error: 'ไม่มี Content-Range' };
+    var total = String(cr).split('/')[1];
+    if (!total || total === '*') return { error: 'Content-Range ไม่มียอดรวม: ' + cr };
+    return parseInt(total, 10);
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+/**
+ * นับแถว + คีย์ซ้ำของชีทหนึ่งใบ
+ *
+ * ⚠️ คีย์ซ้ำคือจุดบอดของการเทียบ "จำนวนแถว" เฉยๆ: ชีทมี 2 แถว, PK ฝั่ง postgres
+ *    ยุบเหลือ 1 ⇒ ยอดไม่ตรงตลอดกาลและ sweep รอบถัดไปก็ไม่ช่วย เพราะไม่ใช่ของค้าง
+ *    (เจอจริง 2026-09-10: Category ซ้ำหนึ่งคู่ ⇒ ชีท 1439 / postgres 1440)
+ * คืน { rows, unique, dups[], rowsOfDup{} } หรือ { error }
+ */
+function sbSheetKeyStats_(ss, sheetName, keyHeader) {
+  var sh = ss.getSheetByName(sheetName);
+  if (!sh) return { error: 'ไม่พบชีท ' + sheetName };
+  var last = sh.getLastRow();
+  if (last < 2) return { rows: 0, unique: 0, dups: [], rowsOfDup: {} };
+
+  var values = sh.getDataRange().getValues();
+  var header = values[0], col = -1;
+  for (var i = 0; i < header.length; i++) {
+    if (String(header[i]).trim() === keyHeader) { col = i; break; }
+  }
+  if (col < 0) return { error: 'ไม่พบคอลัมน์ ' + keyHeader + ' ในชีท ' + sheetName };
+
+  // prefix กัน key ชนกับ prototype ('constructor', '__proto__', ...)
+  var seen = {}, dups = [], rowsOfDup = {}, uniq = 0;
+  for (var r = 1; r < values.length; r++) {
+    var k = String(values[r][col]).trim();
+    if (!k) continue;
+    var kk = 'k:' + k;
+    if (seen[kk]) {
+      if (dups.indexOf(k) === -1) { dups.push(k); rowsOfDup[k] = [seen[kk]]; }
+      rowsOfDup[k].push(r + 1);                       // เลขแถวจริงในชีท (1-based, มี header)
+    } else {
+      seen[kk] = r + 1;
+      uniq++;
+    }
+  }
+  return { rows: values.length - 1, unique: uniq, dups: dups, rowsOfDup: rowsOfDup };
+}
+
+/**
+ * เช็คสุขภาพ: เทียบทุก slice ที่ mirror ดูแล ระหว่างชีทกับ postgres
  * ไม่เขียนอะไรทั้งนั้น เรียกได้ทุกเมื่อ
+ *
+ * เทียบ "คีย์ไม่ซ้ำ" ไม่ใช่ "จำนวนแถว" เพราะฝั่ง postgres มี PK ⇒ แถวซ้ำในชีทยุบหายไปเสมอ
+ * Category ฝั่ง postgres มีแถว auto_created ที่ไม่มีในชีทโดยเจตนา (004 §R) จึงหักออกก่อนเทียบ
  */
 function checkSupabaseMirror() {
   if (!sbEnabled_()) { console.log('mirror ปิดอยู่ (ไม่มีคีย์)'); return; }
+
   var v = sbCallNow_('data_version', {});
   if (!v || v.error) { console.log('data_version ล้มเหลว: ' + (v && v.error)); return; }
-  var sheetCount = SpreadsheetApp.openById(SHEET_ID).getSheetByName('Questions').getLastRow() - 1;
-  console.log('postgres: ' + v.questionCount + ' ข้อ, cursor ' + v.questions);
-  console.log('sheet   : ' + sheetCount + ' ข้อ');
-  console.log(Number(v.questionCount) === sheetCount ? 'ตรงกัน' : '⚠️ ไม่ตรงกัน — รอ sweep รอบถัดไป');
+
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var bad = 0;
+
+  // ── questions: data_version() นับให้แล้ว (ไม่รวมที่ถูกลบอ่อน)
+  var qSheet = ss.getSheetByName('Questions').getLastRow() - 1;
+
+  // data_version() นับเฉพาะแถวที่ยังไม่ถูกลบอ่อน แต่ชีทยังเก็บแถวนั้นไว้และ GAS ยังเสิร์ฟอยู่
+  // ⇒ ต้องบวกกลับก่อนเทียบ ไม่งั้นรายงาน "ไม่ตรง" ตลอดกาลจนคนเลิกอ่าน
+  // (ถ้าเรียกไม่ได้ก็แค่ไม่บวก — ไม่ทำให้ check ล้ม)
+  var del = sbCountNow_('questions?deleted_at=not.is.null');
+  var delN = (del && del.error) ? 0 : Number(del) || 0;
+  var qExpected = Number(v.questionCount) + delN;
+
+  console.log('cursor  : ' + v.questions);
+  console.log('Questions      sheet ' + qSheet + ' / postgres ' + v.questionCount +
+              (delN ? ' (+ ลบอ่อน ' + delN + ' = ' + qExpected + ')' : '') +
+              (qExpected === qSheet ? '  ตรงกัน' : '  ⚠️ ไม่ตรง'));
+  if (qExpected !== qSheet) bad++;
+  if (delN) {
+    console.log('  หมายเหตุ: ' + delN + ' ข้อถูกลบอ่อนใน postgres แต่ยังอยู่ในชีท —');
+    console.log('  คนที่อ่านผ่าน Supabase จะไม่เห็น ส่วนคนที่ตกไป GAS จะยังเห็น');
+  }
+
+  // ── slice ที่เหลือ: [ชีท, view, คอลัมน์คีย์]
+  var SLICES = [
+    ['Category',      'v_categories',    'CategoryID'],
+    ['Announcements', 'v_announcements', 'Id']
+  ];
+
+  for (var i = 0; i < SLICES.length; i++) {
+    var sheetName = SLICES[i][0], view = SLICES[i][1], keyCol = SLICES[i][2];
+
+    var st = sbSheetKeyStats_(ss, sheetName, keyCol);
+    if (st.error) { console.log(sheetName + ': อ่านชีทไม่ได้ — ' + st.error); bad++; continue; }
+
+    var pg = sbCountNow_(view);
+    if (pg && pg.error) { console.log(sheetName + ': นับ ' + view + ' ไม่ได้ — ' + pg.error); bad++; continue; }
+
+    // Category: หักแถว auto_created ออก (ไม่มีต้นทางในชีท จึงไม่ควรถูกนับว่าเกิน)
+    var extra = 0;
+    if (sheetName === 'Category') {
+      var auto = sbCountNow_('v_categories?Status=eq.auto_created');
+      if (!(auto && auto.error)) extra = auto;
+    }
+
+    var expected = pg - extra;
+    var okRow = (expected === st.unique);
+    console.log(sheetName + '       sheet ' + st.rows + ' แถว / คีย์ไม่ซ้ำ ' + st.unique +
+                ' / postgres ' + pg + (extra ? ' (auto_created ' + extra + ')' : '') +
+                (okRow ? '  ตรงกัน' : '  ⚠️ ไม่ตรง'));
+    if (!okRow) bad++;
+
+    if (st.dups.length) {
+      bad++;
+      console.log('  ⚠️ คีย์ซ้ำในชีท ' + sheetName + ' ' + st.dups.length + ' คีย์ — postgres ยุบเหลือแถวเดียวเสมอ');
+      for (var d = 0; d < Math.min(st.dups.length, 10); d++) {
+        var k = st.dups[d];
+        console.log('     ' + k + ' → แถว ' + st.rowsOfDup[k].join(', '));
+      }
+      console.log('  แก้ที่ชีท: ลบแถวซ้ำให้เหลือใบเดียว แล้วรอ sweep รอบถัดไป (10 นาที)');
+    }
+  }
+
+  console.log('');
+  console.log(bad === 0 ? 'sum: OK - all slices match' : 'sum: WARN - ' + bad + ' issue(s)');
 }
