@@ -490,6 +490,9 @@ function getPriorYearAuditData(startTime) {
   var bySubject = {};
   // กลุ่มข้อสอบ = ตัวเลขรุ่น 2 หลัก + ตัวอักษรประเภท + เลขกลุ่ม(ถ้ามี) — ยอมรับส่วนขยายท้าย เช่น "_Alltopics"/"_AnatomyPhysiology" (ของจริงในชีท)
   // แต่ตัด junk suffix ที่ไม่ใช่หัวข้อจริง (_Extracted, _Modified, by AI) ออกก่อนเช็ค — ไม่งั้นจะกลายเป็นกลุ่มปลอมซ้ำ
+  // เจตนาไม่รับ "xx" (รหัสปีที่ไม่ทราบ เช่น COMMED2_xxMCQ1) — audit นี้เทียบรุ่น N กับ N-1
+  // ข้อสอบที่ไม่รู้ปีจึงเทียบไม่ได้ ต้องข้ามไป ห้ามแก้เป็น (\d{2}|xx)
+  // เพราะ parseInt("xx") = NaN แล้วจะเกิด bucket bySubject[subj][NaN] ทำให้ผลเทียบเพี้ยน
   var groupRe = /^(\d{2})_?([A-Za-z]+)(\d*)/;
   var junkSuffixRe = /_Extracted|_Modified|by AI/i;
 
