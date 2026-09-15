@@ -42,9 +42,15 @@ function aiSheetRetry_(fn) {
 }
 
 // อ่านทะเบียนโมเดลจากชีต AI_Models (สร้าง+seed อัตโนมัติถ้ายังไม่มี "หรือว่างเปล่า") — cache ต่อ 1 execution
+// + CacheService 5 นาทีข้าม execution: hot path ของทุก AI call ไม่ต้องแตะชีตทุก request
+// ทุกจุดที่เขียน AI_Models ต้องเรียก invalidateAIModelsCache_() ไม่งั้นค่าเก่าค้างได้ถึง 5 นาที
 var _aiModelRegistryCache = null;
 function getAIModelRegistry_(ss) {
   if (_aiModelRegistryCache) return _aiModelRegistryCache;
+  try {
+    var cached = CacheService.getScriptCache().get("ai_model_registry_v1");
+    if (cached) { _aiModelRegistryCache = JSON.parse(cached); return _aiModelRegistryCache; }
+  } catch (e) {}
   ss = ss || SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
   if (!sheet) sheet = ss.insertSheet(AI_MODELS_SHEET_NAME);
@@ -73,10 +79,22 @@ function getAIModelRegistry_(ss) {
   }
   models.sort(function(a, b) { return a.priority - b.priority; });
   _aiModelRegistryCache = models;
+  try { CacheService.getScriptCache().put("ai_model_registry_v1", JSON.stringify(models), 300); } catch (e) {}
   return models;
 }
 
-// เปิดชีต AI_Config โครงใหม่ (สร้าง/migrate จากโครงเดิม/เติมคอลัมน์โมเดลที่ขาด อัตโนมัติ)
+// ล้าง cache ทะเบียนโมเดลทั้ง 3 ชั้น (in-process + registry + payload ของ getAIModels)
+function invalidateAIModelsCache_() {
+  _aiModelRegistryCache = null;
+  try {
+    var c = CacheService.getScriptCache();
+    c.remove("ai_model_registry_v1");
+    c.remove("ai_models_public");
+  } catch (e) {}
+}
+
+// เปิดชีต AI_Config โครงใหม่ (สร้างถ้าไม่มี + เติมคอลัมน์โมเดลที่ขาด)
+// migrate โครงเดิมไม่ทำที่นี่แล้ว (hot path) — ย้ายไป setupAIConfigSheet (GET ?action=setupAIConfig)
 function getAIConfigSheet_(ss) {
   ss = ss || SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(AI_CONFIG_SHEET_NAME);
@@ -86,7 +104,6 @@ function getAIConfigSheet_(ss) {
       .setFontWeight("bold").setBackground("#e6f7ff");
     sheet.setFrozenRows(1);
   }
-  sheet = migrateAIConfigLegacy_(ss, sheet);
   ensureAIConfigModelColumns_(sheet, getAIModelRegistry_(ss));
   return sheet;
 }
@@ -324,8 +341,11 @@ function getAvailableAIKey(provider, preferredModel, reserveCount, avoidModels) 
     dart -= pool[k].remaining;
     if (dart <= 0) { picked = pool[k]; break; }
   }
-  // fallback chain สำหรับ converter: โมเดล Active เรียงตาม Priority จากทะเบียน
-  picked.fallbackModels = activeModels.map(function(m) { return m.model; });
+  // fallback chain: เฉพาะโมเดลที่ key นี้ยังมีโควต้าวัน (+ไม่ติด cooldown/avoid) เรียงตาม Priority
+  // (candidates ต่อแถวไล่ตาม activeModels ซึ่ง sort priority แล้ว) — กันยิงโมเดลที่ _Remaining=0 จน 429 perDay
+  picked.fallbackModels = candidates
+    .filter(function(c) { return c.key === picked.key; })
+    .map(function(c) { return c.model; });
   return picked;
 }
 
@@ -383,6 +403,11 @@ function getAIConfigStatus() {
 // คืน [{model, rpd, priority, status, notes}] ตรงจากชีต AI_Models (ไม่ sensitive → public เหมือน aiConfigStatus)
 function getAIModels() {
   function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+  // cache payload เต็ม 5 นาที (แยกจาก registry cache — ต้องใช้ Status/Notes ดิบที่ registry ทิ้งไป)
+  try {
+    var hit = CacheService.getScriptCache().get("ai_models_public");
+    if (hit) return ContentService.createTextOutput(hit).setMimeType(ContentService.MimeType.JSON);
+  } catch (e) {}
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(AI_MODELS_SHEET_NAME);
   if (!sheet) return out({ result: 'error', message: 'AI_Models not found' });
@@ -394,7 +419,9 @@ function getAIModels() {
     rows.push({ model: name, rpd: data[i][1], priority: data[i][2],
                 status: String(data[i][3] || "").trim(), notes: String(data[i][4] || "") });
   }
-  return out({ result: 'success', models: rows });
+  var payload = JSON.stringify({ result: 'success', models: rows });
+  try { CacheService.getScriptCache().put("ai_models_public", payload, 300); } catch (e) {}
+  return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
 }
 
 // Admin write — POST action=setModelRpd {model, rpd?, priority?} (P2-Q1/Q5: RPD = human go-live gate; P2-Q7: priority override)
@@ -430,7 +457,7 @@ function setModelRpd(model, rpd, priority) {
     if (hasPrio) sheet.getRange(row, 3).setValue(prioN); // col 3 = Priority
   });
   SpreadsheetApp.flush();
-  _aiModelRegistryCache = null; // registry re-read เห็น limit/priority ใหม่
+  invalidateAIModelsCache_(); // registry re-read เห็น limit/priority ใหม่ (รวม cache ข้าม execution)
   var backfilled = 0;
   try {
     var cfg = getAIConfigSheet_(ss); // ensureAIConfigModelColumns_ ในตัว → คอลัมน์ _Remaining มีแน่
@@ -525,13 +552,19 @@ function isSyncableGeminiModel_(m) {
      rank fail-safe  : "auto-discovered <date> needs-manual-priority"
    ========================================================= */
 
-// parse "gemini-X.Y-<tier>" → {tierRank, major, minor} หรือ null (curveball: preview/latest/date/-8b/customtools)
+// Tier bucket ของ Priority (index = tierRank): flash 0-19 / flash-lite 20-39 / pro 40-59
+var AI_TIER_BUCKET_BASES_ = [0, 20, 40];
+var AI_TIER_UNCLASSIFIED_BASE_ = 60; // fail-safe band (parse ไม่ได้/rank ชน) — อยู่นอกทุก tier จริงเสมอ
+
+// parse "gemini-X[.Y]-<tier>[-suffix]" → {tierRank, major, minor} หรือ null
+// suffix (preview/date/-8b/customtools) parse ได้แล้ว → rank เท่ากับ id ฐาน; minor ไม่มี = 0
 // flash-lite ต้องมาก่อน flash ใน alternation ไม่งั้น lite ไปแมตช์ prefix "flash"
 function _parseGeminiRank_(id) {
-  var m = String(id || "").match(/^gemini-(\d+)\.(\d+)-(flash-lite|flash|pro)$/);
+  var m = String(id || "").match(/^gemini-(\d+(?:\.\d+)?)-(flash-lite|flash|pro)(?:-.*)?$/i);
   if (!m) return null;
-  var tierRank = { "flash": 0, "flash-lite": 1, "pro": 2 }[m[3]];
-  return { tierRank: tierRank, major: parseInt(m[1], 10), minor: parseInt(m[2], 10) };
+  var ver = m[1].split(".");
+  var tierRank = { "flash": 0, "flash-lite": 1, "pro": 2 }[m[2].toLowerCase()];
+  return { tierRank: tierRank, major: parseInt(ver[0], 10), minor: ver.length > 1 ? parseInt(ver[1], 10) : 0 };
 }
 
 // เทียบ 2 rank key: คืน <0 ถ้า a ดีกว่า (ลองก่อน = priority number น้อยกว่า)
@@ -542,30 +575,54 @@ function _cmpGeminiRank_(a, b) {
   return b.minor - a.minor;
 }
 
-// P2-Q3 insert-without-renumber: คืน {priority} ให้ id ใหม่ตามตำแหน่ง sort-key เทียบ workingRegistry
-// (existing non-Deprecated + ตัวที่เพิ่ง place รอบนี้), หรือ null → fail-safe (worst + needs-manual-priority)
-// workingRegistry: [{id, priority}]. ไม่แตะ priority เดิม (เคารพ hand-tuning + monotonic lock)
+// Tier-bucketed placement: priority = ฐาน tier + จำนวนตัวใน tier เดียวกันที่ใหม่กว่า (workingRegistry)
+// หรือ null → fail-safe (parse ไม่ได้ / rank ชนพอดี = id ซ้ำหรือ alias) → needs-manual-priority
+// workingRegistry: [{id, priority}]. เป็นแค่ตำแหน่งตั้งต้น — reindexGeminiModelPriorities_ จัด tier ใหม่ท้าย reconcile
 function assignDiscoveredPriority_(id, workingRegistry) {
   var key = _parseGeminiRank_(id);
   if (!key) return null; // unparseable → fail-safe
-  var allPrios = [], better = [], worse = [];
+  var betterCount = 0;
   for (var i = 0; i < (workingRegistry || []).length; i++) {
-    var p = parseInt(workingRegistry[i].priority, 10);
-    if (isNaN(p)) continue;
-    allPrios.push(p);
     var rk = _parseGeminiRank_(workingRegistry[i].id);
-    if (!rk) continue; // แถวเดิมที่ parse ไม่ได้ — กินสล็อต priority แต่เทียบ sort-key ไม่ได้
+    if (!rk || rk.tierRank !== key.tierRank) continue;
     var c = _cmpGeminiRank_(rk, key);
-    if (c < 0) better.push(p);        // เดิมดีกว่า → ใหม่อยู่ต่อท้าย (priority มากกว่า)
-    else if (c > 0) worse.push(p);    // เดิมแย่กว่า → ใหม่อยู่ก่อน (priority น้อยกว่า)
-    else return null;                 // rank ชนพอดี (id ซ้ำ?) → fail-safe
+    if (c < 0) betterCount++;         // เดิมใหม่กว่า → ใหม่อยู่ถัดลงไป
+    else if (c === 0) return null;    // rank ชนพอดี (id ซ้ำ?) → fail-safe
   }
-  if (allPrios.length === 0) return { priority: 1 };
-  if (better.length === 0) return { priority: Math.min.apply(null, allPrios) - 1 }; // flagship
-  if (worse.length === 0) return { priority: Math.max.apply(null, allPrios) + 1 };  // ท้ายสุด
-  var prevPrio = Math.max.apply(null, better), nextPrio = Math.min.apply(null, worse);
-  if (prevPrio + 1 >= nextPrio) return null; // ไม่มีช่อง integer → fail-safe
-  return { priority: Math.floor((prevPrio + nextPrio) / 2) };
+  return { priority: AI_TIER_BUCKET_BASES_[key.tierRank] + betterCount };
+}
+
+// จัด Priority ใหม่ทั้งทะเบียนแบบ tier-bucket: ต่อ tier เรียง newer-first → ฐาน tier + ลำดับ
+// ข้าม Deprecated และ id ที่ parse ไม่ได้ (คง Priority เดิม — สัญญาเดียวกับ needs-manual-priority)
+// หมายเหตุ: priority ที่ตั้งมือผ่าน setModelRpd จะถูกทับรอบ reconcile ถัดไป (ตั้งใจ — registry ต้องสะอาด)
+// คืนจำนวน cell ที่เปลี่ยน
+function reindexGeminiModelPriorities_(sheet) {
+  var data = sheet.getDataRange().getValues();
+  var colPrio = 2, colStatus = 3; // [Model, RPD_Limit, Priority, Status, Notes]
+  var tiers = [[], [], []];
+  for (var i = 1; i < data.length; i++) {
+    var name = String(data[i][0] || "").trim();
+    if (!name || String(data[i][colStatus] || "").trim() === "Deprecated") continue;
+    var rk = _parseGeminiRank_(name);
+    if (!rk) continue;
+    tiers[rk.tierRank].push({ row: i + 1, rank: rk, prio: parseInt(data[i][colPrio], 10) });
+  }
+  var changes = [];
+  tiers.forEach(function(list, t) {
+    if (list.length >= 20) console.warn("[reindexGemini] tier " + t + " มี " + list.length + " แถว — priority ล้นเข้า band tier ถัดไป");
+    // rank เท่ากัน (suffix variant ข้าง id ฐาน) → คงลำดับแถวในชีต
+    list.sort(function(a, b) { return _cmpGeminiRank_(a.rank, b.rank) || (a.row - b.row); });
+    list.forEach(function(e, idx) {
+      var want = AI_TIER_BUCKET_BASES_[t] + idx;
+      if (e.prio !== want) changes.push({ row: e.row, prio: want });
+    });
+  });
+  changes.forEach(function(ch) {
+    aiSheetRetry_(function() { sheet.getRange(ch.row, colPrio + 1).setValue(ch.prio); });
+  });
+  if (changes.length) SpreadsheetApp.flush();
+  invalidateAIModelsCache_();
+  return changes.length;
 }
 
 // Discovery + three-way reconcile (Q1/Q2) — GET ?action=reconcileGeminiModels
@@ -616,8 +673,8 @@ function reconcileGeminiModels() {
   pending.forEach(function(m) {
     var r = assignDiscoveredPriority_(m.id, workingRegistry);
     var prio, notes;
-    if (r === null) { // fail-safe: worst priority + flag ให้ owner ตั้งเอง
-      maxPrio += 1; prio = maxPrio;
+    if (r === null) { // fail-safe: worst priority (นอก band tier จริง) + flag ให้ owner ตั้งเอง
+      prio = Math.max(maxPrio + 1, AI_TIER_UNCLASSIFIED_BASE_); maxPrio = prio;
       notes = "auto-discovered " + today + " needs-manual-priority";
     } else {
       prio = r.priority;
@@ -643,10 +700,14 @@ function reconcileGeminiModels() {
   });
   if (deprecated.length) SpreadsheetApp.flush();
 
+  // (2b) re-index priority ทั้งทะเบียนเป็น tier bucket — อยู่ในตัว reconcile เอง (ไม่ใช่แค่ daily wrapper)
+  // เพราะ reconcile ถูกเรียกมือได้ตรงๆ: ถ้าไม่ reindex แถวเก่าที่ priority ยังไม่ bucket จะชนกับแถวใหม่
+  var reindexed = reindexGeminiModelPriorities_(sheet);
+
   // (3) เติมคอลัมน์ <model>_Remaining สำหรับ registry ใหม่ (append-only ที่ getLastColumn()+1)
   var colsBefore = null, colsAfter = null;
   try {
-    _aiModelRegistryCache = null; // reset cache → re-read หลัง mutate แถว
+    invalidateAIModelsCache_(); // reset cache → re-read หลัง mutate แถว
     var cfg = ss.getSheetByName(AI_CONFIG_SHEET_NAME);
     colsBefore = cfg.getLastColumn();
     ensureAIConfigModelColumns_(cfg, getAIModelRegistry_(ss));
@@ -654,7 +715,7 @@ function reconcileGeminiModels() {
   } catch (e) { /* คอลัมน์เติมรอบหน้าได้ ไม่ critical */ }
 
   return out({ result: 'success', liveTotal: live.length, appendable: appendable.length,
-               added: added, deprecated: deprecated, leftUnchanged: leftCount,
+               added: added, deprecated: deprecated, leftUnchanged: leftCount, reindexed: reindexed,
                configColsBefore: colsBefore, configColsAfter: colsAfter });
 }
 
@@ -684,7 +745,7 @@ function parseGemini429_(body, headers) {
     var ra = headers["Retry-After"] || headers["retry-after"];
     if (ra) retrySec = parseInt(ra, 10) || 0;
   }
-  if (!retrySec || retrySec < 1) retrySec = 60;   // ไม่มีสัญญาณ → default 60s
+  if (!retrySec || retrySec < 1) retrySec = 45;   // ไม่มีสัญญาณ → default 45s
   return { metric: metric, retrySec: retrySec };
 }
 
@@ -710,6 +771,32 @@ function handleGemini429_(apiKeyInfo, model, body, headers) {
   }
   setModelCooldown_(apiKeyInfo.key, model, p.retrySec);      // perMinute/unknown → cooldown, ไม่แตะโควต้าวัน
   return { action: 'cooldown', metric: p.metric, retrySec: p.retrySec };
+}
+
+/* =========================================================
+   Model-wide circuit breaker — ระดับโมเดล (ทุก key) แยกจาก RPD/RPM ที่เป็นระดับ (key, model)
+   เปิดเฉพาะ 503 หรือ 5xx ที่ body บอก overloaded/UNAVAILABLE — ไม่เปิดบน 500/502 เฉยๆ เพราะ Gemini
+   คืน 500 INTERNAL กับ payload เสียเฉพาะ request ได้ (PDF/รูปพัง) → คนเดียวจะปิดโมเดลให้ทุกคน 120s
+   อายุ 60→120s (streak) ±20% jitter; success ครั้งถัดไปล้าง streak
+   ========================================================= */
+function _modelDownCacheKey_(model) { return "model_down:" + model; }
+function _modelDownStreakKey_(model) { return "model_down_streak:" + model; }
+function markModelUnavailable_(model) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var streak = Math.min((parseInt(cache.get(_modelDownStreakKey_(model)), 10) || 0) + 1, 4);
+    var base = Math.min(60 * Math.pow(2, streak - 1), 120);       // 60, 120, 120, 120...
+    var ttl = Math.floor(base * (0.8 + Math.random() * 0.4));      // ±20% jitter
+    cache.put(_modelDownStreakKey_(model), String(streak), 600);   // จำ streak 10 นาที
+    cache.put(_modelDownCacheKey_(model), "1", ttl);
+  } catch (e) { console.warn("markModelUnavailable_ failed: " + e.message); }
+}
+function clearModelUnavailable_(model) {
+  try { CacheService.getScriptCache().remove(_modelDownStreakKey_(model)); } catch (e) {}
+}
+function isModelDown_(model) {
+  try { return CacheService.getScriptCache().get(_modelDownCacheKey_(model)) !== null; }
+  catch (e) { return false; }
 }
 
 // Verify action — GET ?action=verifyRpmCooldown
@@ -821,10 +908,12 @@ function enableGeminiModel(modelParam) {
   if (!t.pass) {
     aiSheetRetry_(function() { sheet.getRange(row, notesCol + 1).setValue("tool-incapable: " + t.reason + " (" + today + ")"); });
     SpreadsheetApp.flush();
+    invalidateAIModelsCache_();
     return out({ result: 'refused', model: model, reason: t.reason });
   }
   aiSheetRetry_(function() { sheet.getRange(row, statusCol + 1).setValue("Active"); });
   SpreadsheetApp.flush();
+  invalidateAIModelsCache_();
   return out({ result: 'success', model: model, enabled: true, note: 'ตั้ง RPD_Limit > 0 เพื่อเริ่ม serve (Q1 human-confirmed)' });
 }
 
@@ -882,6 +971,7 @@ function activateDisabledGeminiModels() {
     activated.push(model + " (RPD=" + rpd + ", backfilled " + filled + " keys" + (remCol < 0 ? ", NO _Remaining col — serves next reset" : "") + ")");
   }
   SpreadsheetApp.flush();
+  invalidateAIModelsCache_();
   var summary = { result: 'success', activated: activated, refused: refused, transient: transient, skipped: skipped };
   console.log("[activateDisabled] " + JSON.stringify(summary));
   return summary;
@@ -1019,6 +1109,7 @@ function runGeminiToolProbe() {
     console.warn("[geminiProbe] " + name + " → Deprecated: " + t.reason);
   }
   SpreadsheetApp.flush();
+  invalidateAIModelsCache_();
   console.log("[geminiProbe] checked=" + checked + " enabled=" + enabled + " refused=" + refused
     + " deprecated=" + deprecated + " skippedTransient=" + skipped);
   return { checked: checked, enabled: enabled, refused: refused, deprecated: deprecated, skippedTransient: skipped, results: results };
@@ -1096,6 +1187,7 @@ function purgeFakeGeminiModelRows() {
     if (FAKE[name]) { sheet.deleteRow(i + 1); removed.push(name); }
   }
   SpreadsheetApp.flush();
+  invalidateAIModelsCache_();
   return out({ result: 'success', removed: removed, rowsLeft: sheet.getLastRow() - 1 });
 }
 
@@ -1133,6 +1225,8 @@ function setupAIConfigSheet() {
   if (cfg) {
     var h = cfg.getRange(1, 1, 1, Math.max(cfg.getLastColumn(), 1)).getValues()[0];
     legacy = h.indexOf("Last_Reset_Date") < 0;
+    // migrate/กู้ header junk ทำที่นี่ที่เดียว (ย้ายออกจาก getAIConfigSheet_ ที่เป็น hot path)
+    migrateAIConfigLegacy_(ss, cfg);
   }
   var sheet = getAIConfigSheet_(ss);
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -1146,13 +1240,117 @@ function setupAIConfigSheet() {
 }
 
 
+/* =========================================================
+   Resilient Gemini runner — กลไก retry / model fallback / circuit breaker ชุดเดียว
+   ทุก wrapper (callGeminiAI / SlipOCR / Converter / SearchOverview) สร้าง prompt+payload และ return contract ของตัวเอง
+   หักโควต้า (updateAIUsage) ที่ engine จุดเดียว — wrapper ห้ามเรียกซ้ำ ไม่งั้น 1 call กิน 2 RPD
+   ========================================================= */
+
+// ยิง generateContent 1 ครั้ง (v1beta เสมอ — รองรับ Thinking/Grounding) แล้วจำแนกผล:
+//   ok · fatal (401/403/code อื่น/exception — key ใช้ไม่ได้) · quota (429) · overloaded (503 / 5xx ที่บอก overloaded)
+//   · nextModel (404/500/502) · ไม่มี flag (400/คำตอบว่าง/JSON parse ไม่ได้ → ลอง variant ถัดไป)
+function geminiFetchOnce_(model, apiKey, payload, expectJson) {
+  var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
+  try {
+    var resp = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
+    var code = resp.getResponseCode();
+    var body = resp.getContentText();
+    var rj; try { rj = JSON.parse(body); } catch (pe) { rj = {}; }
+
+    if (code === 200) {
+      var cand = rj.candidates && rj.candidates[0];
+      var text = "";
+      if (cand && cand.content && cand.content.parts) {
+        cand.content.parts.forEach(function (p) { if (!p.thought && p.text) text += p.text; });
+      }
+      // usageMetadata = หลักฐานเดียวที่แยกออกว่า "ข้อหาย" เพราะอะไร (converter ส่งต่อให้ client):
+      //   outputTokens ต่ำ + finishReason STOP  → โมเดลออกข้อไม่ครบเอง (ไม่ใช่ถูกตัด)
+      //   finishReason MAX_TOKENS               → คำตอบถูกตัดจริง
+      //   thoughtTokens สูงทั้งที่สั่ง thinkingBudget:0 → โมเดลเมิน thinkingBudget แล้วกินโควต้า output ไป
+      var um = rj.usageMetadata || {};
+      var tc = payload.generationConfig && payload.generationConfig.thinkingConfig;
+      var thinkingOff = !!(tc && tc.thinkingBudget === 0);
+      var usage = {
+        promptTokens: um.promptTokenCount || 0,
+        outputTokens: um.candidatesTokenCount || 0,
+        thoughtTokens: um.thoughtsTokenCount || 0,
+        totalTokens: um.totalTokenCount || 0,
+        thinkingRequestedOff: thinkingOff,
+        thinkingIgnored: thinkingOff && (um.thoughtsTokenCount || 0) > 0
+      };
+      var fr = (cand && cand.finishReason) || "";
+      if (!text.trim()) {
+        // silent-empty (เจอได้กับ JSON mode + thinkingBudget:0 บางรุ่น) → ให้ engine ลอง variant/โมเดลถัดไป
+        return { ok: false, error: "คำตอบว่าง (finishReason: " + (fr || "NO_CONTENT") + ")", recitation: fr === "RECITATION", usage: usage };
+      }
+      var json = null;
+      if (expectJson) {
+        try { json = JSON.parse(text); } catch (je) {
+          var m = text.match(/\{[\s\S]*\}/);
+          if (m) { try { json = JSON.parse(m[0]); } catch (e2) { } }
+        }
+        if (!json) return { ok: false, error: "parse_fail", usage: usage };
+      }
+      return { ok: true, text: text, json: json, finishReason: fr || "STOP", usage: usage };
+    }
+
+    var msg = (rj.error && rj.error.message) || ("HTTP " + code);
+    if (code === 429) return { ok: false, error: msg, quota: true, body: body, headers: resp.getAllHeaders() };
+    // regex overloaded เช็คเฉพาะ 5xx — 4xx ที่มีคำว่า unavailable (เช่น region) ไม่ใช่สัญญาณให้ทุกคนถอย
+    if (code === 503 || (code >= 500 && /overloaded|UNAVAILABLE/i.test(body))) return { ok: false, error: msg, overloaded: true };
+    if (code === 404 || code >= 500) return { ok: false, error: msg, nextModel: true };
+    if (code === 400) return { ok: false, error: msg }; // เช่น reject thinkingConfig → variant ถัดไป
+    return { ok: false, error: msg, fatal: true };
+  } catch (e) {
+    return { ok: false, error: e.message, fatal: true };
+  }
+}
+
+// engine: เดิน modelChain × thinking variants จนสำเร็จ / fatal / ครบ maxAttempts / งบเวลาใกล้หมด
+// cfg = { apiKeyInfo, modelChain, buildPayload(model, variantFlag), tryThinkingVariants, expectJson, maxAttempts, onRecitation }
+// คืน { ok:true, text, json, finishReason, usage, model } หรือ { ok:false, error, reason:'fatal'|'max-attempts'|'exec-budget'|'chain-end' }
+// pass 0 เคารพ breaker (ข้ามโมเดล down/cooling) · pass 1 รันเฉพาะเมื่อ pass 0 ไม่ได้ยิงเลยสักครั้ง:
+// breaker เป็น load-shedding ไม่ใช่ประตูปิดตาย — งาน batch (report-vote auto-apply, verify-questions) ไม่มีคนกด retry
+// จึงห้ามอดตายเพราะ cache บอกว่าทั้ง chain ไม่ healthy → ยิงจริงอีกรอบให้ response ตัดสิน
+function executeGeminiWithAutoFallback_(cfg) {
+  var models = (cfg.modelChain || []).filter(function (m, i, a) { return m && a.indexOf(m) === i; });
+  var attempts = 0, lastErr = "", anyAttempted = false;
+  for (var pass = 0; pass < 2 && !anyAttempted; pass++) {
+    for (var mi = 0; mi < models.length; mi++) {
+      var model = models[mi];
+      if (pass === 0 && isModelDown_(model)) { lastErr = model + ": circuit-open"; continue; }
+      if (pass === 0 && isModelCoolingDown_(cfg.apiKeyInfo.key, model)) { lastErr = model + ": rpm-cooldown"; continue; }
+      var variants = cfg.tryThinkingVariants ? [true, false] : [false];
+      for (var vi = 0; vi < variants.length; vi++) {
+        if (attempts >= cfg.maxAttempts) return { ok: false, error: lastErr, reason: 'max-attempts' };
+        if (execBudgetExhausted_()) return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget' };
+        attempts++; anyAttempted = true;
+        var r = geminiFetchOnce_(model, cfg.apiKeyInfo.key, cfg.buildPayload(model, variants[vi]), cfg.expectJson);
+        if (r.ok) {
+          clearModelUnavailable_(model);
+          // หักโควต้าจุดเดียว (โมเดลที่ใช้จริง อาจเป็น fallback) — write พังห้ามทิ้งคำตอบที่ได้มาแล้ว
+          try { updateAIUsage(cfg.apiKeyInfo, model); } catch (ue) { console.warn("updateAIUsage failed: " + ue.message); }
+          return { ok: true, text: r.text, json: r.json, finishReason: r.finishReason, usage: r.usage, model: model };
+        }
+        lastErr = model + ": " + r.error;
+        if (r.fatal) return { ok: false, error: lastErr, reason: 'fatal' };
+        if (r.overloaded) { markModelUnavailable_(model); break; }
+        if (r.quota) { handleGemini429_(cfg.apiKeyInfo, model, r.body, r.headers); break; } // perDay→zero, perMinute/unknown→cooldown
+        if (r.nextModel) break;
+        if (r.recitation) { if (cfg.onRecitation) cfg.onRecitation(); break; }
+        // อื่นๆ (400/คำตอบว่าง/parse_fail) → variant ถัดไปของโมเดลเดิม; หมด variant → โมเดลถัดไป
+      }
+    }
+  }
+  return { ok: false, error: lastErr || 'no models available', reason: 'chain-end' };
+}
+
 /**
  * ฟังก์ชันหลักในการเรียก Gemini API พร้อมระบบ Google Search Grounding และรับส่งไฟล์รูปภาพ
+ * chain: โมเดลที่ getAvailableAIKey เลือก (เคารพ preferredModel ของผู้เรียก เช่น chatbot = flash-lite) นำหน้า
+ * แล้วตกตามทะเบียน priority (fallbackModels) — contract เดิม: คืน string หรือ throw
  */
 function callGeminiAI(prompt, apiKeyInfo, images) {
-  // ใช้ v1beta เสมอเพื่อรองรับฟีเจอร์ Google Search Grounding และ Thinking ในการอัปเดตเกณฑ์การรักษาล่าสุด
-  var apiVersion = 'v1beta';
-  var url = "https://generativelanguage.googleapis.com/" + apiVersion + "/models/" + apiKeyInfo.model + ":generateContent?key=" + apiKeyInfo.key;
   
   var parts = [{ "text": prompt }];
   
@@ -1202,65 +1400,36 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
     });
   }
   
-  var payload = {
-    "contents": [{
-      "parts": parts
-    }],
-    "systemInstruction": {
-      "parts": [{ "text": "You are a Medical Education Expert. Focus on Pathophysiology and Clinical Reasoning. If you need to verify medical guidelines (like AHA, GINA, GOLD, KDIGO) to formulate the response, use the search tool to find the most accurate and up-to-date recommendations." }]
+  var chain = [apiKeyInfo.model].concat(apiKeyInfo.fallbackModels || []);
+  // ผู้เรียกปักหมุด flash-lite (chatbot ปริมาณสูง) → fallback อยู่ใน tier lite เท่านั้น
+  // ไม่ไหลไปกินโควต้า full flash (20 RPD/key) ที่ converter ต้องใช้
+  if (/flash-lite/i.test(apiKeyInfo.model)) chain = chain.filter(function (m) { return /flash-lite/i.test(m); });
+  var r = executeGeminiWithAutoFallback_({
+    apiKeyInfo: apiKeyInfo,
+    modelChain: chain,
+    // variant true = ส่ง thinkingConfig includeThoughts (แบบเดิม) ; false = ไม่ส่ง thinkingConfig (สำรองกรณีรุ่นนั้นตอบ 400/ว่าง)
+    buildPayload: function (model, withThinkingCfg) {
+      var genCfg = { "temperature": 1.0, "maxOutputTokens": 8192 };
+      if (withThinkingCfg) genCfg.thinkingConfig = { "includeThoughts": true }; // เปิดใช้งาน Thinking ในการประเมินวิเคราะห์ข้อสอบ
+      return {
+        "contents": [{
+          "parts": parts
+        }],
+        "systemInstruction": {
+          "parts": [{ "text": "You are a Medical Education Expert. Focus on Pathophysiology and Clinical Reasoning. If you need to verify medical guidelines (like AHA, GINA, GOLD, KDIGO) to formulate the response, use the search tool to find the most accurate and up-to-date recommendations." }]
+        },
+        // "tools": [{
+        //   "google_search": {} // เปิดใช้งานระบบสืบค้นข้อมูล Google Search Grounding ของจริง
+        // }],
+        "generationConfig": genCfg
+      };
     },
-    // "tools": [{
-    //   "google_search": {} // เปิดใช้งานระบบสืบค้นข้อมูล Google Search Grounding ของจริง
-    // }],
-    "generationConfig": {
-      "temperature": 1.0, 
-      "maxOutputTokens": 8192,
-      "thinkingConfig": {
-        "includeThoughts": true // เปิดใช้งาน Thinking ในการประเมินวิเคราะห์ข้อสอบ
-      }
-    }
-  };
-  
-  var options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
-  };
-
-  try {
-    var response = UrlFetchApp.fetch(url, options);
-    var resJson = JSON.parse(response.getContentText());
-    
-    if (response.getResponseCode() == 200) {
-      var candidate = resJson.candidates && resJson.candidates[0];
-      if (candidate && candidate.content && candidate.content.parts) {
-        updateAIUsage(apiKeyInfo, apiKeyInfo.model);
-
-        // กรองเอาเฉพาะเนื้อหาคำตอบจริง (ข้ามส่วนที่เป็นกระบวนการคิดหรือ "thought": true)
-        var respParts = candidate.content.parts;
-        var aiText = "";
-        for (var i = 0; i < respParts.length; i++) {
-          if (!respParts[i].thought && respParts[i].text) {
-            aiText += respParts[i].text;
-          }
-        }
-        if (!aiText.trim()) {
-          var finishReason = candidate.finishReason || "UNKNOWN";
-          throw new Error("AI ไม่ส่งคำตอบกลับมา (finishReason: " + finishReason + ")");
-        }
-        return aiText.trim();
-      } else {
-        var finishReason = (resJson.candidates && resJson.candidates[0] && resJson.candidates[0].finishReason) || "NO_CONTENT";
-        throw new Error("Gemini ไม่ส่งเนื้อหากลับมา (finishReason: " + finishReason + ")");
-      }
-    } else {
-      var errorMsg = resJson.error ? resJson.error.message : "Unknown error";
-      throw new Error("Gemini Error: " + errorMsg);
-    }
-  } catch (e) {
-    throw new Error("AI Assistant Error: " + e.message);
-  }
+    tryThinkingVariants: true,
+    expectJson: false,
+    maxAttempts: 3 // chatbot มีผู้ใช้รอสด — เพดานต่ำ; execBudgetExhausted_ เป็น backstop
+  });
+  if (!r.ok) throw new Error("AI Assistant Error: " + r.error);
+  return r.text.trim();
 }
 
 /* =========================================================
@@ -1295,55 +1464,25 @@ function callGeminiForSlipOCR(dataUrl) {
   var models = SLIP_OCR_MODELS.slice();
   if (apiKeyInfo.model && models.indexOf(apiKeyInfo.model) < 0) models.unshift(apiKeyInfo.model);
 
-  var lastErr = '';
-  for (var mi = 0; mi < models.length && mi < 3; mi++) {
-    var model = models[mi];
-    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKeyInfo.key;
+  var r = executeGeminiWithAutoFallback_({
+    apiKeyInfo: apiKeyInfo,
+    modelChain: models.slice(0, 3),
     // variant true = ส่ง thinkingBudget:0 (กันคิดยาวกินโควต้า output 2048) ; false = ไม่ส่ง thinkingConfig
     // บางรุ่น (เช่น gemini-3.5-flash-lite) reject thinkingBudget:0 → 400 "Request contains an invalid argument"
-    // จึงมี variant สำรองเหมือน tryConverterCall_ แทนการ break ทิ้งทั้งโมเดลบน 400
-    var variants = [true, false];
-    for (var vi = 0; vi < variants.length; vi++) {
+    buildPayload: function (model, disableThinking) {
       var genCfg = { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 2048 };
-      if (variants[vi]) genCfg.thinkingConfig = { thinkingBudget: 0 };
-      var payload = {
+      if (disableThinking) genCfg.thinkingConfig = { thinkingBudget: 0 };
+      return {
         contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: imgMime, data: imgB64 } }] }],
         generationConfig: genCfg
       };
-      try {
-        var resp = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
-        var code = resp.getResponseCode();
-        var body = resp.getContentText();
-        var rj; try { rj = JSON.parse(body); } catch (pe) { rj = {}; }
-        if (code === 200) {
-          var cand = rj.candidates && rj.candidates[0];
-          var raw = "";
-          if (cand && cand.content && cand.content.parts) {
-            cand.content.parts.forEach(function (p) { if (!p.thought && p.text) raw += p.text; });
-          }
-          // ว่าง (เจอได้กับ thinkingBudget:0 บางรุ่น) → ลอง variant ไม่ส่ง thinkingConfig ก่อนตกโมเดลถัดไป
-          if (!raw.trim()) { lastErr = 'empty (finishReason: ' + ((cand && cand.finishReason) || '?') + ')'; continue; }
-          updateAIUsage(apiKeyInfo, model); // หักโควต้าโมเดลที่ใช้จริง
-          var parsed = null;
-          try { parsed = JSON.parse(raw); } catch (je) {
-            var m = raw.match(/\{[\s\S]*\}/);
-            if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { } }
-          }
-          if (!parsed) { lastErr = 'parse_fail'; continue; }
-          return { ok: true, data: parsed, model: model };
-        }
-        if (code === 401 || code === 403) { // key ใช้ไม่ได้ — เปลี่ยนโมเดล/variant ก็ไม่ช่วย
-          lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
-          return { ok: false, error: 'อ่านสลิปไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
-        }
-        if (code === 429) { handleGemini429_(apiKeyInfo, model, body, resp.getAllHeaders()); lastErr = '429'; break; } // → โมเดลถัดไป
-        if (code === 404 || code >= 500) { lastErr = 'HTTP ' + code; break; } // ไม่มีรุ่น/overloaded → โมเดลถัดไป
-        // 400 — เช่น reject thinkingConfig → วน variant ไม่ส่ง thinkingConfig ; หมด variant แล้วตกไปโมเดลถัดไป
-        lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
-      } catch (fe) { lastErr = fe.message; }
-    }
-  }
-  return { ok: false, error: 'อ่านสลิปไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
+    },
+    tryThinkingVariants: true,
+    expectJson: true,
+    maxAttempts: 6 // 3 โมเดล × 2 variant (เพดานเดิม)
+  });
+  if (r.ok) return { ok: true, data: r.json, model: r.model };
+  return { ok: false, error: 'อ่านสลิปไม่สำเร็จ (' + r.error + ') กรุณาลองใหม่ภายหลัง' };
 }
 
 
@@ -1380,45 +1519,7 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     throw new Error("แปลงไม่สำเร็จ: โควต้าโมเดล flash เต็มแล้ว (ตัวแปลง PDF ไม่ใช้ flash-lite) กรุณาลองใหม่ภายหลัง");
   }
 
-  var attempts = 0;
-  var lastErr = "";
-  var convTemp = 0.1; // ถูก bump เป็น 0.8 เมื่อเจอ RECITATION — temp ต่ำทำให้ retry ซ้ำผลเดิมเป๊ะ
-  for (var mi = 0; mi < models.length; mi++) {
-    // ลองแบบปิด thinking ก่อน (thinkingBudget:0) — บางรุ่น reject หรือคืนคำตอบว่าง จึงมี variant ไม่ส่ง thinkingConfig สำรอง
-    var variants = [true, false];
-    for (var vi = 0; vi < variants.length; vi++) {
-      if (attempts >= CONVERTER_MAX_ATTEMPTS) {
-        throw new Error("แปลงไม่สำเร็จ (ครบจำนวนครั้งที่ลองได้): " + lastErr + converterErrHint_(lastErr));
-      }
-      attempts++;
-      var res = tryConverterCall_(prompt, apiKeyInfo.key, models[mi], variants[vi], pdfB64, images, convTemp);
-      if (res.ok) {
-        updateAIUsage(apiKeyInfo, models[mi]); // หักโควต้าโมเดลที่ใช้จริง (อาจเป็น fallback ไม่ใช่ตัวที่เลือกตอนแรก)
-        return { raw: res.raw, finishReason: res.finishReason, model: models[mi], usage: res.usage || null };
-      }
-      lastErr = models[mi] + ": " + res.error;
-      if (res.fatal) throw new Error("แปลงไม่สำเร็จ: " + lastErr);
-      // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp แล้วข้ามไปโมเดลถัดไปเลย
-      if (res.recitation) { convTemp = 0.8; break; }
-      if (res.quota) handleGemini429_(apiKeyInfo, models[mi], res.body429, res.headers429); // 429: perDay→zero, perMinute/unknown→cooldown
-      if (res.nextModel) break; // 429/404 → ข้ามไปโมเดลถัดไปเลย ไม่ต้องลอง variant
-      // อื่นๆ (400/คำตอบว่าง) → วนไป variant ไม่ส่ง thinkingConfig; ถ้าหมด variant ก็ตกไปโมเดลถัดไป
-    }
-  }
-  throw new Error("แปลงไม่สำเร็จ (ทุกโมเดลใช้งานไม่ได้): " + lastErr + converterErrHint_(lastErr));
-}
-
-// ข้อความช่วยอธิบายให้ผู้ใช้ เมื่อ error สุดท้ายคือ RECITATION (ตัวกรองการคัดลอกเนื้อหาของ Gemini)
-function converterErrHint_(msg) {
-  return msg.indexOf("RECITATION") >= 0
-    ? " — เนื้อหาไปตรงกับตัวกรอง recitation ของ Gemini ลองกดแปลงซ้ำอีกครั้ง หรือแบ่งช่วงหน้าให้เล็กลง"
-    : "";
-}
-
-// ยิง Gemini 1 ครั้ง — คืน {ok,raw,finishReason} หรือ {ok:false,error,nextModel?,fatal?}
-function tryConverterCall_(prompt, apiKey, model, disableThinking, pdfB64, images, temperature) {
-  var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
-
+  // parts เหมือนกันทุก attempt — ประกอบครั้งเดียว
   var parts = [{ "text": prompt }];
   if (pdfB64) {
     parts.push({ "inlineData": { "mimeType": "application/pdf", "data": pdfB64 } });
@@ -1434,66 +1535,35 @@ function tryConverterCall_(prompt, apiKey, model, disableThinking, pdfB64, image
     });
   }
 
-  var genConfig = {
-    "responseMimeType": "application/json",
-    "temperature": (typeof temperature === "number" ? temperature : 0.1),
-    "maxOutputTokens": 65536
-  };
-  if (disableThinking) {
-    genConfig.thinkingConfig = { "thinkingBudget": 0 };
+  var convTemp = 0.1; // ถูก bump เป็น 0.8 เมื่อเจอ RECITATION — temp ต่ำทำให้ retry ซ้ำผลเดิมเป๊ะ
+  var r = executeGeminiWithAutoFallback_({
+    apiKeyInfo: apiKeyInfo,
+    modelChain: models,
+    // ลองแบบปิด thinking ก่อน (thinkingBudget:0) — บางรุ่น reject หรือคืนคำตอบว่าง จึงมี variant ไม่ส่ง thinkingConfig สำรอง
+    buildPayload: function (model, disableThinking) {
+      var genConfig = { "responseMimeType": "application/json", "temperature": convTemp, "maxOutputTokens": 65536 };
+      if (disableThinking) genConfig.thinkingConfig = { "thinkingBudget": 0 };
+      return { "contents": [{ "parts": parts }], "generationConfig": genConfig };
+    },
+    tryThinkingVariants: true,
+    expectJson: false, // client parse เอง (มี recovery กรณี JSON ถูกตัด) — ห้าม reject parse_fail ที่ฝั่งนี้
+    maxAttempts: CONVERTER_MAX_ATTEMPTS,
+    // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp แล้วข้ามไปโมเดลถัดไปเลย
+    onRecitation: function () { convTemp = 0.8; }
+  });
+  if (r.ok) return { raw: r.text, finishReason: r.finishReason, model: r.model, usage: r.usage || null };
+  if (r.reason === 'fatal') throw new Error("แปลงไม่สำเร็จ: " + r.error);
+  if (r.reason === 'max-attempts' || r.reason === 'exec-budget') {
+    throw new Error("แปลงไม่สำเร็จ (ครบจำนวนครั้งที่ลองได้): " + r.error + converterErrHint_(r.error));
   }
+  throw new Error("แปลงไม่สำเร็จ (ทุกโมเดลใช้งานไม่ได้): " + r.error + converterErrHint_(r.error));
+}
 
-  var options = {
-    "method": "post",
-    "contentType": "application/json",
-    "payload": JSON.stringify({ "contents": [{ "parts": parts }], "generationConfig": genConfig }),
-    "muteHttpExceptions": true
-  };
-
-  try {
-    var response = UrlFetchApp.fetch(url, options);
-    var code = response.getResponseCode();
-    var resJson;
-    try { resJson = JSON.parse(response.getContentText()); } catch (pe) { resJson = {}; }
-
-    if (code === 200) {
-      var candidate = resJson.candidates && resJson.candidates[0];
-      var raw = "";
-      if (candidate && candidate.content && candidate.content.parts) {
-        var rp = candidate.content.parts;
-        for (var i = 0; i < rp.length; i++) {
-          if (!rp[i].thought && rp[i].text) raw += rp[i].text;
-        }
-      }
-      // usageMetadata = หลักฐานเดียวที่แยกออกว่า "ข้อหาย" เพราะอะไร:
-      //   outputTokens ต่ำ + finishReason STOP  → โมเดลออกข้อไม่ครบเอง (ไม่ใช่ถูกตัด)
-      //   finishReason MAX_TOKENS               → คำตอบถูกตัดจริง
-      //   thoughtTokens สูงทั้งที่สั่ง thinkingBudget:0 → โมเดลเมิน thinkingBudget แล้วกินโควต้า output ไป
-      var um = resJson.usageMetadata || {};
-      var usage = {
-        promptTokens: um.promptTokenCount || 0,
-        outputTokens: um.candidatesTokenCount || 0,
-        thoughtTokens: um.thoughtsTokenCount || 0,
-        totalTokens: um.totalTokenCount || 0,
-        thinkingRequestedOff: !!disableThinking,
-        thinkingIgnored: !!disableThinking && (um.thoughtsTokenCount || 0) > 0
-      };
-      if (!raw.trim()) {
-        // silent-empty (เจอได้กับ JSON mode + thinkingBudget:0 บางรุ่น) → ให้ caller ลอง variant/โมเดลถัดไป
-        var fr = (candidate && candidate.finishReason) || "NO_CONTENT";
-        return { ok: false, error: "คำตอบว่าง (finishReason: " + fr + ")", recitation: fr === "RECITATION", usage: usage };
-      }
-      return { ok: true, raw: raw, finishReason: (candidate && candidate.finishReason) || "STOP", usage: usage };
-    }
-
-    var msg = (resJson.error && resJson.error.message) || ("HTTP " + code);
-    if (code === 429) return { ok: false, error: msg, nextModel: true, quota: true, body429: response.getContentText(), headers429: response.getAllHeaders() }; // 429 → caller แยก perDay/perMinute
-    if (code === 404 || code >= 500) return { ok: false, error: msg, nextModel: true }; // ไม่มีโมเดล/overloaded → โมเดลถัดไป
-    if (code === 400) return { ok: false, error: msg }; // เช่น reject thinkingConfig → ลอง variant ถัดไป
-    return { ok: false, error: msg, fatal: true }; // 401/403 — key ใช้ไม่ได้ เปลี่ยนโมเดลก็ไม่ช่วย
-  } catch (e) {
-    return { ok: false, error: e.message, fatal: true };
-  }
+// ข้อความช่วยอธิบายให้ผู้ใช้ เมื่อ error สุดท้ายคือ RECITATION (ตัวกรองการคัดลอกเนื้อหาของ Gemini)
+function converterErrHint_(msg) {
+  return msg.indexOf("RECITATION") >= 0
+    ? " — เนื้อหาไปตรงกับตัวกรอง recitation ของ Gemini ลองกดแปลงซ้ำอีกครั้ง หรือแบ่งช่วงหน้าให้เล็กลง"
+    : "";
 }
 
 /* =========================================================
@@ -1637,54 +1707,29 @@ function callGeminiSearchOverview(keyword, examStats, questionSnippets, apiKeyIn
   // ยึด chain ของตัวเองเสมอ ไม่ unshift apiKeyInfo.model เข้ามานำ:
   // เมื่อ flash-lite หมดโควต้า getAvailableAIKey จะคืนโมเดล priority ดีสุดที่เหลือ (อาจเป็น 3.7-flash ตัวเต็ม)
   // → สรุปสั้น ~300 token จะไปกินโควต้าโมเดลแพงแทน (บั๊กแบบเดียวกับที่ discussion.js/converter กันไว้)
-  var models = SEARCH_OVERVIEW_MODELS.slice();
-
-  var lastErr = '';
-  for (var mi = 0; mi < models.length && mi < 3; mi++) {
-    var model = models[mi];
-    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKeyInfo.key;
-    var payload = {
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.3, maxOutputTokens: 1024 }
-    };
-    try {
-      var resp = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
-      var code = resp.getResponseCode();
-      var body = resp.getContentText();
-      var rj; try { rj = JSON.parse(body); } catch (pe) { rj = {}; }
-
-      if (code === 200) {
-        var cand = rj.candidates && rj.candidates[0];
-        var raw = "";
-        if (cand && cand.content && cand.content.parts) {
-          cand.content.parts.forEach(function (p) { if (!p.thought && p.text) raw += p.text; });
-        }
-        if (!raw.trim()) { lastErr = 'empty (finishReason: ' + ((cand && cand.finishReason) || '?') + ')'; continue; }
-        updateAIUsage(apiKeyInfo, model); // หักโควต้าโมเดลที่ใช้จริง (อาจเป็น fallback ไม่ใช่ตัวที่เลือกตอนแรก)
-        var parsed = null;
-        try { parsed = JSON.parse(raw); } catch (je) {
-          var m = raw.match(/\{[\s\S]*\}/);
-          if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { } }
-        }
-        if (!parsed) { lastErr = 'parse_fail'; continue; }
-        return {
-          ok: true,
-          model: model,
-          data: {
-            summary: String(parsed.summary || '').trim(),
-            examPatterns: Array.isArray(parsed.examPatterns) ? parsed.examPatterns.slice(0, 5).map(String) : [],
-            pitfallPoints: Array.isArray(parsed.pitfallPoints) ? parsed.pitfallPoints.slice(0, 5).map(String) : [],
-            relatedConcepts: Array.isArray(parsed.relatedConcepts) ? parsed.relatedConcepts.slice(0, 8).map(String) : []
-          }
-        };
-      }
-      if (code === 401 || code === 403) { // key ใช้ไม่ได้ — เปลี่ยนโมเดลก็ไม่ช่วย
-        lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
-        return { ok: false, error: 'สรุปภาพรวมไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
-      }
-      if (code === 429) { handleGemini429_(apiKeyInfo, model, body, resp.getAllHeaders()); lastErr = '429'; continue; }
-      lastErr = (rj.error && rj.error.message) || ('HTTP ' + code);
-    } catch (fe) { lastErr = fe.message; }
-  }
-  return { ok: false, error: 'สรุปภาพรวมไม่สำเร็จ (' + lastErr + ') กรุณาลองใหม่ภายหลัง' };
+  var r = executeGeminiWithAutoFallback_({
+    apiKeyInfo: apiKeyInfo,
+    modelChain: SEARCH_OVERVIEW_MODELS.slice(0, 3),
+    buildPayload: function () {
+      return {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.3, maxOutputTokens: 1024 }
+      };
+    },
+    tryThinkingVariants: false, // ไม่ส่ง thinkingConfig เลย (ดูหัว section)
+    expectJson: true,
+    maxAttempts: 3
+  });
+  if (!r.ok) return { ok: false, error: 'สรุปภาพรวมไม่สำเร็จ (' + r.error + ') กรุณาลองใหม่ภายหลัง' };
+  var parsed = r.json;
+  return {
+    ok: true,
+    model: r.model,
+    data: {
+      summary: String(parsed.summary || '').trim(),
+      examPatterns: Array.isArray(parsed.examPatterns) ? parsed.examPatterns.slice(0, 5).map(String) : [],
+      pitfallPoints: Array.isArray(parsed.pitfallPoints) ? parsed.pitfallPoints.slice(0, 5).map(String) : [],
+      relatedConcepts: Array.isArray(parsed.relatedConcepts) ? parsed.relatedConcepts.slice(0, 8).map(String) : []
+    }
+  };
 }

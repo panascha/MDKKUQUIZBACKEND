@@ -19,6 +19,11 @@ function onSheetEdit(e) {
   if (watchSheetsVotes.indexOf(sheetName) > -1) {
     updateVotesVersion();
   }
+  // แก้ทะเบียนโมเดลด้วยมือ → ล้าง cache 5 นาทีของ registry/getAIModels (ai-gemini.gs) ให้เห็นผลทันที
+  // แยกจาก watchSheetsQuestions โดยตั้งใจ — ไม่ต้อง bump version คลังข้อสอบ
+  if (sheetName === AI_MODELS_SHEET_NAME) {
+    invalidateAIModelsCache_();
+  }
 
   // ระบบตรวจสอบอัตโนมัติเมื่อคอลัมน์ Category (G) ของชีต Questions มีการแก้ไข
   if (sheetName === 'Questions') {
