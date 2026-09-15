@@ -17,13 +17,14 @@ var AI_CONFIG_FIXED_HEADERS = ["API_Key", "Donor_Name", "Status", "Last_Used", "
 // Rate Limit ของ AI Studio โดยตรง (ยังไม่ผ่าน discoverGeminiModels) — priority คงเลขเดิมของตัวที่รอด (ช่องว่างไม่เป็นไร)
 var AI_MODELS_DEFAULTS = [
   // [Model, RPD_Limit, Priority, Status, Notes]
+  ["gemini-3.8-flash",      20,  0, "Active",   "new flagship flash"],
   ["gemini-3.7-flash",      20,  0, "Active",   "flagship flash ล่าสุด"],
   ["gemini-3.5-flash",      20,  1, "Active",   "text-out หลัก"],
   ["gemini-3.6-flash",      20,  2, "Active",   ""],
-  ["gemini-2.5-flash",      20,  3, "Active",   ""],
+  ["gemini-2.5-flash",      20,  3, "Active",   "legacy fallback"],
   ["gemini-3.1-flash-lite", 500, 4, "Active",   "RPD สูงสุดใน free tier"],
   ["gemini-3.5-flash-lite", 500, 4, "Active",   "RPD สูงสุดใน free tier"],
-  ["gemini-2.5-flash-lite", 20,  5, "Active",   ""],
+  ["gemini-2.5-flash-lite", 20,  5, "Active",   "legacy fallback"],
   ["gemini-2.5-pro",        0,  91, "Disabled", "free tier RPD = 0"]
 ];
 
@@ -1296,9 +1297,16 @@ function geminiFetchOnce_(model, apiKey, payload, expectJson) {
 
     var msg = (rj.error && rj.error.message) || ("HTTP " + code);
     if (code === 429) return { ok: false, error: msg, quota: true, body: body, headers: resp.getAllHeaders() };
+    // deprecated/retired model (เช่น "models/gemini-2.5-flash is no longer available to new users")
+    // ข้ามทันทีไม่ retry ซ้ำ — cooldown ระดับ key กัน call ถัดไปบน key เดิมชนโมเดลนี้อีกทั้งวัน
+    if (code === 404 || /no longer available|not available to new users|deprecated|not supported for this api|not found/i.test(msg)) {
+      markModelUnavailable_(model);
+      setModelCooldown_(apiKey, model, 86400);
+      return { ok: false, error: msg, nextModel: true, modelUnavailable: true };
+    }
     // regex overloaded เช็คเฉพาะ 5xx — 4xx ที่มีคำว่า unavailable (เช่น region) ไม่ใช่สัญญาณให้ทุกคนถอย
     if (code === 503 || (code >= 500 && /overloaded|UNAVAILABLE/i.test(body))) return { ok: false, error: msg, overloaded: true };
-    if (code === 404 || code >= 500) return { ok: false, error: msg, nextModel: true };
+    if (code >= 500) return { ok: false, error: msg, nextModel: true };
     if (code === 400) return { ok: false, error: msg }; // เช่น reject thinkingConfig → variant ถัดไป
     return { ok: false, error: msg, fatal: true };
   } catch (e) {
@@ -1440,7 +1448,7 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
    เรียกจาก donations.gs::submitDonation "นอก lock" (UrlFetchApp ห้ามใต้ LockService)
    ========================================================= */
 // สลิป = รูปเดียวเล็ก → ใช้ lite ได้ (ประหยัดโควต้า) — ห้ามเอา flash-lite filter ของ converter มาใช้
-var SLIP_OCR_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-3.5-flash"];
+var SLIP_OCR_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
 
 function callGeminiForSlipOCR(dataUrl) {
   var apiKeyInfo = getAvailableAIKey("Gemini"); // reserve 0 (default) — donation ไม่แย่งโควต้าสำรอง
@@ -1497,7 +1505,7 @@ function callGeminiForSlipOCR(dataUrl) {
 // 2026-08-09: ตัด flash-lite ออกทั้งหมด — คุณภาพแปลงข้อสอบต่ำเกินรับได้
 // converter ใช้ full flash เท่านั้น (3.7 → 3.6 → 3.5 → 2.5); การกรองจริงอยู่ใน callGeminiConverter
 // เพราะ chain ที่ใช้จริงมาจากทะเบียน AI_Models ซึ่งยังมี lite อยู่ (โมดูลอื่นยังใช้ lite ได้ตามเดิม)
-var CONVERTER_FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
+var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
 
@@ -1669,7 +1677,7 @@ function seedGeminiKey(apiKey, donorName) {
         หรือ { ok:false, error }
    เรียกจาก router-doPost.gs::getSearchAIOverview (lock-free — UrlFetchApp ห้ามใต้ LockService)
    ========================================================= */
-var SEARCH_OVERVIEW_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-3.5-flash"];
+var SEARCH_OVERVIEW_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"];
 
 function callGeminiSearchOverview(keyword, examStats, questionSnippets, apiKeyInfo) {
   if (!apiKeyInfo || !apiKeyInfo.key) {
