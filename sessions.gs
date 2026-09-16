@@ -16,6 +16,10 @@ function onSheetEdit(e) {
   if (watchSheetsQuestions.indexOf(sheetName) > -1) {
     updateVersion();
   }
+  // แก้ Category/Structure ด้วยมือในชีต → ต้อง bump v_cat ด้วย ไม่งั้นแคชหมวด (30 นาที) ค้างของเก่า
+  if (sheetName === 'Category' || sheetName === 'Structure') {
+    updateCategoryVersion();
+  }
   if (watchSheetsVotes.indexOf(sheetName) > -1) {
     updateVotesVersion();
   }

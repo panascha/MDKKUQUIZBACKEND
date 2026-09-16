@@ -71,10 +71,12 @@ function readQuestionReports_(qid, ss) {
 
 // Logs columns: Timestamp,User,Role,ActionGroup,ActionType,TargetID,Details,OldValue,NewValue,Metadata
 // decision #8: filter ActionGroup=QUESTION/ActionType=EDIT/TargetID=qid, diff แบบย่อ, ซ่อนชื่อแอดมิน
-// ใช้ logs_data_cache (15s TTL) แบบเดียวกับ getChangedSinceTimestamp — กัน full-scan Logs ซ้ำทุกครั้งที่เปิด discussion
+// ใช้คีย์ของตัวเอง (logs_full_cache, 300s) ไม่ใช่ logs_data_cache ของ getChangedSinceTimestamp:
+// คีย์นั้นอาจเก็บแค่ sample 1000 แถวท้าย ซึ่งจะทำให้ revision เก่าหาย และถ้าเขียน full payload ทับ
+// ก็จะไปทำให้ delta poll (hot path) ต้องวนทั้งชีตแทน 1000 แถว — ทั้งสองคีย์ถูกล้างใน writeAdminLog()
 function readQuestionRevisions_(qid, ss, startTime) {
   if (!ss) ss = SpreadsheetApp.openById(SHEET_ID);
-  var logDataJson = getLargeCache("logs_data_cache");
+  var logDataJson = getLargeCache("logs_full_cache");
   var logData;
   if (logDataJson) {
     logData = JSON.parse(logDataJson);
@@ -83,7 +85,7 @@ function readQuestionRevisions_(qid, ss, startTime) {
     var sheet = ss.getSheetByName("Logs");
     if (!sheet || sheet.getLastRow() < 2) return [];
     logData = sheet.getDataRange().getValues();
-    putLargeCache("logs_data_cache", JSON.stringify(logData), 15, startTime);
+    putLargeCache("logs_full_cache", JSON.stringify(logData), 300, startTime);
   }
   var out = [];
   for (var i = 1; i < logData.length; i++) {

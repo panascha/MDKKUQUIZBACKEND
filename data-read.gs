@@ -638,7 +638,8 @@ function getChangedSinceTimestamp(sinceStr, filterSubject, startTime) {
           // Fallback to full read only if client has no sinceMs or is extremely outdated
           logData = logSheet.getDataRange().getValues();
         }
-        putLargeCache("logs_data_cache", JSON.stringify(logData), 15, startTime); // Cache for 15s to block stamps
+        // 300s TTL แทน 15s — ความสดคุมด้วย event-driven eviction ใน writeAdminLog() (Logs มีผู้เขียนจุดเดียว)
+        putLargeCache("logs_data_cache", JSON.stringify(logData), 300, startTime);
       } else {
         logData = [];
       }

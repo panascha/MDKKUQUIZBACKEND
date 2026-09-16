@@ -2218,6 +2218,7 @@ function doPost(e) {
               var catNameOld = rows[i][3];
               sheet.deleteRow(i + 1);
               updateVersion();
+              updateCategoryVersion();
               writeAdminLog(user, userRole, "CATEGORY", "DELETE", data.data.CategoryID, "Category Deleted", catNameOld, "DELETED", metadata);
               sbMarkSheet_('Category');
               return ContentService.createTextOutput(JSON.stringify({
@@ -2235,6 +2236,7 @@ function doPost(e) {
               var oldName = rows[i][3];
               sheet.getRange(i + 1, 4).setValue(data.data.CategoryName);
               updateVersion();
+              updateCategoryVersion();
               writeAdminLog(user, userRole, "CATEGORY", "EDIT", data.data.CategoryID, "Renamed Category", oldName, data.data.CategoryName, metadata);
               sbMarkSheet_('Category');
               return ContentService.createTextOutput(JSON.stringify({
@@ -2264,6 +2266,7 @@ function doPost(e) {
           }
 
           updateVersion();
+          updateCategoryVersion();
           writeAdminLog(user, userRole, "GROUP", "DELETE", data.data.SubjectRef + "_" + data.data.AccordionGroup, "Deleted Group & " + deletedCount + " categories", "", "DELETED", metadata);
           sbMarkSheet_('Category');
           sbMarkSheet_('Structure');
@@ -2296,6 +2299,7 @@ function doPost(e) {
           }
 
           updateVersion();
+          updateCategoryVersion();
           writeAdminLog(user, userRole, "GROUP", "EDIT", subjectId + "_" + oldGroup, "Renamed Group", oldGroup, newGroup, metadata);
           sbMarkSheet_('Category');
           sbMarkSheet_('Structure');
@@ -2309,6 +2313,7 @@ function doPost(e) {
           sheet = doc.getSheetByName("Structure");
           sheet.appendRow([data.data.Year, data.data.SubjectID, data.data.SubjectName, "GENERAL"]);
           updateVersion();
+          updateCategoryVersion();
           writeAdminLog(user, userRole, "SUBJECT", "ADD", data.data.SubjectID, "Added Subject", "", data.data.SubjectName, metadata);
           sbMarkSheet_('Structure');
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
@@ -2323,6 +2328,7 @@ function doPost(e) {
               sheet.getRange(i + 1, 1).setValue(data.data.Year);
               sheet.getRange(i + 1, 3).setValue(data.data.SubjectName);
               updateVersion();
+              updateCategoryVersion();
               writeAdminLog(user, userRole, "SUBJECT", "EDIT", data.data.SubjectID, "Updated Subject Info", oldName, data.data.SubjectName, metadata);
               sbMarkSheet_('Structure');
               return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
@@ -2343,6 +2349,7 @@ function doPost(e) {
             if (cRows[i][1] == subjectId) catSheet.deleteRow(i + 1);
           }
           updateVersion();
+          updateCategoryVersion();
           writeAdminLog(user, userRole, "SUBJECT", "DELETE", subjectId, "Deleted Subject & Related Data", "", "DELETED", metadata);
           sbMarkSheet_('Structure');
           sbMarkSheet_('Category');

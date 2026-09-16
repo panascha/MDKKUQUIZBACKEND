@@ -94,6 +94,12 @@ function autoCreateSplitCategories(questionId, categories, skipSort) {
     }
   }
 
+  // append แถวใหม่ลง Category/Structure แล้ว ⇒ ต้อง bump v_cat เอง
+  // (เส้นทาง skipSort=true ไม่ได้ผ่าน sortCategorySheet ซึ่งเป็นจุด bump ปกติ)
+  if (sheetsChanged) {
+    updateCategoryVersion();
+  }
+
   // บังคับข้ามการจัดเรียงหากทำงานอยู่ภายใต้คำสั่งประมวลผลเป็นกลุ่ม (Deferred Sorting)
   if (!skipSort) {
     sortCategorySheet();
@@ -303,12 +309,8 @@ function sortCategorySheet(ss) {
   var sheet = ss.getSheetByName("Category");
   if (!sheet) return;
 
-  // บังคับล้างลบแคชของ Category และตารางจัดกลุ่มความสัมพันธ์ในทันทีก่อนเรียงลำดับใหม่
-  var cache = CacheService.getScriptCache();
-  var v = getVersionCached();
-  cache.remove("category_sheet_raw_" + v);
-  cache.remove("cat_to_subj_map_" + v);
-
+  // แคช Category ถูกล้างด้วย updateCategoryVersion() "หลัง" เขียนผลเรียงลำดับเสร็จ (ดูท้ายฟังก์ชัน)
+  // เดิมล้างก่อนเรียง ทำให้ reader ที่เข้ามาระหว่างเรียงแคชแถวที่เรียงค้างไว้แทน
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return;
 
@@ -386,6 +388,7 @@ function sortCategorySheet(ss) {
   SpreadsheetApp.flush();
   range.setValues(data);
   updateVersion();
+  updateCategoryVersion();
 }
 function verifyAllSingleCategoryVotes() {
   var ss = SpreadsheetApp.openById(SHEET_ID);

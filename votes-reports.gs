@@ -41,6 +41,14 @@ function writeAdminLog(user, role, group, type, targetId, details, oldVal, newVa
       meta || ""
     ]);
 
+    // Logs มีผู้เขียนจุดเดียวคือฟังก์ชันนี้ ⇒ ล้างแคช Logs ตรงนี้จุดเดียวครอบทุก writer
+    // ต้องอยู่ "ก่อน" sbMirrorLogRow_ เพราะถ้า mirror throw catch ด้านนอกจะกลืน แล้วแคชจะค้างเก่าถึง 300s
+    // ลบแค่คีย์ _chunks พอ — getLargeCache คืน null ทันทีเมื่อไม่มี _chunks (chunk ที่เหลือหมดอายุเอง)
+    try {
+      CacheService.getScriptCache().remove('logs_data_cache_chunks');
+      CacheService.getScriptCache().remove('logs_full_cache_chunks');
+    } catch (e) {}
+
     // จุดเขียน log จุดเดียวของทั้งระบบ ⇒ hook ที่นี่ครอบทุก action ของแอดมิน รวม REPORT_AUTOFIX
     // ยกเว้น POSTGRES_MIRROR_FAIL เอง ไม่งั้น mirror ที่ล้มจะพยายาม mirror ความล้มเหลวของตัวเอง
     if (type !== 'POSTGRES_MIRROR_FAIL') {

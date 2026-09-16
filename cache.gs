@@ -58,6 +58,25 @@ function updateReviewsVersion() {
   return newVer;
 }
 
+// --- Category version key (แยกจาก v) — ชีต Category/Structure เปลี่ยนน้อยมาก แต่เดิมผูกกับ v
+// ทำให้ "แก้ข้อสอบ 1 ข้อ" ล้าง cache Category 1,440 แถวทิ้งทุกครั้ง (churn) — bump เฉพาะตอนแก้หมวด/วิชาเท่านั้น ---
+function getCategoryVersionCached() {
+  var cache = CacheService.getScriptCache();
+  var v = cache.get("v_cat_cache");
+  if (v == null) {
+    v = PropertiesService.getScriptProperties().getProperty('v_cat') || "0";
+    try { cache.put("v_cat_cache", v, 60); } catch (e) { console.warn("Category version cache write error: " + e.message); }
+  }
+  return v;
+}
+
+function updateCategoryVersion() {
+  var newVer = new Date().getTime().toString();
+  PropertiesService.getScriptProperties().setProperty('v_cat', newVer);
+  try { CacheService.getScriptCache().put("v_cat_cache", newVer, 60); } catch (e) { console.warn("Category version cache put failed: " + e.message); }
+  return newVer;
+}
+
 // public getReviews cache (chunked, 10 นาที) — คีย์ผูก v_reviews จึงถูกล้างทันทีเมื่อมีรีวิวใหม่/เปลี่ยนสถานะ
 function getReviewsDataCached(subjectId, startTime) {
   var v = getReviewsVersionCached();
@@ -205,7 +224,7 @@ function getAllDataForAdminCached(startTime) {
 // ────────────────────────────────────────────────────────────────────
 
 function getCategorySheetDataCached(ss, startTime) {
-  var v = getVersionCached();
+  var v = getCategoryVersionCached();
   var cacheKey = "category_sheet_raw_" + v;
   var cached = getLargeCache(cacheKey);
   if (cached) {
@@ -257,7 +276,7 @@ function getAllQuestionsCached(ss, startTime) {
 }
 
 function getCategoryToSubjectMapCached(ss, startTime) {
-  var v = getVersionCached();
+  var v = getCategoryVersionCached();
   var cacheKey = "cat_to_subj_map_" + v;
   var cached = getLargeCache(cacheKey);
   if (cached) {
