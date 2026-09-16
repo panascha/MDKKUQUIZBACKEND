@@ -1111,6 +1111,92 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // IMAGE UPLOAD GROUP (Drive I/O — ไม่จับ script lock)
+    // เดิมอยู่ใต้ adminLock 25s: อัปโหลดลง Drive ใช้เวลา 2-5 วิ/รูป ทำให้คนอัปโหลดพร้อมกัน 2-3 คน
+    // ชน Admin Lock Timeout และบล็อก editQuestion ของแอดมินคนอื่นไปด้วย
+    // Drive ไม่แตะชีตข้อสอบ จึงไม่ต้องใช้ sheet lock; writeAdminLog ใช้ appendRow ซึ่ง atomic อยู่แล้ว
+    // (ไม่มี read-modify-write) — การจับ script lock ครอบจะทำให้กลับไป serialize กับ admin CRUD โดยไม่ได้ correctness เพิ่ม
+    // ----------------------------------------------------
+    if (action === 'uploadImage' || action === 'uploadImagesBatch') {
+      var upUser = null;
+      if (data.sessionToken) {
+        upUser = verifySessionToken(data.sessionToken);
+      } else if (data.googleIdToken) {
+        var upPayload = verifyGoogleToken(data.googleIdToken);
+        if (upPayload) upUser = findAdminByEmail(upPayload.email);
+      } else {
+        upUser = verifyAdmin(data.username, data.adminPass);
+      }
+
+      if (!upUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'token_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      if (action === 'uploadImage') {
+        try {
+          var fileUrl = uploadQuestionImageToDrive(data.data.base64, data.data.questionId, data.data.type, data.data.subject, data.data.year);
+          writeAdminLog(upUser.username, upUser.role, "IMAGE", "UPLOAD", data.data.questionId, "Uploaded new " + data.data.type + " image", "", fileUrl, "");
+
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success',
+            'url': fileUrl
+          })).setMimeType(ContentService.MimeType.JSON);
+        } catch (err) {
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'error',
+            'message': 'Drive Upload Error: ' + err.message
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+
+      // T2.5: อัปโหลดหลายรูปในการเรียกครั้งเดียว (สูงสุด 10 รูป) — พารามิเตอร์ต่อรายการเหมือน uploadImage
+      // แต่ละรายการอยู่ใน data.images[] = { base64, questionId, type, subject, year }
+      // คืน urls[] เรียงตามลำดับ input; รายการที่ล้มเหลวจะเป็น { error: "..." } (ไม่ทำให้ทั้ง batch ล้ม)
+      var images = data.images || [];
+      if (!Array.isArray(images) || images.length === 0) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'ไม่พบรายการรูปภาพ (images array is empty)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (images.length > 10) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'อัปโหลดได้สูงสุด 10 รูปต่อครั้ง (batch size exceeds 10)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      var urls = [];
+      var successCount = 0;
+      // ใช้ร่วมกันทั้ง batch — กัน getQuestionRoutingInfo/getFoldersByName รันซ้ำต่อรูป
+      var batchRouteCache = {};
+      var batchFolderCache = {};
+      for (var bi = 0; bi < images.length; bi++) {
+        var item = images[bi] || {};
+        try {
+          if (!item.base64) { urls.push({ error: 'missing base64' }); continue; }
+          var batchUrl = uploadQuestionImageToDrive(item.base64, item.questionId, item.type, item.subject, item.year, batchRouteCache, batchFolderCache);
+          urls.push(batchUrl);
+          successCount++;
+        } catch (err) {
+          urls.push({ error: err.message });
+        }
+      }
+
+      writeAdminLog(upUser.username, upUser.role, "IMAGE", "UPLOAD_BATCH",
+        (images[0] && images[0].questionId) || "",
+        "Batch uploaded " + successCount + "/" + images.length + " images", "", "", "");
+
+      return ContentService.createTextOutput(JSON.stringify({
+        'result': 'success',
+        'urls': urls
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // ----------------------------------------------------
     // LOCALIZED LOCK GROUP (Locks briefly for writes, tryLock 15s)
     // ----------------------------------------------------
     var localizedActions = ['submitVote', 'submitReport', 'voteOnReport', 'deleteSession', 'saveStudentId', 'syncSubjectPopularity'];
@@ -1574,105 +1660,6 @@ function doPost(e) {
             'message': error.toString()
           })).setMimeType(ContentService.MimeType.JSON);
         }
-      }
-
-      if (action === 'uploadImage') {
-        var userObj = null;
-        if (data.sessionToken) {
-          userObj = verifySessionToken(data.sessionToken);
-        } else if (data.googleIdToken) {
-          var payload = verifyGoogleToken(data.googleIdToken);
-          if (payload) userObj = findAdminByEmail(payload.email);
-        } else {
-          userObj = verifyAdmin(data.username, data.adminPass);
-        }
-
-        if (!userObj) {
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'token_expired'
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-
-        try {
-          var subject = data.data.subject;
-          var year = data.data.year;
-          var fileUrl = uploadQuestionImageToDrive(data.data.base64, data.data.questionId, data.data.type, subject, year);
-          writeAdminLog(userObj.username, userObj.role, "IMAGE", "UPLOAD", data.data.questionId, "Uploaded new " + data.data.type + " image", "", fileUrl, "");
-
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'success',
-            'url': fileUrl
-          })).setMimeType(ContentService.MimeType.JSON);
-
-        } catch (err) {
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'Drive Upload Error: ' + err.message
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-      }
-
-      // T2.5: อัปโหลดหลายรูปในการเรียกครั้งเดียว (สูงสุด 10 รูป) — auth และพารามิเตอร์ต่อรายการเหมือน uploadImage
-      // แต่ละรายการอยู่ใน data.images[] = { base64, questionId, type, subject, year }
-      // คืน urls[] เรียงตามลำดับ input; รายการที่ล้มเหลวจะเป็น { error: "..." } (ไม่ทำให้ทั้ง batch ล้ม)
-      if (action === 'uploadImagesBatch') {
-        var userObj = null;
-        if (data.sessionToken) {
-          userObj = verifySessionToken(data.sessionToken);
-        } else if (data.googleIdToken) {
-          var payload = verifyGoogleToken(data.googleIdToken);
-          if (payload) userObj = findAdminByEmail(payload.email);
-        } else {
-          userObj = verifyAdmin(data.username, data.adminPass);
-        }
-
-        if (!userObj) {
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'token_expired'
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-
-        var images = data.images || [];
-        if (!Array.isArray(images) || images.length === 0) {
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'ไม่พบรายการรูปภาพ (images array is empty)'
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-        if (images.length > 10) {
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'อัปโหลดได้สูงสุด 10 รูปต่อครั้ง (batch size exceeds 10)'
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-
-        var urls = [];
-        var successCount = 0;
-        // ใช้ร่วมกันทั้ง batch — กัน getQuestionRoutingInfo/getFoldersByName รันซ้ำต่อรูป
-        var batchRouteCache = {};
-        var batchFolderCache = {};
-        for (var bi = 0; bi < images.length; bi++) {
-          var item = images[bi] || {};
-          try {
-            if (!item.base64) { urls.push({ error: 'missing base64' }); continue; }
-            var fileUrl = uploadQuestionImageToDrive(item.base64, item.questionId, item.type, item.subject, item.year, batchRouteCache, batchFolderCache);
-            urls.push(fileUrl);
-            successCount++;
-          } catch (err) {
-            urls.push({ error: err.message });
-          }
-        }
-
-        writeAdminLog(userObj.username, userObj.role, "IMAGE", "UPLOAD_BATCH",
-          (images[0] && images[0].questionId) || "",
-          "Batch uploaded " + successCount + "/" + images.length + " images", "", "", "");
-
-        return ContentService.createTextOutput(JSON.stringify({
-          'result': 'success',
-          'urls': urls
-        })).setMimeType(ContentService.MimeType.JSON);
       }
 
       if (action === 'deleteImage') {

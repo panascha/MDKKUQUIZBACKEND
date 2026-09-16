@@ -7,12 +7,38 @@
 // 1. ฟังก์ชันช่วยหาหรือสร้าง Folder (MD > Y[ปี] > [วิชา])
 // folderCache: optional {} shared across a batch call — memoizes getFoldersByName lookups
 // so repeated images to the same folder don't re-hit Drive every iteration
+// CacheService ทำหน้าที่แทน folderCache ข้าม execution: แต่ละ POST รันคนละ container
+// folderCache (in-memory) จึงว่างเสมอเมื่อคนละ request → getFoldersByName ยิง Drive 4-5 ครั้งต่อรูป
+// อัปโหลดพร้อมกันหลายคนจะชน Drive rate limit (429 / "Service error: Drive")
+// โครงสร้างโฟลเดอร์นิ่งเมื่อสร้างแล้ว จึงแคช folder ID ได้ยาว (6 ชม.)
+var FOLDER_ID_CACHE_TTL = 21600;
+
 function getOrCreateFolder(parentFolder, folderName, folderCache) {
-  var cacheKey = folderCache ? (parentFolder.getId() + '::' + folderName) : null;
-  if (folderCache && folderCache[cacheKey]) return folderCache[cacheKey];
+  var parentId = parentFolder.getId();
+  var memKey = parentId + '::' + folderName;
+  if (folderCache && folderCache[memKey]) return folderCache[memKey];
+
+  var cache = CacheService.getScriptCache();
+  var cacheKey = 'fldr_' + memKey;
+  var cachedId = null;
+  try { cachedId = cache.get(cacheKey); } catch (e) { /* cache ใช้ไม่ได้ → ตกไปหาแบบเดิม */ }
+  if (cachedId) {
+    try {
+      var hit = DriveApp.getFolderById(cachedId);
+      if (!hit.isTrashed()) {
+        if (folderCache) folderCache[memKey] = hit;
+        return hit;
+      }
+      cache.remove(cacheKey);
+    } catch (e) {
+      try { cache.remove(cacheKey); } catch (e2) { /* ignore */ }
+    }
+  }
+
   var folders = parentFolder.getFoldersByName(folderName);
   var folder = folders.hasNext() ? folders.next() : parentFolder.createFolder(folderName);
-  if (folderCache) folderCache[cacheKey] = folder;
+  try { cache.put(cacheKey, folder.getId(), FOLDER_ID_CACHE_TTL); } catch (e) { /* ไม่ critical */ }
+  if (folderCache) folderCache[memKey] = folder;
   return folder;
 }
 
@@ -24,35 +50,25 @@ function getQuestionRoutingInfo(questionId, subjectHint, yearHint) {
     return { year: String(yearHint).trim(), subject: String(subjectHint).trim() };
   }
 
-  var ss = SpreadsheetApp.openById(SHEET_ID);
-  var qSheet = ss.getSheetByName('Questions');
-  var qData = qSheet.getDataRange().getValues();
-  var categoryId = "";
-  
-  for(var i=1; i<qData.length; i++) {
-    if(qData[i][0] == questionId) {
-      var catRaw = qData[i][6].toString();
-      try { categoryId = JSON.parse(catRaw.replace(/'/g, '"'))[0]; } 
-      catch(e) { categoryId = catRaw; }
-      break;
+  // เดิมสแกนชีต Questions ทั้งใบ (24k แถว) + Category + Structure ต่อรูป 1 ใบ เพื่อหาวิชา
+  // ข้อที่เพิ่งแปลงจาก PDF ยังไม่มีแถวในชีตด้วยซ้ำ → สแกนจบแล้วได้ "General"/"Unknown" อยู่ดี
+  // questionId ใช้รูปแบบ <SubjectCode>_<Batch>_<No> เสมอ จึงแกะวิชาจาก prefix แล้วหาปีจาก Structure ที่แคชไว้
+  var subjectId = subjectHint
+    ? String(subjectHint).trim()
+    : ((questionId && String(questionId).indexOf('_') > -1) ? String(questionId).split('_')[0].trim() : "");
+
+  var year = yearHint ? String(yearHint).trim() : "";
+  if (!year && subjectId) {
+    var structRows = getStructureSheetDataCached();
+    for (var i = 1; i < structRows.length; i++) {
+      if (String(structRows[i][1]).trim().toUpperCase() === subjectId.toUpperCase()) {
+        year = String(structRows[i][0]).trim();
+        break;
+      }
     }
   }
 
-  var cSheet = ss.getSheetByName('Category');
-  var cData = cSheet.getDataRange().getValues();
-  var subjectId = "";
-  for(var i=1; i<cData.length; i++) {
-    if(cData[i][0] == categoryId) { subjectId = cData[i][1]; break; }
-  }
-
-  var sSheet = ss.getSheetByName('Structure');
-  var sData = sSheet.getDataRange().getValues();
-  var year = "Unknown";
-  for(var i=1; i<sData.length; i++) {
-    if(sData[i][1] == subjectId) { year = sData[i][0]; break; }
-  }
-
-  return { year: year, subject: subjectId || "General" };
+  return { year: year || "Unknown", subject: subjectId || "General" };
 }
 
 // 3. ฟังก์ชันอัปโหลดรูป

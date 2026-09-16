@@ -571,6 +571,33 @@ function getPriorYearAuditData(startTime) {
   })).setMimeType(ContentService.MimeType.JSON);
 }
 
+// คืนแถว Questions เฉพาะ qid ที่เปลี่ยน
+// เหตุผล: updateVersion() เปลี่ยน v ทุกครั้งที่บันทึกข้อสอบ ทำให้ key "all_questions_raw_<v>" เป็นของใหม่เสมอ
+// → getAllQuestionsCached() cache-miss 100% ทุกครั้งที่ client sync หลังบันทึก แล้วต้องอ่าน+บีบอัดชีตทั้งใบ (24k แถว)
+// เพื่อดึงข้อเดียว ทางนี้อ่านเฉพาะคอลัมน์ A หา row index แล้วดึงเฉพาะแถวที่ตรง
+// ถ้าจำนวนข้อที่เปลี่ยนเยอะ (import/bulk) การดึงทีละแถวจะแพงกว่า จึงถอยกลับไปใช้ cache ก้อนใหญ่ตามเดิม
+var CHANGED_ROWS_TARGETED_LIMIT = 50;
+
+function getChangedQuestionRows_(ss, changedIds, changedCount, startTime) {
+  var cached = getLargeCache("all_questions_raw_" + getVersionCached());
+  if (cached) return JSON.parse(cached);
+  if (changedCount > CHANGED_ROWS_TARGETED_LIMIT) return getAllQuestionsCached(ss, startTime);
+
+  var qSheet = ss.getSheetByName('Questions');
+  var lastRow = qSheet.getLastRow();
+  if (lastRow <= 1) return [];
+
+  if (startTime) assertNotTimedOut_(startTime, 'getChangedQuestionRows_:before_id_scan');
+  var idCol = qSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  var rows = [];
+  for (var i = 0; i < idCol.length; i++) {
+    if (!changedIds[String(idCol[i][0]).trim()]) continue;
+    rows.push(qSheet.getRange(i + 2, 1, 1, 7).getValues()[0]);
+    if (rows.length >= changedCount) break;
+  }
+  return rows;
+}
+
 function getChangedSinceTimestamp(sinceStr, filterSubject, startTime) {
   if (startTime) assertNotTimedOut_(startTime, 'getChangedSinceTimestamp:start');
   var ss = SpreadsheetApp.openById(SHEET_ID);
@@ -651,7 +678,7 @@ function getChangedSinceTimestamp(sinceStr, filterSubject, startTime) {
   }
 
   // --- Fetch changed rows from cached Questions instead of sheet ---
-  var qData = getAllQuestionsCached(ss, startTime);
+  var qData = getChangedQuestionRows_(ss, changedIds, changedIdKeys.length, startTime);
   var changedQuestions = [];
 
   for (var i = 0; i < qData.length; i++) {
