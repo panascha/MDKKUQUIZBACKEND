@@ -2386,6 +2386,7 @@ function doPost(e) {
           }
 
           updateVersion();
+          updateCategoryVersion(); // append แถวใหม่ — sortCategorySheet() bump ให้เฉพาะตอนลำดับขยับ
           sortCategorySheet();
           writeAdminLog(user, userRole, "CATEGORY", "ADD", data.data.CategoryID, "Added Category", "", data.data.CategoryName, metadata);
           sbMarkSheet_('Category');

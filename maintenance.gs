@@ -292,6 +292,8 @@ function runManualSplitExtraction() {
   // เรียก sort และ version update แค่ครั้งเดียวตอนท้าย
   if (processCount > 0 || newCatRows.length > 0) {
     updateVersion();
+    // append แถวใหม่ลง Category — sortCategorySheet() bump ให้เฉพาะตอนลำดับขยับ
+    if (newCatRows.length > 0) updateCategoryVersion();
     sortCategorySheet();
   }
 
@@ -316,6 +318,9 @@ function sortCategorySheet(ss) {
 
   var range = sheet.getRange(2, 1, lastRow - 1, 4);
   var data = range.getValues();
+  // ลำดับ CategoryID ก่อนเรียง — ใช้เทียบท้ายฟังก์ชันว่าแถวขยับจริงไหม
+  // ถ้าไม่ขยับ = เนื้อหาชีตเท่าเดิม ⇒ ห้าม bump v_cat (แก้ข้อสอบเรียกทางนี้บ่อย ผ่าน autoCreateSplitCategories)
+  var orderBefore = JSON.stringify(data.map(function (r) { return String(r[0]); }));
 
   var extractYear = function (id) {
     var match = String(id).match(/\d+/);
@@ -388,7 +393,11 @@ function sortCategorySheet(ss) {
   SpreadsheetApp.flush();
   range.setValues(data);
   updateVersion();
-  updateCategoryVersion();
+  // bump เฉพาะตอนลำดับเปลี่ยนจริง — ผู้เรียกที่ "เพิ่มแถว" (addCategory, autoCreateSplitCategories,
+  // runManualSplitExtraction) bump ของตัวเองอยู่แล้ว เพราะการ append อาจไม่ทำให้ลำดับขยับ
+  if (JSON.stringify(data.map(function (r) { return String(r[0]); })) !== orderBefore) {
+    updateCategoryVersion();
+  }
 }
 function verifyAllSingleCategoryVotes() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
