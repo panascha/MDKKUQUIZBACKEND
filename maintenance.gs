@@ -1,4 +1,4 @@
-function autoCreateSplitCategories(questionId, categories, skipSort) {
+function autoCreateSplitCategories(questionId, categories, skipSort, knownRowIndex) {
   if (!categories || categories.length < 2) return;
 
   // 1. กรอง "by AI" ออก และตรวจสอบว่ามาจาก Subject เดียวกันหรือไม่
@@ -76,22 +76,28 @@ function autoCreateSplitCategories(questionId, categories, skipSort) {
 
   // 7. เพิ่ม NewSplitCatId เข้าไปในคำถามนั้น (ถ้ายังไม่มี)
   const qSheet = ss.getSheetByName("Questions");
-  const qData = qSheet.getDataRange().getValues();
   let finalCats = null;
-  for (let i = 1; i < qData.length; i++) {
-    if (qData[i][0] === questionId) {
-      let currentCats = [];
-      try {
-        currentCats = JSON.parse(qData[i][6].replace(/'/g, '"'));
-      } catch (e) { currentCats = [qData[i][6]]; }
+  let targetRow = knownRowIndex;
 
-      if (!currentCats.includes(newSplitCatId)) {
-        currentCats.push(newSplitCatId);
-        qSheet.getRange(i + 1, 7).setValue(JSON.stringify(currentCats));
-      }
-      finalCats = currentCats;
-      break;
+  if (!targetRow) {
+    const idCol = qSheet.getRange(2, 1, qSheet.getLastRow() - 1, 1).getValues();
+    for (let i = 0; i < idCol.length; i++) {
+      if (idCol[i][0] === questionId) { targetRow = i + 2; break; }
     }
+  }
+
+  if (targetRow) {
+    const catCell = qSheet.getRange(targetRow, 7).getValue();
+    let currentCats = [];
+    try {
+      currentCats = JSON.parse(String(catCell).replace(/'/g, '"'));
+    } catch (e) { currentCats = [catCell]; }
+
+    if (!currentCats.includes(newSplitCatId)) {
+      currentCats.push(newSplitCatId);
+      qSheet.getRange(targetRow, 7).setValue(JSON.stringify(currentCats));
+    }
+    finalCats = currentCats;
   }
 
   // append แถวใหม่ลง Category/Structure แล้ว ⇒ ต้อง bump v_cat เอง
@@ -101,7 +107,8 @@ function autoCreateSplitCategories(questionId, categories, skipSort) {
   }
 
   // บังคับข้ามการจัดเรียงหากทำงานอยู่ภายใต้คำสั่งประมวลผลเป็นกลุ่ม (Deferred Sorting)
-  if (!skipSort) {
+  // และข้ามด้วยถ้าไม่มี Category/Structure ใหม่เกิดขึ้นจริง (ไม่มีอะไรให้ sort)
+  if (!skipSort && sheetsChanged) {
     sortCategorySheet();
   }
 

@@ -1458,6 +1458,83 @@ function doPost(e) {
     }
 
     // ----------------------------------------------------
+    // checkGoogleAuth — ตรวจ token (UrlFetchApp ไป tokeninfo) + อ่านชีท Admins "นอก lock"
+    // เดิมอยู่ใต้ adminLock 25s ทั้งก้อน → ทุก login ถือ script lock ตัวเดียวกับทุก write ระหว่างรอ network
+    // ตอนนี้ล็อกเฉพาะช่วงเขียน (createSession / appendRow auto-enroll / writeAdminLog)
+    // Admins/Sessions/Logs ไม่ใช่ชีทที่ mirror ไป Supabase → ไม่ต้อง sbSnapshotDirtySheets_ ก่อนปลด lock
+    // ----------------------------------------------------
+    if (action === 'checkGoogleAuth') {
+      var tokenPayload = verifyGoogleToken(data.idToken);
+      if (!tokenPayload) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'Token ไม่ถูกต้องหรือหมดอายุการใช้งาน'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      var email = tokenPayload.email;
+      var hd = tokenPayload.hd;
+
+      if (hd !== "kkumail.com" && hd !== "kku.ac.th") {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'ต้องใช้บัญชี @kkumail.com หรือ @kku.ac.th ของทางมหาวิทยาลัยเท่านั้น'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      var adminUser = findAdminByEmail(email);
+
+      var authLock = LockService.getScriptLock();
+      if (!authLock.tryLock(25000)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'error',
+          'message': 'ระบบหลังบ้านทำงานหนักเนื่องจากมีการเขียนซ้อนกัน (Admin Lock Timeout)'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        if (!adminUser) {
+          // re-check ใต้ lock: login ครั้งแรกพร้อมกัน 2 แท็บ อ่านนอก lock ได้ null ทั้งคู่ → กัน appendRow ซ้ำ
+          adminUser = findAdminByEmail(email);
+        }
+        if (adminUser) {
+          var sessionToken = createSession(email, adminUser);
+          writeAdminLog(adminUser.displayName, adminUser.role, "AUTH", "LOGIN_SSO", "Session", "Google SSO Login Success", "", "", "");
+          return ContentService.createTextOutput(JSON.stringify({
+            'result': 'success',
+            'user': adminUser,
+            'sessionToken': sessionToken
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // Auto-enroll: บัญชี KKU ทุกคนที่ login ครั้งแรก → เพิ่มเข้าชีต Admins เป็น role Admin ทันที
+        // Password ใส่ค่าสุ่ม (SSO-only) — ห้ามเว้นว่าง เพราะ verifyAdmin เทียบตรงตัว ค่าว่างจะ login ผ่านด้วยรหัสว่าง
+        var adminsSheet = doc.getSheetByName("Admins");
+        var newUsername = String(email).split("@")[0];
+        var newDisplayName = tokenPayload.name || newUsername;
+        adminsSheet.appendRow([
+          newUsername,
+          "SSO_ONLY_" + Utilities.getUuid(),
+          newDisplayName,
+          "https://api.dicebear.com/7.x/avataaars/svg?seed=" + newUsername,
+          "Admin",
+          email,
+          "", "", "", "", ""
+        ]);
+        // ไม่ updateVersion(): Admins ไม่ใช่ข้อมูลข้อสอบ — bump v ทำให้ client ทุกคน checkVersion mismatch แล้ว sync ซ้ำทั้งหมด
+        var newAdmin = findAdminByEmail(email);
+        var newToken = createSession(email, newAdmin);
+        writeAdminLog(newDisplayName, "Admin", "AUTH", "AUTO_ENROLL", "Session", "Auto-enrolled KKU account as Admin via Google SSO", "", "", "");
+        return ContentService.createTextOutput(JSON.stringify({
+          'result': 'success',
+          'user': newAdmin,
+          'sessionToken': newToken
+        })).setMimeType(ContentService.MimeType.JSON);
+      } finally {
+        authLock.releaseLock();
+      }
+    }
+
+    // ----------------------------------------------------
     // ADMIN LOCK GROUP (Admin and write operations, tryLock 25s)
     // ----------------------------------------------------
     var adminLock = LockService.getScriptLock();
@@ -1469,61 +1546,6 @@ function doPost(e) {
       })).setMimeType(ContentService.MimeType.JSON);
     }
     try {
-      if (action === 'checkGoogleAuth') {
-        var tokenPayload = verifyGoogleToken(data.idToken);
-        if (!tokenPayload) {
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'Token ไม่ถูกต้องหรือหมดอายุการใช้งาน'
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-
-        var email = tokenPayload.email;
-        var hd = tokenPayload.hd;
-
-        if (hd !== "kkumail.com" && hd !== "kku.ac.th") {
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'error',
-            'message': 'ต้องใช้บัญชี @kkumail.com หรือ @kku.ac.th ของทางมหาวิทยาลัยเท่านั้น'
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-
-        var adminUser = findAdminByEmail(email);
-        if (adminUser) {
-          var sessionToken = createSession(email, adminUser);
-          writeAdminLog(adminUser.displayName, adminUser.role, "AUTH", "LOGIN_SSO", "Session", "Google SSO Login Success", "", "", "");
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'success',
-            'user': adminUser,
-            'sessionToken': sessionToken
-          })).setMimeType(ContentService.MimeType.JSON);
-        } else {
-          // Auto-enroll: บัญชี KKU ทุกคนที่ login ครั้งแรก → เพิ่มเข้าชีต Admins เป็น role Admin ทันที
-          // Password ใส่ค่าสุ่ม (SSO-only) — ห้ามเว้นว่าง เพราะ verifyAdmin เทียบตรงตัว ค่าว่างจะ login ผ่านด้วยรหัสว่าง
-          var adminsSheet = doc.getSheetByName("Admins");
-          var newUsername = String(email).split("@")[0];
-          var newDisplayName = tokenPayload.name || newUsername;
-          adminsSheet.appendRow([
-            newUsername,
-            "SSO_ONLY_" + Utilities.getUuid(),
-            newDisplayName,
-            "https://api.dicebear.com/7.x/avataaars/svg?seed=" + newUsername,
-            "Admin",
-            email,
-            "", "", "", "", ""
-          ]);
-          updateVersion();
-          var newAdmin = findAdminByEmail(email);
-          var newToken = createSession(email, newAdmin);
-          writeAdminLog(newDisplayName, "Admin", "AUTH", "AUTO_ENROLL", "Session", "Auto-enrolled KKU account as Admin via Google SSO", "", "", "");
-          return ContentService.createTextOutput(JSON.stringify({
-            'result': 'success',
-            'user': newAdmin,
-            'sessionToken': newToken
-          })).setMimeType(ContentService.MimeType.JSON);
-        }
-      }
-
       if (action === 'registerAdmin') {
         var sheet = doc.getSheetByName("Admins");
         var users = sheet.getDataRange().getValues();
@@ -1895,36 +1917,39 @@ function doPost(e) {
 
         if (action === 'editQuestion') {
           sheet = doc.getSheetByName("Questions");
-          var rows = sheet.getDataRange().getValues();
-          var headers = rows[0];
+          var idCol = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues();
+          var foundRow = -1;
+          for (var i = 0; i < idCol.length; i++) {
+            if (idCol[i][0] == data.data.id) { foundRow = i + 2; break; }
+          }
 
-          for (var i = 1; i < rows.length; i++) {
-            if (rows[i][0] == data.data.id) {
-              var oldRowData = {};
-              for (var k = 0; k < headers.length; k++) {
-                oldRowData[headers[k]] = rows[i][k];
-              }
-
-              var catToSave = Array.isArray(data.data.category) ? JSON.stringify(data.data.category) : data.data.category;
-              sheet.getRange(i + 1, 2, 1, 6).setValues([
-                [data.data.problem, data.data.img, data.data.choices, data.data.answer, data.data.explain, catToSave]
-              ]);
-
-              var splitRes = null;
-              try {
-                const catsForSplit = Array.isArray(data.data.category) ? data.data.category : JSON.parse(catToSave);
-                splitRes = autoCreateSplitCategories(data.data.id, catsForSplit);
-              } catch (e) { console.log("Split error in editQuestion: " + e); }
-
-              updateVersion();
-              writeAdminLog(user, userRole, "QUESTION", "EDIT", data.data.id, "Question Updated", oldRowData, data.data, metadata);
-              // ส่ง data.data.category (array ดิบ) ไม่ใช่ catToSave ที่ stringify แล้ว
-              sbMirrorQuestion_(data.data, splitRes);
-
-              return ContentService.createTextOutput(JSON.stringify({
-                'result': 'success'
-              })).setMimeType(ContentService.MimeType.JSON);
+          if (foundRow !== -1) {
+            var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+            var oldRowValues = sheet.getRange(foundRow, 1, 1, headers.length).getValues()[0];
+            var oldRowData = {};
+            for (var k = 0; k < headers.length; k++) {
+              oldRowData[headers[k]] = oldRowValues[k];
             }
+
+            var catToSave = Array.isArray(data.data.category) ? JSON.stringify(data.data.category) : data.data.category;
+            sheet.getRange(foundRow, 2, 1, 6).setValues([
+              [data.data.problem, data.data.img, data.data.choices, data.data.answer, data.data.explain, catToSave]
+            ]);
+
+            var splitRes = null;
+            try {
+              const catsForSplit = Array.isArray(data.data.category) ? data.data.category : JSON.parse(catToSave);
+              splitRes = autoCreateSplitCategories(data.data.id, catsForSplit, false, foundRow);
+            } catch (e) { console.log("Split error in editQuestion: " + e); }
+
+            updateVersion();
+            writeAdminLog(user, userRole, "QUESTION", "EDIT", data.data.id, "Question Updated", oldRowData, data.data, metadata);
+            // ส่ง data.data.category (array ดิบ) ไม่ใช่ catToSave ที่ stringify แล้ว
+            sbMirrorQuestion_(data.data, splitRes);
+
+            return ContentService.createTextOutput(JSON.stringify({
+              'result': 'success'
+            })).setMimeType(ContentService.MimeType.JSON);
           }
         }
 
