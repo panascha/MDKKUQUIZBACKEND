@@ -1325,14 +1325,14 @@ function geminiFetchOnce_(model, apiKey, payload, expectJson) {
 
 // engine: เดิน modelChain × thinking variants จนสำเร็จ / fatal / ครบ maxAttempts / งบเวลาใกล้หมด
 // cfg = { apiKeyInfo, modelChain, buildPayload(model, variantFlag), tryThinkingVariants, expectJson, maxAttempts, onRecitation,
-//         maxStartElapsedMs?, overloadRetryMs?, maxFetches? }
+//         maxStartElapsedMs?, overloadFree?, maxFetches? }
 // คืน { ok:true, text, json, finishReason, usage, model } หรือ { ok:false, error, reason:'fatal'|'max-attempts'|'exec-budget'|'chain-end' }
 // pass 0 เคารพ breaker (ข้ามโมเดล down/cooling) · pass 1 รันเฉพาะเมื่อ pass 0 ไม่ได้ยิงเลยสักครั้ง:
 // breaker เป็น load-shedding ไม่ใช่ประตูปิดตาย — งาน batch (report-vote auto-apply, verify-questions) ไม่มีคนกด retry
 // จึงห้ามอดตายเพราะ cache บอกว่าทั้ง chain ไม่ healthy → ยิงจริงอีกรอบให้ response ตัดสิน
 function executeGeminiWithAutoFallback_(cfg) {
   var models = (cfg.modelChain || []).filter(function (m, i, a) { return m && a.indexOf(m) === i; });
-  var attempts = 0, fetches = 0, lastErr = "", anyAttempted = false, overloadRetried = {};
+  var attempts = 0, fetches = 0, lastErr = "", anyAttempted = false;
   for (var pass = 0; pass < 2 && !anyAttempted; pass++) {
     for (var mi = 0; mi < models.length; mi++) {
       var model = models[mi];
@@ -1341,7 +1341,7 @@ function executeGeminiWithAutoFallback_(cfg) {
       var variants = cfg.tryThinkingVariants ? [true, false] : [false];
       for (var vi = 0; vi < variants.length; vi++) {
         if (attempts >= cfg.maxAttempts) return { ok: false, error: lastErr, reason: 'max-attempts' };
-        // maxFetches: เพดาน HTTP fetch จริงต่อ call — นับ overload retry ด้วย (attempts-- ไม่ลดตัวนี้)
+        // maxFetches: เพดาน HTTP fetch จริงต่อ call — นับ overload ด้วย (attempts-- ไม่ลดตัวนี้)
         if (cfg.maxFetches && fetches >= cfg.maxFetches) return { ok: false, error: lastErr, reason: 'max-attempts' };
         if (execBudgetExhausted_()) return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget' };
         // maxStartElapsedMs: เพดานเวลาเริ่ม attempt ใหม่ต่อผู้เรียก — call เดียวของงานหนัก (converter) ยาวเกิน 60s reserve ได้
@@ -1359,12 +1359,9 @@ function executeGeminiWithAutoFallback_(cfg) {
         lastErr = model + ": " + r.error;
         if (r.fatal) return { ok: false, error: lastErr, reason: 'fatal' };
         if (r.overloaded) {
-          // overloadRetryMs (converter): 503 ตอบเร็ว + ไม่หักโควต้า → ไม่นับเป็น attempt; รอสั้น ๆ แล้วลองโมเดลเดิมซ้ำ 1 ครั้ง
-          // เดิม 3 โมเดลติดสไปก์พร้อมกัน = ครบ maxAttempts ทั้งที่ยังเหลือ 3.8/2.5 ใน chain
-          if (cfg.overloadRetryMs) {
-            attempts--;
-            if (!overloadRetried[model] && !(cfg.maxFetches && fetches >= cfg.maxFetches)) { overloadRetried[model] = true; Utilities.sleep(cfg.overloadRetryMs); vi--; continue; }
-          }
+          // overloadFree (converter): 503 ตอบเร็ว + ไม่หักโควต้า → ไม่นับเป็น attempt แล้วข้ามไปโมเดลถัดไปทันที (ไม่ retry โมเดลเดิม)
+          // เดิม 3 โมเดลติดสไปก์พร้อมกัน = ครบ maxAttempts ทั้งที่ยังเหลือ 3.8/2.5 ใน chain; ยังถูกคุมด้วย maxFetches
+          if (cfg.overloadFree) attempts--;
           markModelUnavailable_(model); break;
         }
         if (r.quota) { handleGemini429_(cfg.apiKeyInfo, model, r.body, r.headers); break; } // perDay→zero, perMinute/unknown→cooldown
@@ -1532,8 +1529,10 @@ function callGeminiForSlipOCR(dataUrl) {
 var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
-// เพดาน HTTP fetch รวมต่อ 1 POST — overload retry ไม่นับ attempt (ff8d350) แต่นับตัวนี้ → call เดียวเดิน chain ยาวจนเกิน 360s ไม่ได้
-var CONVERTER_MAX_FETCHES = 4;
+// เพดาน HTTP fetch รวมต่อ 1 POST — overload ไม่นับ attempt (ff8d350) แต่นับตัวนี้ → call เดียวเดิน chain ยาวจนเกิน 360s ไม่ได้
+// 2026-09-24: 4 → 8 + overload ข้ามโมเดลทันที (ไม่ retry โมเดลเดิม) — เดิม 3.8+3.7 สไปก์กิน 4 fetch หมดก่อนถึง 3.6/3.5/2.5
+// เวลาจริงคุมด้วย CONVERTER_MAX_START_ELAPSED_MS (overload ตอบในไม่กี่วินาที)
+var CONVERTER_MAX_FETCHES = 8;
 // 2026-09-24: ยืนยันจากการรันจริง — attempt ที่ 2 เริ่มราว 4 นาที แล้ว Gemini ตอบช้า → เกิน 360s → client ได้ HTTP 404
 // 200s ยังพังซ้ำบน @336 (retry เริ่ม ~190s วิ่งอีก 2-3 นาที) → ลดเหลือ 120s: เหลือ ~240s ให้ call สุดท้ายจบ + ตอบกลับ
 var CONVERTER_MAX_START_ELAPSED_MS = 120000;
@@ -1599,7 +1598,7 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     maxAttempts: CONVERTER_MAX_ATTEMPTS,
     maxFetches: CONVERTER_MAX_FETCHES,
     maxStartElapsedMs: CONVERTER_MAX_START_ELAPSED_MS,
-    overloadRetryMs: 2500,
+    overloadFree: true,
     // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp + ให้เรียบเรียงใหม่ แล้วข้ามไปโมเดลถัดไปเลย
     onRecitation: function () { convTemp = 0.8; recited = true; }
   });
