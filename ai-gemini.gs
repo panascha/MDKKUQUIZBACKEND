@@ -1515,6 +1515,9 @@ var CONVERTER_MAX_ATTEMPTS = 3;
 // 2026-09-24: ยืนยันจากการรันจริง — attempt ที่ 2 เริ่มราว 4 นาที แล้ว Gemini ตอบช้า → เกิน 360s → client ได้ HTTP 404
 // ห้ามเริ่ม retry ใหม่หลัง 200s (attempt แรกยิงเสมอ) — เหลือ ~160s ให้ call สุดท้ายจบ + ตอบกลับ
 var CONVERTER_MAX_START_ELAPSED_MS = 200000;
+// เพดานงานต่อ call — ดู comment ใน buildPayload ของ callGeminiConverter
+var CONVERTER_MAX_OUTPUT_TOKENS = 12288;
+var CONVERTER_THINKING_BUDGET = 1024;
 // ต่อท้าย prompt เฉพาะตอน retry หลังโดน RECITATION — รอบแรกยังคัดลอกตรงตามต้นฉบับ (กฎข้อ 7 ของ prompt ฝั่ง client)
 var CONVERTER_RECITATION_NOTE = "\n\n**รอบนี้โดนตัวกรอง recitation:** ให้เรียบเรียงถ้อยคำของโจทย์ (vignette) ใหม่ด้วยภาษาเดิมของต้นฉบับ " +
   "โดยคงข้อเท็จจริงทางพยาธิสรีรวิทยา อาการ ค่า lab ตัวเลข หน่วย และเลขข้อไว้ครบถ้วนทุกตัว — ใช้แทนกฎข้อ 7 เฉพาะ problem เท่านั้น " +
@@ -1559,10 +1562,13 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
   var r = executeGeminiWithAutoFallback_({
     apiKeyInfo: apiKeyInfo,
     modelChain: models,
-    // ลองแบบปิด thinking ก่อน (thinkingBudget:0) — บางรุ่น reject หรือคืนคำตอบว่าง จึงมี variant ไม่ส่ง thinkingConfig สำรอง
+    // ลองแบบปิด thinking ก่อน (thinkingBudget:0) — บางรุ่น reject หรือคืนคำตอบว่าง จึงมี variant สำรอง
+    // 2026-09-24: variant สำรองเดิมไม่ส่ง thinkingConfig = คิดไม่จำกัด + output 65536 → call เดียววิ่งหลายนาที
+    // เริ่มก่อน 200s cutoff ได้แต่จบเกิน 360s (UrlFetchApp ตัดกลางทางไม่ได้) → จำกัด thinking 1024 + output 12288
+    // 12288 ไม่ใช่ 8192: ชุด 10 ข้อ + explain ≈ 7-8k token (splitter.js) — 8192 ชนเพดานพอดี; ถ้าเกินจริง client กู้ partial ได้
     buildPayload: function (model, disableThinking) {
-      var genConfig = { "responseMimeType": "application/json", "temperature": convTemp, "maxOutputTokens": 65536 };
-      if (disableThinking) genConfig.thinkingConfig = { "thinkingBudget": 0 };
+      var genConfig = { "responseMimeType": "application/json", "temperature": convTemp, "maxOutputTokens": CONVERTER_MAX_OUTPUT_TOKENS };
+      genConfig.thinkingConfig = { "thinkingBudget": disableThinking ? 0 : CONVERTER_THINKING_BUDGET };
       var useParts = recited ? [{ "text": prompt + CONVERTER_RECITATION_NOTE }].concat(parts.slice(1)) : parts;
       return { "contents": [{ "parts": useParts }], "generationConfig": genConfig };
     },
