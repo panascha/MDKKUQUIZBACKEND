@@ -1332,6 +1332,10 @@ function executeGeminiWithAutoFallback_(cfg) {
       for (var vi = 0; vi < variants.length; vi++) {
         if (attempts >= cfg.maxAttempts) return { ok: false, error: lastErr, reason: 'max-attempts' };
         if (execBudgetExhausted_()) return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget' };
+        // maxStartElapsedMs: เพดานเวลาเริ่ม attempt ใหม่ต่อผู้เรียก — call เดียวของงานหนัก (converter) ยาวเกิน 60s reserve ได้
+        if (cfg.maxStartElapsedMs && anyAttempted && (Date.now() - EXEC_START_MS) > cfg.maxStartElapsedMs) {
+          return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget' };
+        }
         attempts++; anyAttempted = true;
         var r = geminiFetchOnce_(model, cfg.apiKeyInfo.key, cfg.buildPayload(model, variants[vi]), cfg.expectJson);
         if (r.ok) {
@@ -1508,6 +1512,13 @@ function callGeminiForSlipOCR(dataUrl) {
 var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
+// 2026-09-24: ยืนยันจากการรันจริง — attempt ที่ 2 เริ่มราว 4 นาที แล้ว Gemini ตอบช้า → เกิน 360s → client ได้ HTTP 404
+// ห้ามเริ่ม retry ใหม่หลัง 200s (attempt แรกยิงเสมอ) — เหลือ ~160s ให้ call สุดท้ายจบ + ตอบกลับ
+var CONVERTER_MAX_START_ELAPSED_MS = 200000;
+// ต่อท้าย prompt เฉพาะตอน retry หลังโดน RECITATION — รอบแรกยังคัดลอกตรงตามต้นฉบับ (กฎข้อ 7 ของ prompt ฝั่ง client)
+var CONVERTER_RECITATION_NOTE = "\n\n**รอบนี้โดนตัวกรอง recitation:** ให้เรียบเรียงถ้อยคำของโจทย์ (vignette) ใหม่ด้วยภาษาเดิมของต้นฉบับ " +
+  "โดยคงข้อเท็จจริงทางพยาธิสรีรวิทยา อาการ ค่า lab ตัวเลข หน่วย และเลขข้อไว้ครบถ้วนทุกตัว — ใช้แทนกฎข้อ 7 เฉพาะ problem เท่านั้น " +
+  "choices และ answer ยังต้องตรงตามต้นฉบับ";
 
 /**
  * Gemini call สำหรับแปลงข้อสอบ (คนละ tuning กับ callGeminiAI ของ chatbot):
@@ -1544,6 +1555,7 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
   }
 
   var convTemp = 0.1; // ถูก bump เป็น 0.8 เมื่อเจอ RECITATION — temp ต่ำทำให้ retry ซ้ำผลเดิมเป๊ะ
+  var recited = false; // true = retry ถัดไปแนบ CONVERTER_RECITATION_NOTE ต่อท้าย prompt
   var r = executeGeminiWithAutoFallback_({
     apiKeyInfo: apiKeyInfo,
     modelChain: models,
@@ -1551,13 +1563,15 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     buildPayload: function (model, disableThinking) {
       var genConfig = { "responseMimeType": "application/json", "temperature": convTemp, "maxOutputTokens": 65536 };
       if (disableThinking) genConfig.thinkingConfig = { "thinkingBudget": 0 };
-      return { "contents": [{ "parts": parts }], "generationConfig": genConfig };
+      var useParts = recited ? [{ "text": prompt + CONVERTER_RECITATION_NOTE }].concat(parts.slice(1)) : parts;
+      return { "contents": [{ "parts": useParts }], "generationConfig": genConfig };
     },
     tryThinkingVariants: true,
     expectJson: false, // client parse เอง (มี recovery กรณี JSON ถูกตัด) — ห้าม reject parse_fail ที่ฝั่งนี้
     maxAttempts: CONVERTER_MAX_ATTEMPTS,
-    // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp แล้วข้ามไปโมเดลถัดไปเลย
-    onRecitation: function () { convTemp = 0.8; }
+    maxStartElapsedMs: CONVERTER_MAX_START_ELAPSED_MS,
+    // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp + ให้เรียบเรียงใหม่ แล้วข้ามไปโมเดลถัดไปเลย
+    onRecitation: function () { convTemp = 0.8; recited = true; }
   });
   if (r.ok) return { raw: r.text, finishReason: r.finishReason, model: r.model, usage: r.usage || null };
   if (r.reason === 'fatal') throw new Error("แปลงไม่สำเร็จ: " + r.error);

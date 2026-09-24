@@ -375,11 +375,12 @@ function doPost(e) {
     // Rate limit 40 POST/ชม. ต่อ user — ขึ้นจาก 20 เมื่อ 2026-08-09
     //   เดิมคิดบน "~4 batch/ไฟล์" แต่ฝั่ง client ซอยชุดตามจำนวนข้อแล้ว (~15 ข้อ/ชุด)
     //   ไฟล์ 90 ข้อ = 7 POST ดังนั้น 20/ชม. เหลือแค่ 2 ไฟล์/ชม. ซึ่งน้อยเกินใช้งานจริง
+    // 2026-09-24: 40 → 80 — client ลดเหลือ ~10 ข้อ/ชุด (กัน 360s timeout) → ไฟล์ 90 ข้อ ≈ 9-10 POST
     // ----------------------------------------------------
     if (action === 'convertPdfBatch') {
       // rate-limit ก่อน auth (กัน flood ด้วย garbage token — mirror saveProgress)
       var pcRlKey = data.sessionToken || data.username || data.clientId || 'anon';
-      if (!checkActionRateLimit('rl_pdfconv_', pcRlKey, 40)) {
+      if (!checkActionRateLimit('rl_pdfconv_', pcRlKey, 80)) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: 'แปลง PDF บ่อยเกินไป (จำกัดต่อชั่วโมง) กรุณาลองใหม่ภายหลัง'
         })).setMimeType(ContentService.MimeType.JSON);
