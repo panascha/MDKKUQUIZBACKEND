@@ -1296,6 +1296,8 @@ function geminiFetchOnce_(model, apiKey, payload, expectJson) {
     }
 
     var msg = (rj.error && rj.error.message) || ("HTTP " + code);
+    // สไปก์ชั่วคราวของ Gemini ("experiencing high demand") = overloaded ไม่ว่า code ไหน — ต้องเช็คก่อน 429 (ไม่ใช่โควต้าหมด)
+    if (/experiencing high demand|spikes in demand/i.test(msg)) return { ok: false, error: msg, overloaded: true };
     if (code === 429) return { ok: false, error: msg, quota: true, body: body, headers: resp.getAllHeaders() };
     // deprecated/retired model (เช่น "models/gemini-2.5-flash is no longer available to new users")
     // ข้ามทันทีไม่ retry ซ้ำ — cooldown ระดับ key กัน call ถัดไปบน key เดิมชนโมเดลนี้อีกทั้งวัน
@@ -1315,14 +1317,15 @@ function geminiFetchOnce_(model, apiKey, payload, expectJson) {
 }
 
 // engine: เดิน modelChain × thinking variants จนสำเร็จ / fatal / ครบ maxAttempts / งบเวลาใกล้หมด
-// cfg = { apiKeyInfo, modelChain, buildPayload(model, variantFlag), tryThinkingVariants, expectJson, maxAttempts, onRecitation }
+// cfg = { apiKeyInfo, modelChain, buildPayload(model, variantFlag), tryThinkingVariants, expectJson, maxAttempts, onRecitation,
+//         maxStartElapsedMs?, overloadRetryMs? }
 // คืน { ok:true, text, json, finishReason, usage, model } หรือ { ok:false, error, reason:'fatal'|'max-attempts'|'exec-budget'|'chain-end' }
 // pass 0 เคารพ breaker (ข้ามโมเดล down/cooling) · pass 1 รันเฉพาะเมื่อ pass 0 ไม่ได้ยิงเลยสักครั้ง:
 // breaker เป็น load-shedding ไม่ใช่ประตูปิดตาย — งาน batch (report-vote auto-apply, verify-questions) ไม่มีคนกด retry
 // จึงห้ามอดตายเพราะ cache บอกว่าทั้ง chain ไม่ healthy → ยิงจริงอีกรอบให้ response ตัดสิน
 function executeGeminiWithAutoFallback_(cfg) {
   var models = (cfg.modelChain || []).filter(function (m, i, a) { return m && a.indexOf(m) === i; });
-  var attempts = 0, lastErr = "", anyAttempted = false;
+  var attempts = 0, lastErr = "", anyAttempted = false, overloadRetried = {};
   for (var pass = 0; pass < 2 && !anyAttempted; pass++) {
     for (var mi = 0; mi < models.length; mi++) {
       var model = models[mi];
@@ -1346,7 +1349,15 @@ function executeGeminiWithAutoFallback_(cfg) {
         }
         lastErr = model + ": " + r.error;
         if (r.fatal) return { ok: false, error: lastErr, reason: 'fatal' };
-        if (r.overloaded) { markModelUnavailable_(model); break; }
+        if (r.overloaded) {
+          // overloadRetryMs (converter): 503 ตอบเร็ว + ไม่หักโควต้า → ไม่นับเป็น attempt; รอสั้น ๆ แล้วลองโมเดลเดิมซ้ำ 1 ครั้ง
+          // เดิม 3 โมเดลติดสไปก์พร้อมกัน = ครบ maxAttempts ทั้งที่ยังเหลือ 3.8/2.5 ใน chain
+          if (cfg.overloadRetryMs) {
+            attempts--;
+            if (!overloadRetried[model]) { overloadRetried[model] = true; Utilities.sleep(cfg.overloadRetryMs); vi--; continue; }
+          }
+          markModelUnavailable_(model); break;
+        }
         if (r.quota) { handleGemini429_(cfg.apiKeyInfo, model, r.body, r.headers); break; } // perDay→zero, perMinute/unknown→cooldown
         if (r.nextModel) break;
         if (r.recitation) { if (cfg.onRecitation) cfg.onRecitation(); break; }
@@ -1576,6 +1587,7 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     expectJson: false, // client parse เอง (มี recovery กรณี JSON ถูกตัด) — ห้าม reject parse_fail ที่ฝั่งนี้
     maxAttempts: CONVERTER_MAX_ATTEMPTS,
     maxStartElapsedMs: CONVERTER_MAX_START_ELAPSED_MS,
+    overloadRetryMs: 2500,
     // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp + ให้เรียบเรียงใหม่ แล้วข้ามไปโมเดลถัดไปเลย
     onRecitation: function () { convTemp = 0.8; recited = true; }
   });
