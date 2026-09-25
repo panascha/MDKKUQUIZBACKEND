@@ -1333,31 +1333,37 @@ function geminiFetchOnce_(model, apiKey, payload, expectJson) {
 function executeGeminiWithAutoFallback_(cfg) {
   var models = (cfg.modelChain || []).filter(function (m, i, a) { return m && a.indexOf(m) === i; });
   var attempts = 0, fetches = 0, lastErr = "", anyAttempted = false;
+  // trail: บันทึกทุกโมเดลที่ engine แตะ + ผลลัพธ์ (รวม skip) — field แยกจาก error เพื่อไม่เปลี่ยนข้อความของผู้เรียกอื่น
+  var trail = [];
+  function note_(s) { trail.push("p" + pass + " " + s + " @" + Math.round((Date.now() - EXEC_START_MS) / 1000) + "s"); }
   for (var pass = 0; pass < 2 && !anyAttempted; pass++) {
     for (var mi = 0; mi < models.length; mi++) {
       var model = models[mi];
-      if (pass === 0 && isModelDown_(model)) { lastErr = model + ": circuit-open"; continue; }
-      if (pass === 0 && isModelCoolingDown_(cfg.apiKeyInfo.key, model)) { lastErr = model + ": rpm-cooldown"; continue; }
+      if (pass === 0 && isModelDown_(model)) { lastErr = model + ": circuit-open"; note_(lastErr); continue; }
+      if (pass === 0 && isModelCoolingDown_(cfg.apiKeyInfo.key, model)) { lastErr = model + ": rpm-cooldown"; note_(lastErr); continue; }
       var variants = cfg.tryThinkingVariants ? [true, false] : [false];
       for (var vi = 0; vi < variants.length; vi++) {
-        if (attempts >= cfg.maxAttempts) return { ok: false, error: lastErr, reason: 'max-attempts' };
+        if (attempts >= cfg.maxAttempts) { note_("stop: max-attempts"); return { ok: false, error: lastErr, reason: 'max-attempts', trail: trail }; }
         // maxFetches: เพดาน HTTP fetch จริงต่อ call — นับ overload ด้วย (attempts-- ไม่ลดตัวนี้)
-        if (cfg.maxFetches && fetches >= cfg.maxFetches) return { ok: false, error: lastErr, reason: 'max-attempts' };
-        if (execBudgetExhausted_()) return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget' };
+        if (cfg.maxFetches && fetches >= cfg.maxFetches) { note_("stop: max-fetches"); return { ok: false, error: lastErr, reason: 'max-attempts', trail: trail }; }
+        if (execBudgetExhausted_()) { note_("stop: exec-budget"); return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget', trail: trail }; }
         // maxStartElapsedMs: เพดานเวลาเริ่ม attempt ใหม่ต่อผู้เรียก — call เดียวของงานหนัก (converter) ยาวเกิน 60s reserve ได้
         if (cfg.maxStartElapsedMs && anyAttempted && (Date.now() - EXEC_START_MS) > cfg.maxStartElapsedMs) {
-          return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget' };
+          note_("stop: max-start-elapsed");
+          return { ok: false, error: (lastErr ? lastErr + " / " : "") + "exec-budget", reason: 'exec-budget', trail: trail };
         }
         attempts++; fetches++; anyAttempted = true;
         var r = geminiFetchOnce_(model, cfg.apiKeyInfo.key, cfg.buildPayload(model, variants[vi]), cfg.expectJson);
         if (r.ok) {
+          note_(model + ": ok");
           clearModelUnavailable_(model);
           // หักโควต้าจุดเดียว (โมเดลที่ใช้จริง อาจเป็น fallback) — write พังห้ามทิ้งคำตอบที่ได้มาแล้ว
           try { updateAIUsage(cfg.apiKeyInfo, model); } catch (ue) { console.warn("updateAIUsage failed: " + ue.message); }
-          return { ok: true, text: r.text, json: r.json, finishReason: r.finishReason, usage: r.usage, model: model };
+          return { ok: true, text: r.text, json: r.json, finishReason: r.finishReason, usage: r.usage, model: model, trail: trail };
         }
         lastErr = model + ": " + r.error;
-        if (r.fatal) return { ok: false, error: lastErr, reason: 'fatal' };
+        note_(model + (variants[vi] ? "" : "/think") + ": " + String(r.error).substring(0, 80));
+        if (r.fatal) return { ok: false, error: lastErr, reason: 'fatal', trail: trail };
         if (r.overloaded) {
           // overloadFree (converter): 503 ตอบเร็ว + ไม่หักโควต้า → ไม่นับเป็น attempt แล้วข้ามไปโมเดลถัดไปทันที (ไม่ retry โมเดลเดิม)
           // เดิม 3 โมเดลติดสไปก์พร้อมกัน = ครบ maxAttempts ทั้งที่ยังเหลือ 3.8/2.5 ใน chain; ยังถูกคุมด้วย maxFetches
@@ -1371,7 +1377,7 @@ function executeGeminiWithAutoFallback_(cfg) {
       }
     }
   }
-  return { ok: false, error: lastErr || 'no models available', reason: 'chain-end' };
+  return { ok: false, error: lastErr || 'no models available', reason: 'chain-end', trail: trail };
 }
 
 /**
@@ -1603,11 +1609,13 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     onRecitation: function () { convTemp = 0.8; recited = true; }
   });
   if (r.ok) return { raw: r.text, finishReason: r.finishReason, model: r.model, usage: r.usage || null };
-  if (r.reason === 'fatal') throw new Error("แปลงไม่สำเร็จ: " + r.error);
+  // ลำดับโมเดลที่ลองจริง (chain + ผลแต่ละตัว) — ใช้วินิจฉัยว่า chain หยุดที่ไหนเพราะอะไร
+  var trailNote = " [chain: " + models.join(",") + " | ลองแล้ว: " + (r.trail || []).join(" | ") + "]";
+  if (r.reason === 'fatal') throw new Error("แปลงไม่สำเร็จ: " + r.error + trailNote);
   if (r.reason === 'max-attempts' || r.reason === 'exec-budget') {
-    throw new Error("แปลงไม่สำเร็จ (ครบจำนวนครั้งที่ลองได้): " + r.error + converterErrHint_(r.error));
+    throw new Error("แปลงไม่สำเร็จ (ครบจำนวนครั้งที่ลองได้): " + r.error + converterErrHint_(r.error) + trailNote);
   }
-  throw new Error("แปลงไม่สำเร็จ (ทุกโมเดลใช้งานไม่ได้): " + r.error + converterErrHint_(r.error));
+  throw new Error("แปลงไม่สำเร็จ (ทุกโมเดลใช้งานไม่ได้): " + r.error + converterErrHint_(r.error) + trailNote);
 }
 
 // ข้อความช่วยอธิบายให้ผู้ใช้ เมื่อ error สุดท้ายคือ RECITATION (ตัวกรองการคัดลอกเนื้อหาของ Gemini)

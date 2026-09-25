@@ -4,6 +4,8 @@
    =========================================
 */
 function doPost(e) {
+  // defensive: รีเซ็ตจุดเริ่มงบเวลาทุก request — ปกติ global ถูก evaluate ใหม่ทุก execution อยู่แล้ว กันไว้เผื่อ container ค้างค่าเก่า
+  EXEC_START_MS = Date.now();
   try {
     var doc = SpreadsheetApp.openById(SHEET_ID);
     var contents = e.postData.contents;
