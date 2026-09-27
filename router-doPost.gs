@@ -640,6 +640,23 @@ function doPost(e) {
       return getFeedbackRows();
     }
 
+    // §1.10 slide reference: อ่านล้วน → lock-free; admin-only (verifySessionToken คืน null ให้ Student) — auth แบบ getFeedback
+    if (action === 'getKBPages' || action === 'getKBPageNotes') {
+      var kbpUser = null;
+      if (data.sessionToken) {
+        kbpUser = verifySessionToken(data.sessionToken);
+      } else if (data.username) {
+        kbpUser = verifyAdmin(data.username, data.adminPass);
+      }
+      if (!kbpUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (action === 'getKBPages') return getKBPagesData(data.subject, EXEC_START_MS);
+      return getKBPageNotes(data.pageIds);
+    }
+
     // ====================================================
     // REVIEWS + DONATIONS (2026-08-28) — reviews.gs / donations.gs
     // submit* = localized-15s (lock ภายในฟังก์ชัน แบบ saveProgress/submitFeedback)
@@ -1774,7 +1791,7 @@ function doPost(e) {
         }
       }
 
-      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual', 'bulkAddQuestionCategories'];
+      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual', 'bulkAddQuestionCategories', 'indexSlideFolder'];
       if (adminActions.indexOf(action) > -1) {
         var userObj = null;
         if (data.sessionToken) {
@@ -1814,6 +1831,17 @@ function doPost(e) {
           return ContentService.createTextOutput(JSON.stringify({
             result: 'success', subject: relSubj, relationRows: relCount
           })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // §1.10: index หน้าสไลด์จาก Drive LectureSlides/<SUBJ>/ ลง KB_Pages (idempotent; รันซ้ำได้หลัง timeout)
+        // อาจถือ admin lock นานกว่า 25s ได้ — ยอมรับ (lock แค่เรียงคิว admin write)
+        if (action === 'indexSlideFolder') {
+          var ksRes = indexSlideFolder(data.subject, data.force === true, EXEC_START_MS);
+          if (ksRes.result === 'success') {
+            writeAdminLog(user, userRole, "KB_PAGES", "INDEX", ksRes.subject, "Indexed slide folder",
+                          "", ksRes.written + " new / " + ksRes.updated + " updated", metadata);
+          }
+          return ContentService.createTextOutput(JSON.stringify(ksRes)).setMimeType(ContentService.MimeType.JSON);
         }
 
         // Feature 2: สั่งสกัด glossary ของวิชาเดียวแบบ manual (ทดสอบ/populate) โดยไม่ต้องรอ cron

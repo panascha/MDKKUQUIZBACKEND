@@ -841,6 +841,12 @@ var RELATIONS_CHECKPOINT_KEY = "RELATIONS_BATCH_CHECKPOINT";
 var KB_CHUNKS_SHEET_NAME = "KB_Chunks";
 var KB_CHUNK_MAX_WORDS = 500;   // section ที่ยาวเกินนี้ถูกตัดเป็น chunk ย่อย (คุม top-k ให้ถูก); ~200-500 คำ/chunk
 
+// ── §1.10: Slide reference pages (1 แถว/หน้าสไลด์, จาก tools/slide-ingest → Drive LectureSlides/<SUBJ>/) ──
+// เขียนผ่าน indexSlideFolder (admin tier); อ่านผ่าน getKBPages / getKBPageNotes (lock-free, admin session)
+var KB_PAGES_SHEET_NAME = "KB_Pages";
+var LECTURE_SLIDES_FOLDER_NAME = "LectureSlides";   // หาโดยชื่อใต้ DRIVE_FOLDER_ID ตอนรัน (ไม่ hardcode id)
+var KB_PAGES_WRITE_BATCH = 150;      // แถวต่อ setValues — ตรวจงบเวลาระหว่าง batch
+
 // ── Feature 2: Glossary (root-word + Thai↔English, §2.1–§2.6) ──
 // tap/select miss-path = askGlossaryTerm (public, standalone block, LLM lock-free); เสิร์ฟผ่าน getGlossary
 var GLOSSARY_SHEET_NAME = "Glossary";

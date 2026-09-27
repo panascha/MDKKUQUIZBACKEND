@@ -456,6 +456,194 @@ function getKBData(subject, startTime) {
 }
 
 /* =========================================================================
+   §1.10 — Slide reference pages (Idea/active/slide-reference-pipeline-plan.md Step 4)
+   ภาพ WebP + _index.json ถูกเรนเดอร์ในเครื่อง (tools/slide-ingest) แล้วอัปขึ้น Drive LectureSlides/<SUBJ>/
+   indexSlideFolder อ่าน _index.json + map ชื่อไฟล์→fileId → upsert ลง KB_Pages (1 แถว/หน้า)
+   Page_ID = ชื่อไฟล์ภาพตัด .webp (deterministic, เช่น RP__L02__p016) = upsert key
+   _index.json meta (topic_map ฯลฯ) เก็บใน Script Property "kb_meta_<SUBJ>" แล้วส่งคู่กับ getKBPages
+   ========================================================================= */
+
+var KB_PAGES_HEADERS = ["Page_ID", "Subject_ID", "Source", "Page_No", "Title", "Slide_Text", "Notes_MD",
+                        "Image_File_ID", "Source_Type", "Print_Page", "Status", "Updated_At"];
+
+// idempotent: สร้างชีต KB_Pages ถ้ายังไม่มี (mirror setupKBChunksSheet)
+// คอลัมน์ข้อความตั้ง format "@" (plain text) — slide_text หลายหน้าขึ้นต้นด้วย "- " ซึ่ง Sheets จะตีเป็นสูตร
+function setupKBPagesSheet() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName(KB_PAGES_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(KB_PAGES_SHEET_NAME);
+  if (!sheet.getRange(1, 1).getValue()) {
+    sheet.getRange(1, 1, 1, KB_PAGES_HEADERS.length).setValues([KB_PAGES_HEADERS]);
+    sheet.getRange(1, 1, 1, KB_PAGES_HEADERS.length).setFontWeight("bold").setBackground("#e6f7ff");
+    sheet.setFrozenRows(1);
+    sheet.getRange("A:C").setNumberFormat("@");
+    sheet.getRange("E:H").setNumberFormat("@");
+  }
+  return sheet;
+}
+
+function invalidateKBPagesCache(subject) {
+  var v = getVersionCached();
+  try { CacheService.getScriptCache().remove("kbp_" + v + "_" + String(subject).trim().toUpperCase() + "_chunks"); } catch (e) {}
+}
+
+// Drive v3 list ลูกของโฟลเดอร์ (paginate) — เห็นเฉพาะไฟล์ที่บัญชี deploy มองเห็น (ต้องอยู่ใน My Drive ของบัญชีนั้น)
+function kbListDriveChildren_(parentId, extraQ) {
+  var out = [];
+  var token = null;
+  do {
+    var opts = {
+      q: "'" + parentId + "' in parents and trashed=false" + (extraQ ? " and " + extraQ : ""),
+      fields: "nextPageToken,files(id,name,modifiedTime)",
+      pageSize: 1000
+    };
+    if (token) opts.pageToken = token;
+    var res = Drive.Files.list(opts);
+    out = out.concat(res.files || []);
+    token = res.nextPageToken;
+  } while (token);
+  return out;
+}
+
+// เขียนแถวเป็นก้อนติดกัน (items = [{r, vals}]) — 1 setValues ต่อช่วงแถวต่อเนื่อง ≤ KB_PAGES_WRITE_BATCH แถว
+function kbWriteRowGroups_(sheet, items, col, width, startTime) {
+  items.sort(function (a, b) { return a.r - b.r; });
+  var i = 0;
+  while (i < items.length) {
+    var j = i;
+    while (j + 1 < items.length && items[j + 1].r === items[j].r + 1 && j + 1 - i < KB_PAGES_WRITE_BATCH) j++;
+    var block = items.slice(i, j + 1).map(function (x) { return x.vals; });
+    var startRow = items[i].r;
+    aiSheetRetry_(function () { sheet.getRange(startRow, col, block.length, width).setValues(block); });
+    i = j + 1;
+    if (startTime) assertNotTimedOut_(startTime, 'indexSlideFolder:write');
+  }
+}
+
+// upsert หน้าสไลด์ของวิชาหนึ่งลง KB_Pages. auth ตรวจที่ doPost (admin tier) แล้ว.
+// ค่า default: แถวใหม่ → append เต็ม, แถวเดิม → patch เฉพาะ H..L (Image_File_ID..Updated_At)
+// → รันซ้ำหลัง timeout ได้ผลลู่เข้า (แถวที่ append แล้วไม่ถูกเขียนข้อความซ้ำ). force=true → เขียนทับเต็มแถว
+function indexSlideFolder(subject, force, startTime) {
+  var subj = String(subject || "").trim().toUpperCase();
+  if (!subj) return { result: 'error', message: 'ต้องระบุ subject' };
+
+  var root = kbListDriveChildren_(DRIVE_FOLDER_ID,
+    "name='" + LECTURE_SLIDES_FOLDER_NAME + "' and mimeType='application/vnd.google-apps.folder'");
+  if (!root.length) return { result: 'error', message: 'ไม่พบโฟลเดอร์ ' + LECTURE_SLIDES_FOLDER_NAME + ' ใน DRIVE_FOLDER_ID' };
+  if (root.length > 1) return { result: 'error', message: 'พบโฟลเดอร์ ' + LECTURE_SLIDES_FOLDER_NAME + ' ซ้ำ ' + root.length + ' อัน: ' + root.map(function (x) { return x.id; }).join(', ') };
+
+  var sub = kbListDriveChildren_(root[0].id,
+    "name='" + subj + "' and mimeType='application/vnd.google-apps.folder'");
+  if (!sub.length) return { result: 'error', message: 'ไม่พบโฟลเดอร์ ' + subj + ' ใน LectureSlides' };
+
+  // ชื่อ → ไฟล์ล่าสุด (อัปซ้ำผ่านเว็บอาจได้ชื่อซ้ำ) ; นับ duplicates ไว้รายงาน
+  var files = kbListDriveChildren_(sub[0].id);
+  var byName = {};
+  var duplicates = 0;
+  for (var f = 0; f < files.length; f++) {
+    var cur = byName[files[f].name];
+    if (cur) {
+      duplicates++;
+      if (files[f].modifiedTime <= cur.modifiedTime) continue;
+    }
+    byName[files[f].name] = files[f];
+  }
+  if (!byName['_index.json']) return { result: 'error', message: 'ไม่พบ _index.json ใน ' + subj };
+  if (startTime) assertNotTimedOut_(startTime, 'indexSlideFolder:list');
+
+  var idx = JSON.parse(DriveApp.getFileById(byName['_index.json'].id).getBlob().getDataAsString('UTF-8'));
+  var pages = idx.pages || [];
+  // meta เล็ก (RP topic_map ~300 ตัวอักษร); Script Property จำกัด 9KB/ค่า
+  PropertiesService.getScriptProperties().setProperty('kb_meta_' + subj, JSON.stringify(idx.meta || {}));
+
+  var sheet = setupKBPagesSheet();
+  var rowOf = {};
+  var last = sheet.getLastRow();
+  if (last > 1) {
+    var ids = sheet.getRange(2, 1, last - 1, 1).getValues(); // อ่านเฉพาะคีย์ ไม่ดึง notes หลาย MB
+    for (var k = 0; k < ids.length; k++) if (ids[k][0]) rowOf[String(ids[k][0])] = k + 2;
+  }
+
+  var nowIso = new Date().toISOString();
+  var appends = [], rewrites = [], patches = [];
+  var noImage = 0;
+  for (var p = 0; p < pages.length; p++) {
+    var pg = pages[p];
+    var pageId = String(pg.image_file).replace(/\.webp$/i, '');
+    var img = byName[pg.image_file];
+    if (!img) noImage++;
+    var tail = [img ? img.id : "", pg.source_type || "slide", "", img ? "ok" : "no_image", nowIso]; // H..L
+    var row = [pageId, subj, pg.source, pg.page_no, pg.title, pg.slide_text, pg.notes_md].concat(tail);
+    var r = rowOf[pageId];
+    if (!r) appends.push(row);
+    else if (force) rewrites.push({ r: r, vals: row });
+    else patches.push({ r: r, vals: tail });
+  }
+
+  for (var a = 0; a < appends.length; a += KB_PAGES_WRITE_BATCH) {
+    var chunk = appends.slice(a, a + KB_PAGES_WRITE_BATCH);
+    var at = sheet.getLastRow() + 1;
+    aiSheetRetry_(function () { sheet.getRange(at, 1, chunk.length, KB_PAGES_HEADERS.length).setValues(chunk); });
+    if (startTime) assertNotTimedOut_(startTime, 'indexSlideFolder:append');
+  }
+  kbWriteRowGroups_(sheet, rewrites, 1, KB_PAGES_HEADERS.length, startTime);
+  kbWriteRowGroups_(sheet, patches, 8, 5, startTime);
+
+  invalidateKBPagesCache(subj);
+  return { result: 'success', subject: subj, total: pages.length, written: appends.length,
+           updated: rewrites.length + patches.length, noImage: noImage, duplicates: duplicates };
+}
+
+// หน้าสไลด์ของวิชาหนึ่ง (ไม่รวม Notes_MD) + meta — chunked cache "kbp_<v>_<SUBJ>"
+// payload RP ~1.5MB; BM25 ฝั่ง client ใช้ title + slideText เท่านั้น (ตรงกับ eval_recall.py)
+function getKBPagesData(subject, startTime) {
+  var subj = String(subject || "").trim().toUpperCase();
+  var cacheKey = "kbp_" + getVersionCached() + "_" + subj;
+  var cachedStr = getLargeCache(cacheKey);
+  if (cachedStr != null) {
+    return ContentService.createTextOutput(cachedStr).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (startTime) assertNotTimedOut_(startTime, 'getKBPagesData');
+  var pages = [];
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(KB_PAGES_SHEET_NAME);
+  if (sheet && sheet.getLastRow() > 1) {
+    var n = sheet.getLastRow() - 1;
+    var left = sheet.getRange(2, 1, n, 6).getValues();   // A..F (ข้าม G = Notes_MD)
+    var right = sheet.getRange(2, 8, n, 5).getValues();  // H..L
+    for (var r = 0; r < n; r++) {
+      if (!left[r][0] || String(left[r][1]).trim().toUpperCase() !== subj) continue;
+      pages.push({
+        pageId: left[r][0], source: left[r][2], pageNo: left[r][3], title: left[r][4],
+        slideText: left[r][5], imageFileId: right[r][0], sourceType: right[r][1], status: right[r][3]
+      });
+    }
+  }
+  var meta = {};
+  try { meta = JSON.parse(PropertiesService.getScriptProperties().getProperty('kb_meta_' + subj) || "{}"); } catch (e) {}
+
+  var payload = JSON.stringify({ result: 'success', pages: pages, meta: meta });
+  putLargeCache(cacheKey, payload, 1800, startTime);
+  return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
+}
+
+// Notes_MD ของหน้าที่เลือก (≤4) — ใช้ตอน regenerate คำอธิบายเท่านั้น
+function getKBPageNotes(pageIds) {
+  var want = (pageIds || []).slice(0, 4).map(String);
+  var notes = [];
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(KB_PAGES_SHEET_NAME);
+  if (sheet && sheet.getLastRow() > 1 && want.length) {
+    var ids = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues();
+    for (var i = 0; i < ids.length; i++) {
+      if (want.indexOf(String(ids[i][0])) === -1) continue;
+      notes.push({ pageId: String(ids[i][0]), notesMd: sheet.getRange(i + 2, 7).getValue() });
+    }
+  }
+  return ContentService.createTextOutput(JSON.stringify({ result: 'success', notes: notes }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/* =========================================================================
    FEATURE 2 — Glossary (root-word + Thai↔English, unified) §2.1–§2.6
    สองเส้นทาง:
    (1) tap/select miss-path = askGlossaryTerm (doPost standalone block, ด้านบน):
