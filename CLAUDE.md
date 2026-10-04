@@ -34,7 +34,7 @@ Source split into 13 `.gs` files (GAS loads alphabetically into shared global sc
 |------|----------|
 | `config.gs` | Top-level `var`s (SHEET_ID, DRIVE_FOLDER_ID, thresholds), `onOpen` menu |
 | `cache.gs` | Chunked-cache engine + all `*Cached` getters |
-| `sessions.gs` | `onSheetEdit`, `updateVersion`, session tokens, `getOrCreateAnnouncementsSheet` |
+| `sessions.gs` | `onSheetEdit` (version bumps + column-G split; **not triggered directly** — called by `onInstallableSheetEdit` in `supabase-mirror.gs`, the single installable on-edit trigger, installed by `setupSupabaseMirror()`), `updateVersion`, session tokens, `getOrCreateAnnouncementsSheet` |
 | `router-doGet.gs` | `doGet` entry point (read-only, unauthenticated GET actions) |
 | `data-read.gs` | All GET data functions (getStructure, getQuestions, getPendingVotes, getPendingReports, getLogsPage, getChangedSince, getRelatedQuestions, getKB, getGlossary, getHighYield, getKeywordIndex) |
 | `router-doPost.gs` | `doPost` entry point (3-tier lock dispatch) |

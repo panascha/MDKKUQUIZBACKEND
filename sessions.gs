@@ -6,8 +6,8 @@
 */
 
 function onSheetEdit(e) {
-  if (!e) return;
-  var sheet = e.source.getActiveSheet();
+  if (!e || !e.range) return { splitRan: false };
+  var sheet = e.range.getSheet();
   var sheetName = sheet.getName();
 
   var watchSheetsQuestions = ['Questions', 'Structure', 'Category', 'Admins', 'Announcements'];
@@ -40,9 +40,14 @@ function onSheetEdit(e) {
       var endRow = range.getLastRow();
       var sortedNeeded = false;
 
+      // อ่านทั้งช่วงครั้งเดียว — paste หลายร้อยแถวแบบ getValue ทีละเซลล์จะถือ lock นานเกิน 30 วินาที
+      var editedVals = (endRow >= startRow)
+        ? sheet.getRange(startRow, 1, endRow - startRow + 1, 7).getValues()
+        : [];
+
       for (var r = startRow; r <= endRow; r++) {
-        var qId = sheet.getRange(r, 1).getValue().toString().trim();
-        var catRaw = sheet.getRange(r, 7).getValue().toString().trim();
+        var qId = String(editedVals[r - startRow][0]).trim();
+        var catRaw = String(editedVals[r - startRow][6]).trim();
         if (qId && catRaw !== "") {
           try {
             var categories = [];
@@ -52,7 +57,8 @@ function onSheetEdit(e) {
               categories = [catRaw];
             }
             if (categories.length >= 2) {
-              autoCreateSplitCategories(qId, categories, true);
+              // r = แถวจริงของข้อนี้ ⇒ ส่งเป็น knownRowIndex ไม่ต้องสแกนคอลัมน์ id ซ้ำทุกแถว
+              autoCreateSplitCategories(qId, categories, true, r);
               sortedNeeded = true;
             }
           } catch (err) {
@@ -64,8 +70,11 @@ function onSheetEdit(e) {
       if (sortedNeeded) {
         sortCategorySheet();
       }
+      // onInstallableSheetEdit ใช้ค่านี้ตัดสินว่าต้อง mirror Category/Structure ด้วยหรือไม่
+      return { splitRan: sortedNeeded };
     }
   }
+  return { splitRan: false };
 }
 
 function updateVersion() {

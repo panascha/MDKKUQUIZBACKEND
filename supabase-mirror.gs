@@ -22,7 +22,7 @@
    ── ตั้งค่าครั้งเดียว ────────────────────────────────────────────────────
    ScriptProperties: SUPABASE_URL = https://<ref>.supabase.co
                      SUPABASE_SERVICE_KEY = sb_secret_…  (ห้ามใช้ anon key)
-   แล้วรัน setupSupabaseMirror() หนึ่งครั้งเพื่อสร้าง trigger ของ sweep
+   แล้วรัน setupSupabaseMirror() หนึ่งครั้งเพื่อสร้าง trigger ของ sweep + on-edit (onInstallableSheetEdit)
 */
 
 var SB_RPC_PATH = '/rest/v1/rpc/';
@@ -461,18 +461,118 @@ function sbSweepRead_(cursorMs) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// แก้ชีทด้วยมือ → mirror ทันที (installable on-edit trigger)
+//
+// ทำไมต้องมี: การแก้ด้วยมือไม่ผ่าน doPost จึงไม่มี inline hook ตัวไหนทำงาน
+//   - slice: ต้องรอ sweep 10 นาที
+//   - Questions: sweep ไม่เห็นเลย เพราะมันหา qid ที่เปลี่ยนจาก Logs เท่านั้น และมือไม่เขียน Logs
+// ต้องเป็น installable trigger — simple onEdit(e) เรียก UrlFetchApp ไม่ได้
+// นี่คือทางเข้า "ตัวเดียว" ของ on-edit: มันเรียก onSheetEdit (bump version + split) เอง
+// ห้ามติดตั้ง trigger ของ onSheetEdit แยกอีกตัว ไม่งั้นทุกการแก้จะทำงานซ้ำสองรอบ
+//
+// ไม่ครอบคลุม (ต้องพึ่ง checkSupabaseMirror): ลบ/แทรกแถว (เป็น onChange ไม่ใช่ onEdit)
+// และการแก้ qid ในคอลัมน์ A ซึ่งทิ้งแถวเก่าค้างใน Postgres
+// ────────────────────────────────────────────────────────────────────────────
+
+function onInstallableSheetEdit(e) {
+  if (!e || !e.range) return;
+
+  var lock = LockService.getScriptLock();
+  var locked = false;
+  try { locked = lock.tryLock(25000); } catch (lockErr) { locked = false; }
+
+  var questionRows = [];
+  try {
+    // 1) ของเดิม: bump version + split คอลัมน์ G — ทำเสมอ ไม่ว่าจะได้ lock หรือไม่
+    var res = null;
+    try { res = onSheetEdit(e); } catch (editErr) { console.error('onSheetEdit: ' + editErr.message); }
+
+    if (sbEnabled_()) {
+      var sheet = e.range.getSheet();
+      var sheetName = sheet.getName();
+
+      if (SB_SLICE_RPC[sheetName]) sbMarkSheet_(sheetName);
+
+      if (sheetName === 'Questions' && e.range.getColumn() <= 7) {
+        var startRow = Math.max(2, e.range.getRow());
+        var endRow = e.range.getLastRow();
+        if (endRow >= startRow) {
+          // อ่าน "หลัง" split เสมอ — split เขียนทับคอลัมน์ G ด้วยรายการหมวดสุดท้าย
+          var vals = sheet.getRange(startRow, 1, endRow - startRow + 1, 7).getValues();
+          var qids = [];
+          for (var i = 0; i < vals.length; i++) {
+            var qid = String(vals[i][0] || '').trim();
+            if (!qid) continue;
+            qids.push(qid);
+            questionRows.push({
+              questionId: qid, problem: vals[i][1], img: vals[i][2], choices: vals[i][3],
+              answer: vals[i][4], explain: vals[i][5], category: vals[i][6]
+            });
+          }
+          if (qids.length) {
+            // e.user มักเป็น undefined ใน installable trigger ⇒ ห้ามแตะ property ของมันตรงๆ
+            var userEmail = (e.user && typeof e.user.getEmail === 'function' && e.user.getEmail()) || 'SHEET_MANUAL';
+            // ActionGroup='QUESTION' + TargetID คั่น comma = รูปแบบที่ sbSweepRead_ อ่าน
+            // ⇒ ถ้า POST ด้านล่างล้ม sweep รอบหน้าจะเก็บให้เอง
+            writeAdminLog(userEmail, 'MANUAL', 'QUESTION', 'SHEET_EDIT', qids.join(','),
+                          'แก้ชีท Questions ด้วยมือ ' + qids.length + ' ข้อ', '', '', '');
+          }
+          if (res && res.splitRan) {
+            sbMarkSheet_('Category');
+            sbMarkSheet_('Structure');
+          }
+        }
+      }
+
+      // ★ replace_*_all ลบทุกแถวที่ไม่ได้ส่งไป ⇒ ถ่ายภาพ slice ได้เฉพาะตอนถือ lock (ดูหัวไฟล์)
+      //   ไม่ได้ lock = ทิ้งเครื่องหมายไป ปล่อยให้ sweep เก็บภายใน 10 นาที
+      if (locked) sbSnapshotDirtySheets_();
+      else SB_DIRTY_SHEETS_ = {};
+    }
+  } catch (err) {
+    console.error('onInstallableSheetEdit: ' + err.message);
+  } finally {
+    if (locked) { try { lock.releaseLock(); } catch (relErr) {} }
+  }
+
+  // ตั้งแต่บรรทัดนี้ไปคือนอก lock แล้ว ยิง HTTP ได้ (D14)
+  try {
+    // p_autocreate=false เหมือน sweep: รหัสหมวดที่พิมพ์ด้วยมือมีโอกาสเป็นคำผิดสูง
+    // ถ้าปล่อยให้ปั้นหมวดเองจะได้หมวดผีใน Postgres (§9.11 ข้อ 5)
+    for (var c = 0; c < questionRows.length; c += SB_QUESTION_CHUNK) {
+      if (execBudgetExhausted_()) break;
+      var qRes = sbCallNow_('upsert_questions_batch', {
+        p_rows: questionRows.slice(c, c + SB_QUESTION_CHUNK),
+        p_autocreate: false
+      });
+      if (qRes && qRes.error) console.error('sheet-edit upsert: ' + qRes.error);
+    }
+    sbFlush_();   // slice ที่ถ่ายภาพไว้ + แถว log
+  } catch (flushErr) {
+    console.error('onInstallableSheetEdit flush: ' + flushErr.message);
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // ติดตั้ง / ตรวจสภาพ — รันจากตัวแก้ไข GAS
 // ────────────────────────────────────────────────────────────────────────────
 
 function setupSupabaseMirror() {
+  // ลบ onSheetEdit ด้วย: ตอนนี้มันถูกเรียกจาก onInstallableSheetEdit แล้ว ถ้าปล่อย trigger เก่าไว้จะรันซ้ำสองรอบ
+  // หมายเหตุ: getProjectTriggers() เห็นเฉพาะ trigger ของบัญชีที่รันฟังก์ชันนี้
+  // ถ้าบัญชีอื่นเคยติดตั้ง onSheetEdit ไว้ ต้องไปลบเองในหน้า Triggers
+  var owned = ['runSupabaseMirrorSweep', 'onInstallableSheetEdit', 'onSheetEdit'];
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === 'runSupabaseMirrorSweep') {
+    if (owned.indexOf(triggers[i].getHandlerFunction()) > -1) {
       ScriptApp.deleteTrigger(triggers[i]);
     }
   }
   ScriptApp.newTrigger('runSupabaseMirrorSweep').timeBased().everyMinutes(10).create();
   console.log('sweep trigger ทุก 10 นาที: ติดตั้งแล้ว');
+  ScriptApp.newTrigger('onInstallableSheetEdit')
+    .forSpreadsheet(SpreadsheetApp.openById(SHEET_ID)).onEdit().create();
+  console.log('on-edit trigger (onInstallableSheetEdit): ติดตั้งแล้ว');
   console.log(sbEnabled_()
     ? 'พบ SUPABASE_URL + SUPABASE_SERVICE_KEY — mirror ทำงาน'
     : '⚠️ ยังไม่มี SUPABASE_URL / SUPABASE_SERVICE_KEY ใน ScriptProperties — mirror เป็น no-op');
