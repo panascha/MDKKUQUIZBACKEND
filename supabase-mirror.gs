@@ -646,15 +646,16 @@ function sbPrintDups_(sheetName, st) {
  * ⚠️ ไม่ใช้ offset: v_questions_delta มี array_agg แบบ correlated ต่อแถว ⇒ offset ลึกๆ
  *    คือคำนวณแถวที่ข้ามไปซ้ำทุกหน้า (วัดจริง 2026-10-04: keyset 26 หน้า รวม ~6 วิ)
  * keyCol ต้อง unique และอยู่ใน select
+ * filter (ไม่บังคับ) = ตัวกรอง PostgREST ดิบ เช่น 'deleted_at=not.is.null'
  * คืน array ของแถว หรือ { error } ไม่เคย throw
  */
-function sbReadAllNow_(view, select, keyCol) {
+function sbReadAllNow_(view, select, keyCol, filter) {
   var cfg = sbConfig_();
   if (!cfg) return { error: 'no config' };
   var PAGE = 1000, out = [], last = null;
   try {
     for (var guard = 0; guard < 200; guard++) {
-      var url = cfg.url + '/rest/v1/' + view + '?select=' + select +
+      var url = cfg.url + '/rest/v1/' + view + '?select=' + select + (filter ? '&' + filter : '') +
                 '&order=' + keyCol + '.asc&limit=' + PAGE +
                 // ⚠️ ห้ามครอบ "..." — ตัวกรองเดี่ยว (gt./eq.) PostgREST อ่านค่าทั้งก้อนตามตัวอักษร
                 //    ใส่ quote = quote กลายเป็นส่วนของค่า ⇒ หน้าไม่ขยับ วนจนชน guard (ลองแล้ว 2026-10-04)
@@ -782,12 +783,18 @@ function checkSupabaseMirror() {
   }
   var qst = sbKeyStatsFromKeys_(qKeys);
 
-  // data_version() นับเฉพาะแถวที่ยังไม่ถูกลบอ่อน แต่ชีทยังเก็บแถวนั้นไว้และ GAS ยังเสิร์ฟอยู่
-  // ⇒ ต้องบวกกลับก่อนเทียบ ไม่งั้นรายงาน "ไม่ตรง" ตลอดกาลจนคนเลิกอ่าน
+  // data_version() นับเฉพาะแถวที่ยังไม่ถูกลบอ่อน ⇒ ข้อที่ลบอ่อนแล้ว "แต่ยังอยู่ในชีท" ต้องบวกกลับก่อนเทียบ
+  // ⚠️ บวกเฉพาะ id ที่ยังอยู่ในชีทจริง ไม่ใช่ยอดลบอ่อนทั้งหมด: deleteQuestion ลบแถวออกจากชีทด้วย
+  //    ⇒ บวกทั้งยอด = "ไม่ตรง" ลวงๆ ตลอดกาล (เจอจริง 2026-10-04: RP_51LAB_29 ลบไปแล้วทั้งสองฝั่ง)
   // (ถ้าเรียกไม่ได้ก็แค่ไม่บวก — ไม่ทำให้ check ล้ม แต่ต้องบอก ไม่งั้นกลายเป็น "ไม่ตรง" ลวงๆ เงียบๆ)
-  var del = sbCountNow_('questions?deleted_at=not.is.null');
-  if (del && del.error) console.log('  (นับข้อที่ถูกลบอ่อนไม่ได้ — ' + del.error + ' ⇒ ไม่ได้บวกกลับ ยอดอาจแจ้งไม่ตรงลวงๆ)');
-  var delN = (del && del.error) ? 0 : Number(del) || 0;
+  var del = sbReadAllNow_('questions', 'question_id', 'question_id', 'deleted_at=not.is.null');
+  if (del.error) console.log('  (อ่านข้อที่ถูกลบอ่อนไม่ได้ — ' + del.error + ' ⇒ ไม่ได้บวกกลับ ยอดอาจแจ้งไม่ตรงลวงๆ)');
+  var delN = 0;
+  if (!del.error) {
+    var inSheet = {};
+    for (var ki = 0; ki < qKeys.length; ki++) if (qKeys[ki]) inSheet['k:' + qKeys[ki]] = true;
+    for (var di = 0; di < del.length; di++) if (inSheet['k:' + del[di].question_id]) delN++;
+  }
   var qExpected = Number(v.questionCount) + delN;
 
   console.log('cursor  : ' + v.questions);
