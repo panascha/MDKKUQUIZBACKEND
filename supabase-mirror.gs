@@ -642,6 +642,117 @@ function sbPrintDups_(sheetName, st) {
 }
 
 /**
+ * อ่าน view ทั้งใบผ่าน PostgREST แบบ keyset (keyCol > ตัวสุดท้ายของหน้าก่อน) หน้าละ 1000 แถว
+ * ⚠️ ไม่ใช้ offset: v_questions_delta มี array_agg แบบ correlated ต่อแถว ⇒ offset ลึกๆ
+ *    คือคำนวณแถวที่ข้ามไปซ้ำทุกหน้า (วัดจริง 2026-10-04: keyset 26 หน้า รวม ~6 วิ)
+ * keyCol ต้อง unique และอยู่ใน select
+ * คืน array ของแถว หรือ { error } ไม่เคย throw
+ */
+function sbReadAllNow_(view, select, keyCol) {
+  var cfg = sbConfig_();
+  if (!cfg) return { error: 'no config' };
+  var PAGE = 1000, out = [], last = null;
+  try {
+    for (var guard = 0; guard < 200; guard++) {
+      var url = cfg.url + '/rest/v1/' + view + '?select=' + select +
+                '&order=' + keyCol + '.asc&limit=' + PAGE +
+                // ⚠️ ห้ามครอบ "..." — ตัวกรองเดี่ยว (gt./eq.) PostgREST อ่านค่าทั้งก้อนตามตัวอักษร
+                //    ใส่ quote = quote กลายเป็นส่วนของค่า ⇒ หน้าไม่ขยับ วนจนชน guard (ลองแล้ว 2026-10-04)
+                (last === null ? '' : '&' + keyCol + '=gt.' + encodeURIComponent(String(last)));
+      var res = UrlFetchApp.fetch(url, {
+        method: 'get',
+        headers: { 'apikey': cfg.key, 'Authorization': 'Bearer ' + cfg.key },
+        muteHttpExceptions: true
+      });
+      if (res.getResponseCode() >= 300) {
+        return { error: 'HTTP ' + res.getResponseCode() + ' ' + String(res.getContentText()).slice(0, 200) };
+      }
+      var rows = JSON.parse(res.getContentText() || '[]');
+      for (var i = 0; i < rows.length; i++) out.push(rows[i]);
+      if (rows.length < PAGE) return out;
+      last = rows[rows.length - 1][keyCol];
+    }
+    return { error: 'เกิน 200 หน้า — หยุดกันลูปไม่จบ' };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+/**
+ * แปลงเซลล์หมวด (Questions คอลัมน์ G) เป็น array ของ id — ทำตาม upsert_questions_batch (003 §K)
+ * ไม่ใช่ตาม data-read.gs: เซลล์ที่ RPC parse ไม่ได้ (ว่าง / ไม่ใช่ array) RPC จะ "ไม่แตะ junction"
+ * ⇒ คืน null เพื่อให้ผู้เรียกข้ามแถวนั้น ไม่ใช่เดาเป็น [] หรือ ["Uncategorized"] แล้วแจ้ง drift ลวง
+ */
+function sbParseCatCell_(cell) {
+  var raw = String(cell == null ? '' : cell);
+  var arr;
+  try { arr = JSON.parse(raw.replace(/'/g, '"')); } catch (e) { return null; }
+  if (!Array.isArray(arr)) return null;
+  var out = [];
+  for (var i = 0; i < arr.length; i++) {
+    var c = String(arr[i] == null ? '' : arr[i]).trim();
+    if (c) out.push(c);
+  }
+  return out;
+}
+
+/**
+ * เทียบ "ชุดหมวดต่อข้อ" ระหว่างชีทกับ postgres — ฟังก์ชันล้วน ไม่อ่านไม่เขียนอะไร
+ *
+ * ทำไมต้องมี: การเทียบจำนวน id เขียวตลอดแม้ลิงก์หมวดจะเพี้ยนทั้งวิชา (เจอจริง 2026-10-04:
+ *   HEMATO 794 ข้อ คอลัมน์ G ถูกแก้โดยไม่มีแถว Logs ⇒ sweep ไม่เคยเห็น ⇒ postgres ค้างชุดเก่า)
+ *
+ * qKeys[i] / catCells[i] = คอลัมน์ A / G ของแถวข้อมูลเดียวกัน
+ * pgRows = [{questionId, category[]}] (จาก v_questions_delta ⇒ รวมข้อที่ถูกลบอ่อน ไม่งั้นข้อพวกนั้น
+ *          จะกลายเป็น "ลิงก์หายทั้งข้อ" ลวงๆ)
+ * catSet = { 'k:<CategoryID>': true } ของทุกหมวดใน postgres
+ *
+ * ชุดที่คาดหวัง = หมวดในชีท "เฉพาะที่มีใน categories": RPC ข้ามลิงก์ไปหาหมวดที่ไม่มี (sweep ปิด
+ *   autocreate) ⇒ sweep แก้ไม่ได้ จึงนับแยกเป็น catAbsent ไม่ใช่ drift
+ * หมวด auto_created อยู่ใน catSet อยู่แล้ว ⇒ ลิงก์ของมันถูกเทียบตามปกติ ไม่ถูกรายงานว่าเกิน
+ */
+function sbCatDrift_(qKeys, catCells, pgRows, catSet) {
+  var pg = {}, i, j;
+  for (i = 0; i < pgRows.length; i++) pg['k:' + pgRows[i].questionId] = pgRows[i].category || [];
+
+  var seen = {};
+  for (i = 0; i < qKeys.length; i++) if (qKeys[i]) seen['k:' + qKeys[i]] = (seen['k:' + qKeys[i]] || 0) + 1;
+
+  var r = { compared: 0, drifted: 0, missing: 0, extra: 0, catAbsent: 0, unparsed: 0, notInPg: 0,
+            samples: [], absentSamples: [] };
+  for (i = 0; i < qKeys.length; i++) {
+    var id = qKeys[i];
+    if (!id || seen['k:' + id] > 1) continue;         // id ซ้ำ: sbPrintDups_ รายงานแล้ว และไม่รู้ว่าแถวไหนชนะ
+    var pgCats = pg['k:' + id];
+    if (!pgCats) { r.notInPg++; continue; }           // การเทียบจำนวน id ด้านบนรายงานแล้ว
+    var cats = sbParseCatCell_(catCells[i]);
+    if (cats === null) { r.unparsed++; continue; }
+
+    var want = {}, have = {}, miss = [], extra = [];
+    for (j = 0; j < cats.length; j++) {
+      if (catSet['k:' + cats[j]]) want['k:' + cats[j]] = true;
+      else {
+        r.catAbsent++;
+        if (r.absentSamples.length < 5) r.absentSamples.push(id + ' → ' + cats[j]);
+      }
+    }
+    for (j = 0; j < pgCats.length; j++) have['k:' + pgCats[j]] = true;
+    for (var w in want) if (!have[w]) miss.push(w.slice(2));
+    for (var h in have) if (!want[h]) extra.push(h.slice(2));
+
+    r.compared++;
+    if (miss.length || extra.length) {
+      r.drifted++; r.missing += miss.length; r.extra += extra.length;
+      if (r.samples.length < 10) {
+        r.samples.push(id + (miss.length ? '  ขาด [' + miss.join(', ') + ']' : '') +
+                            (extra.length ? '  เกิน [' + extra.join(', ') + ']' : ''));
+      }
+    }
+  }
+  return r;
+}
+
+/**
  * เช็คสุขภาพ: เทียบทุก slice ที่ mirror ดูแล ระหว่างชีทกับ postgres
  * ไม่เขียนอะไรทั้งนั้น เรียกได้ทุกเมื่อ
  *
@@ -689,6 +800,48 @@ function checkSupabaseMirror() {
   if (delN) {
     console.log('  หมายเหตุ: ' + delN + ' ข้อถูกลบอ่อนใน postgres แต่ยังอยู่ในชีท —');
     console.log('  คนที่อ่านผ่าน Supabase จะไม่เห็น ส่วนคนที่ตกไป GAS จะยังเห็น');
+  }
+
+  // ── ชุดหมวดต่อข้อ: ยอด id ตรงกันไม่ได้แปลว่าลิงก์หมวดตรง (ดู sbCatDrift_)
+  // ⚠️ อ่านคอลัมน์ G แยกอีกหนึ่ง range — อย่ารวบ A..G เป็นก้อนเดียว เพราะจะลาก B–F มาด้วย
+  if (qLast > 1) {
+    var gCol = qSh.getRange(2, 7, qLast - 1, 1).getValues();
+    var gCells = [];
+    for (var gi = 0; gi < gCol.length; gi++) gCells.push(gCol[gi][0]);
+
+    var pgQ = sbReadAllNow_('v_questions_delta', 'questionId,category', 'questionId');
+    var pgC = pgQ.error ? pgQ : sbReadAllNow_('v_categories', 'CategoryID', 'CategoryID');
+    // หน้าที่สั้นกว่า 1000 = จบการอ่าน ⇒ ถ้า max-rows ของ PostgREST ถูกตั้งต่ำกว่านั้น จะได้แค่หน้าแรก
+    // แล้วข้อที่เหลือเงียบหายไปเป็น notInPg ⇒ ต้องเทียบกับยอดจริงก่อนเชื่อผล
+    if (!pgC.error) {
+      var pgTotal = sbCountNow_('v_questions_delta');
+      if (pgTotal && pgTotal.error) pgC = { error: 'นับ v_questions_delta ไม่ได้ — ' + pgTotal.error };
+      else if (pgTotal !== pgQ.length) pgC = { error: 'อ่านได้ ' + pgQ.length + ' จาก ' + pgTotal + ' แถว (อ่านไม่ครบ)' };
+    }
+    if (pgC.error) {
+      console.log('หมวดต่อข้อ: อ่าน postgres ไม่ได้ — ' + pgC.error);
+      bad++;
+    } else {
+      var catSet = {};
+      for (var ci = 0; ci < pgC.length; ci++) catSet['k:' + pgC[ci].CategoryID] = true;
+
+      var cd = sbCatDrift_(qKeys, gCells, pgQ, catSet);
+      console.log('หมวดต่อข้อ     เทียบ ' + cd.compared + ' ข้อ / เพี้ยน ' + cd.drifted +
+                  ' ข้อ (ลิงก์ขาด ' + cd.missing + ', เกิน ' + cd.extra + ')' +
+                  (cd.drifted === 0 ? '  ตรงกัน' : '  ⚠️ ไม่ตรง'));
+      for (var si = 0; si < cd.samples.length; si++) console.log('     ' + cd.samples[si]);
+      if (cd.drifted) {
+        console.log('  sweep ไม่แก้ให้เอง: มันอ่านซ้ำเฉพาะข้อที่มีแถว Logs — ต้อง upsert {questionId, category} ของข้อพวกนี้ใหม่');
+        bad++;
+      }
+      // สองยอดนี้ sweep แก้ไม่ได้และไม่ใช่ของค้าง ⇒ แจ้งให้รู้ แต่ไม่นับเป็น issue
+      if (cd.catAbsent) {
+        console.log('  หมายเหตุ: ' + cd.catAbsent + ' ลิงก์ในชีทชี้ไปหาหมวดที่ไม่มีใน postgres (ไม่ถูก mirror): ' +
+                    cd.absentSamples.join(' | '));
+      }
+      if (cd.notInPg) console.log('  หมายเหตุ: ' + cd.notInPg + ' ข้อในชีทไม่มีใน postgres — ไม่ได้เทียบหมวด (ดูยอด Questions ด้านบน)');
+      if (cd.unparsed) console.log('  หมายเหตุ: ' + cd.unparsed + ' ข้อ เซลล์หมวดว่าง/parse ไม่ได้ — RPC ไม่แตะลิงก์ของข้อพวกนี้ จึงไม่ได้เทียบ');
+    }
   }
 
   // ── slice ที่เหลือ: [ชีท, view, คอลัมน์คีย์ (ประกอบได้)]
