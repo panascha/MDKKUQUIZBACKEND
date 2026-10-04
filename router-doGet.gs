@@ -58,7 +58,10 @@ function doGet_(e) {
   if (action == 'getPendingReports') return getPendingReportsData(e.parameter.qid, __startTime);
   if (action == 'getPendingVotesReports') return getPendingVotesReportsData(e.parameter.subject, __startTime);
   if (action == 'getAllData') return getAllDataForAdminCached(__startTime);
-  if (action == 'getLogsPage') return getLogsPageData(e.parameter.offset, e.parameter.limit, __startTime);
+  // getLogsPage / aiConfigStatus ย้ายไป doPost (developerActions) — GET ไม่มี session ให้ตรวจ
+  if (action == 'getLogsPage' || action == 'aiConfigStatus') {
+    return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: 'forbidden' })).setMimeType(ContentService.MimeType.JSON);
+  }
   if (action == 'getPendingReportCount') return getPendingReportCount(e.parameter.subject, __startTime);
   if (action == 'getChangedSince') return getChangedSinceTimestamp(e.parameter.since, e.parameter.subject, __startTime);
   if (action == 'getRelatedQuestions') return getRelatedQuestionsData(e.parameter.subject, __startTime); // Feature 4: relations map ต่อวิชา (อ่านอย่างเดียว, chunked cache)
@@ -71,7 +74,6 @@ function doGet_(e) {
   if (action == 'setupReviews') return setupReviewsWithSeed_(); // idempotent one-off: สร้างชีต Reviews + seed mock ใต้วิชา DEMO
   if (action == 'setupIntelSphere') return setupIntelSphereSheet(); // idempotent one-off: สร้าง tab IntelSphere_Keys ถ้ายังไม่มี
   if (action == 'setupAIConfig') return setupAIConfigSheet(); // idempotent one-off: สร้าง AI_Models + migrate AI_Config เป็นโครง per-model quota
-  if (action == 'aiConfigStatus') return getAIConfigStatus(); // read-only diagnostic (keys masked)
   if (action == 'discoverGeminiModels') {
     // เรียก Gemini จริงกินโควต้า key ที่บริจาค — public ไม่มี session token ให้ผูก key เลยจำกัดรวมทั้งระบบ
     if (!checkActionRateLimit('rl_discovergemini_', 'global', 5)) {

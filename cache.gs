@@ -189,7 +189,8 @@ function getQuestionsDataCached(filterSubject, ss, startTime) {
 function getAllDataForAdminCached(startTime) {
   startTime = startTime || Date.now();
   var v = getVersionCached();
-  var cacheKey = "admin_all_data_" + v;
+  // key "data2": blob รุ่นก่อน (admin_all_data_) มี admins/logs ติดอยู่ — เปลี่ยนชื่อเพื่อไม่ให้ถูกเสิร์ฟหลัง deploy
+  var cacheKey = "admin_all_data2_" + v;
 
   var cachedStr = getLargeCache(cacheKey);
   if (cachedStr != null) {

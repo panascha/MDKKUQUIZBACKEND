@@ -125,6 +125,11 @@ function verifyUser(data) {
   return null;
 }
 
+// ตรวจ role ฝั่ง server — class developer-only ฝั่ง client แค่ซ่อนเมนู ไม่ได้กันสิทธิ์
+function requireRole_(userObj, role) {
+  return !!userObj && String(userObj.role).trim() === role;
+}
+
 function uploadToDrive(base64Data, filename, mimeType) {
   try {
     var parentFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);

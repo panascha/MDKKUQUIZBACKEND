@@ -1,22 +1,22 @@
-function getAdminsList() {
-    return getSheetDataJSON('Admins');
-}
-
-function getAllDataForAdmin(startTime) {
-  startTime = startTime || Date.now();
-  var ss = SpreadsheetApp.openById(SHEET_ID);
-
-  // ดึงข้อมูล Admins แบบเร็ว
-  var adminsRaw = getSheetDataJSON('Admins', ss);
-  var adminsSafe = adminsRaw.map(function (admin) {
+// รายชื่อ Admins (ตัดคอลัมน์ Password) — เรียกจาก doPost กลุ่ม developerActions เท่านั้น (ตรวจ role DEVELOPER แล้ว)
+function getAdminListData() {
+  var admins = getSheetDataJSON('Admins').map(function (admin) {
     var safeAdmin = {};
     for (var key in admin) {
       if (key !== 'Password') safeAdmin[key] = admin[key];
     }
     return safeAdmin;
   });
+  return ContentService.createTextOutput(JSON.stringify({
+    result: 'success', admins: admins
+  })).setMimeType(ContentService.MimeType.JSON);
+}
 
-  assertNotTimedOut_(startTime, 'getAllDataForAdmin:admins');
+function getAllDataForAdmin(startTime) {
+  startTime = startTime || Date.now();
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+
+  // admins + logs ไม่อยู่ใน payload นี้ (endpoint ไม่ต้อง auth) — DEVELOPER อ่านผ่าน getAdminList / getLogsPage (doPost)
   getOrCreateAnnouncementsSheet(ss); // Ensure sheet exists
 
   assertNotTimedOut_(startTime, 'getAllDataForAdmin:questions');
@@ -31,9 +31,6 @@ function getAllDataForAdmin(startTime) {
   var reportArr = getSheetDataJSON('Report', ss);
   var votesArr = getSheetDataJSON('Votes', ss);
 
-  assertNotTimedOut_(startTime, 'getAllDataForAdmin:logs');
-  var logsArr = getLogsTailJSON(ss, 300); // จำกัดเฉพาะ 300 แถวล่าสุด (Logs โตไม่จำกัด) — โหลดเต็มผ่าน action=getLogsPage
-
   var data = {
     v: getVersionCached(), // แทรกเวอร์ชันปัจจุบันเพื่อให้ฝั่งไคลเอนต์ใช้ซิงค์ในรอบเดี่ยวได้โดยไม่ต้องยิง checkVersion แยก
     serverTime: Date.now(), // seed lastSyncTs ฝั่ง client สำหรับ getAdminSync delta
@@ -42,8 +39,6 @@ function getAllDataForAdmin(startTime) {
     category: categoryArr,
     report: reportArr,
     votes: votesArr,
-    logs: logsArr,
-    admins: adminsSafe,
     announcements: getSheetDataJSON('Announcements', ss)
   };
   assertNotTimedOut_(startTime, 'getAllDataForAdmin:before_stringify');
@@ -66,27 +61,19 @@ function getAdminSyncData(clientVer, sinceStr) {
   var delta = JSON.parse(getChangedSinceTimestamp(sinceStr, '').getContent());
 
   // Small slices (ทุกอย่างยกเว้น questions ~1.6MB raw) — cache ผูกเวอร์ชัน TTL 1800 เหมือน getAllData
-  var smallKey = "admin_sync_small_" + v;
+  // key "small2": blob รุ่นก่อน (admin_sync_small_) มี admins/logs ติดอยู่ — เปลี่ยนชื่อเพื่อไม่ให้ถูกเสิร์ฟหลัง deploy
+  var smallKey = "admin_sync_small2_" + v;
   var smallStr = getLargeCache(smallKey);
   var small;
   if (smallStr) {
     small = JSON.parse(smallStr);
   } else {
     var ss = SpreadsheetApp.openById(SHEET_ID);
-    var adminsSafe = getSheetDataJSON('Admins', ss).map(function (admin) {
-      var safeAdmin = {};
-      for (var key in admin) {
-        if (key !== 'Password') safeAdmin[key] = admin[key];
-      }
-      return safeAdmin;
-    });
     small = {
       structure: getSheetDataJSON('Structure', ss),
       category: getSheetDataJSON('Category', ss),
       report: getSheetDataJSON('Report', ss),
       votes: getSheetDataJSON('Votes', ss),
-      logs: getLogsTailJSON(ss, 300),
-      admins: adminsSafe,
       announcements: getSheetDataJSON('Announcements', ss)
     };
     putLargeCache(smallKey, JSON.stringify(small), 1800);
@@ -100,8 +87,6 @@ function getAdminSyncData(clientVer, sinceStr) {
     category: small.category,
     report: small.report,
     votes: small.votes,
-    logs: small.logs,
-    admins: small.admins,
     announcements: small.announcements,
     changedQuestions: delta.changed,
     changedIds: delta.changedIds
@@ -168,7 +153,7 @@ function getLogsPageData(offsetStr, limitStr, startTime) {
     var ss = SpreadsheetApp.openById(SHEET_ID);
     var sheet = ss.getSheetByName('Logs');
     if (!sheet) {
-        return ContentService.createTextOutput(JSON.stringify({ status: 'success', logs: [], total: 0, offset: 0, limit: 0 })).setMimeType(ContentService.MimeType.JSON);
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success', status: 'success', logs: [], total: 0, offset: 0, limit: 0 })).setMimeType(ContentService.MimeType.JSON);
     }
 
     var lastRow = sheet.getLastRow();
@@ -178,9 +163,10 @@ function getLogsPageData(offsetStr, limitStr, startTime) {
     if (offset < 0) offset = 0;
     var limit = parseInt(limitStr) || 300;
     if (limit < 1) limit = 300;
+    if (limit > 500) limit = 500;
 
     if (total === 0 || offset >= total) {
-        return ContentService.createTextOutput(JSON.stringify({ status: 'success', logs: [], total: total, offset: offset, limit: limit })).setMimeType(ContentService.MimeType.JSON);
+        return ContentService.createTextOutput(JSON.stringify({ result: 'success', status: 'success', logs: [], total: total, offset: offset, limit: limit })).setMimeType(ContentService.MimeType.JSON);
     }
 
     var numCols = sheet.getLastColumn();
@@ -202,6 +188,7 @@ function getLogsPageData(offsetStr, limitStr, startTime) {
     }
 
     return ContentService.createTextOutput(JSON.stringify({
+        result: 'success',
         status: 'success',
         logs: result,
         total: total,

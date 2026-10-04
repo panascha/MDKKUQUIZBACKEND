@@ -273,18 +273,31 @@ function doPost(e) {
       return enableGeminiModel(data.model);
     }
 
-    // setModelRpd — admin panel เขียน RPD_Limit/Priority ของโมเดลใน AI_Models (P2-Q1/Q5/Q7)
-    // auth: mirror getFeedback (sessionToken admin หรือ username+adminPass). lock-free: single-cell write ความถี่ต่ำ
-    // (สอดคล้อง Q5 — AI_Config/AI_Models write ไม่ใช้ LockService; off-by-one ยอมรับได้)
-    if (action === 'setModelRpd') {
-      var smrUser = null;
-      if (data.sessionToken) smrUser = verifySessionToken(data.sessionToken);
-      else if (data.username) smrUser = verifyAdmin(data.username, data.adminPass);
-      if (!smrUser) {
+    // ----------------------------------------------------
+    // DEVELOPER-only actions (lock-free): จัดการผู้ใช้ / config ระบบ / audit log
+    // สิทธิ์แก้เนื้อหา (adminActions ด้านล่าง) เปิดให้ทุกบัญชี KKU ที่ล็อกอิน — กลุ่มนี้ต้องเป็น role DEVELOPER เท่านั้น
+    // role ไม่ผ่าน → 'forbidden' (ห้ามใช้ session_expired/token_expired: frontend จะ logout ทั้ง REAL และ DATABASE)
+    // ----------------------------------------------------
+    var developerActions = ['getAdminList', 'getLogsPage', 'aiConfigStatus', 'setModelRpd'];
+    if (developerActions.indexOf(action) > -1) {
+      var devUser = null;
+      if (data.sessionToken) devUser = verifySessionToken(data.sessionToken);
+      else if (data.username) devUser = verifyAdmin(data.username, data.adminPass);
+      if (!devUser) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: 'session_expired'
         })).setMimeType(ContentService.MimeType.JSON);
       }
+      if (!requireRole_(devUser, 'DEVELOPER')) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'forbidden'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (action === 'getAdminList') return getAdminListData();
+      if (action === 'getLogsPage') return getLogsPageData(data.offset, data.limit);
+      if (action === 'aiConfigStatus') return getAIConfigStatus();
+      // setModelRpd — admin panel เขียน RPD_Limit/Priority ของโมเดลใน AI_Models (P2-Q1/Q5/Q7)
+      // lock-free: single-cell write ความถี่ต่ำ (สอดคล้อง Q5 — AI_Config/AI_Models write ไม่ใช้ LockService; off-by-one ยอมรับได้)
       return setModelRpd(data.model, data.rpd, data.priority);
     }
 
@@ -1566,74 +1579,6 @@ function doPost(e) {
       })).setMimeType(ContentService.MimeType.JSON);
     }
     try {
-      if (action === 'registerAdmin') {
-        var sheet = doc.getSheetByName("Admins");
-        var users = sheet.getDataRange().getValues();
-
-        for (var i = 1; i < users.length; i++) {
-          if (users[i][0] == data.userData.Username) {
-            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Username นี้ถูกใช้ไปแล้ว' })).setMimeType(ContentService.MimeType.JSON);
-          }
-          if (users[i][8] == data.userData.StudentID) {
-            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'รหัสนักศึกษานี้ลงทะเบียนแล้ว' })).setMimeType(ContentService.MimeType.JSON);
-          }
-        }
-
-        var avatarUrl = "https://api.dicebear.com/7.x/avataaars/svg?seed=" + data.userData.Username;
-        if (data.userData.AvatarBase64) {
-          try {
-            avatarUrl = uploadToDrive(data.userData.AvatarBase64, data.userData.Username + "_avatar.png", "image/png");
-          } catch (err) {
-            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'Upload รูปไม่สำเร็จ: ' + err.message })).setMimeType(ContentService.MimeType.JSON);
-          }
-        }
-
-        sheet.appendRow([
-          data.userData.Username,
-          data.userData.Password,
-          data.userData.DisplayName,
-          avatarUrl,
-          data.userData.Role || "Admin",
-          data.userData.KKUMail,
-          data.userData.Prefix,
-          data.userData.FullName,
-          data.userData.StudentID,
-          data.userData.Year,
-          data.userData.Contact
-        ]);
-
-        updateVersion();
-        writeAdminLog("System", "SYSTEM", "AUTH", "REGISTER", data.userData.Username, "New Admin Registered", "", "", "");
-
-        return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
-      }
-
-      if (action === 'resetPassword') {
-        var sheet = doc.getSheetByName("Admins");
-        var users = sheet.getDataRange().getValues();
-        var found = false;
-
-        for (var i = 1; i < users.length; i++) {
-          if (users[i][0] == data.verifyData.Username &&
-            users[i][5] == data.verifyData.KKUMail &&
-            users[i][8] == data.verifyData.StudentID &&
-            users[i][7] == data.verifyData.FullName) {
-
-            sheet.getRange(i + 1, 2).setValue(data.newPassword);
-            updateVersion();
-            writeAdminLog(data.verifyData.Username, "USER", "AUTH", "RESET_PWD", "Self", "Password Changed via Verification", "", "", "");
-            found = true;
-            break;
-          }
-        }
-
-        if (found) {
-          return ContentService.createTextOutput(JSON.stringify({ 'result': 'success' })).setMimeType(ContentService.MimeType.JSON);
-        } else {
-          return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ข้อมูลยืนยันตัวตนไม่ถูกต้อง' })).setMimeType(ContentService.MimeType.JSON);
-        }
-      }
-
       if (action === 'checkAuth') {
         var userObj = verifyAdmin(data.username, data.password);
         if (userObj) {
@@ -1659,6 +1604,17 @@ function doPost(e) {
 
           var values = sheet.getDataRange().getValues();
           var targetUsername = data.targetUsername ? data.targetUsername.toString().trim() : "";
+
+          // แก้ได้เฉพาะโปรไฟล์ตัวเอง หรือผู้เรียกเป็น DEVELOPER
+          var profileUser = verifyUser(data);
+          if (!profileUser) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'token_expired' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var isSelf = String(profileUser.username).trim().toLowerCase() === targetUsername.toLowerCase();
+          if (!targetUsername || (!isSelf && !requireRole_(profileUser, 'DEVELOPER'))) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'forbidden' })).setMimeType(ContentService.MimeType.JSON);
+          }
+
           var foundRow = -1;
           var oldProfileData = {};
 
@@ -1687,7 +1643,7 @@ function doPost(e) {
             if (u.contact !== undefined) sheet.getRange(foundRow, 11).setValue(u.contact);
 
             updateVersion();
-            writeAdminLog(data.username || targetUsername, "ADMIN", "PROFILE", "UPDATE", targetUsername, "Updated profile details", oldProfileData, u, "");
+            writeAdminLog(profileUser.displayName || profileUser.username, profileUser.role || "Admin", "PROFILE", "UPDATE", targetUsername, "Updated profile details", oldProfileData, u, "");
 
             return ContentService.createTextOutput(JSON.stringify({
               'result': 'success',
