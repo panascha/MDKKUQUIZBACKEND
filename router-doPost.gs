@@ -2247,6 +2247,12 @@ function doPost(e) {
               shouldUpdate = true;
             }
 
+            // แตะเฉพาะแถวที่ยังรอตรวจ (เกณฑ์เดียวกับ isPendingReport ฝั่ง DATABASE) —
+            // ไม่งั้น reject/resolve ตาม QuestionID จะเขียนทับประวัติ Resolved/AutoResolved/Rejected เก่าของข้อนั้น
+            var rowStatus = String(rows[i][9] || "").trim();
+            var rowDone = String(rows[i][11] || "").toUpperCase() === 'TRUE';
+            if (rowDone || rowStatus === 'AutoResolved' || rowStatus === 'Resolved' || rowStatus === 'Rejected') shouldUpdate = false;
+
             if (shouldUpdate) {
               var oldStatus = rows[i][9];
 
