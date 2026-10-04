@@ -56,7 +56,7 @@ Key constants in `config.gs`:
 
 **Caching**: `CacheService` with a chunked large-value workaround (90KB chunks, since GAS has a 100KB per-key cache limit). Cache TTL is 30 minutes for question/structure data. Cache is invalidated via a version key `v` stored in `PropertiesService`.
 
-**`doGet(e)`** (~line 375) handles read-only, unauthenticated actions: `getStructure` (subjects/categories tree), `getQuestions&subject=X`, `getPendingVotes`, `getAllData` (used by the admin dashboard — currently unauthenticated, see Known Issues).
+**`doGet(e)`** (~line 375) handles read-only, unauthenticated actions: `getStructure` (subjects/categories tree), `getQuestions&subject=X`, `getPendingVotes`, `getAllData` (used by the admin dashboard — currently unauthenticated, no `admins` / `logs` in the payload, see Known Issues).
 
 **`doPost(e)`** (~line 896) uses a **3-tier lock model**, not one global lock:
 1. **Lock-free group** — `verifySession`, `askAIExpert`. No `LockService` call at all.
@@ -82,7 +82,8 @@ Questions use `///` as a multi-value separator (`img`, `choices` columns); `cate
 
 ## Known Open Issues (this repo)
 
-- 🔴 `doGet`'s `getAllData` is served unauthenticated — no session check before `getAllDataForAdminCached()`.
+- 🟠 `doGet`'s `getAllData` is served unauthenticated — no session check before `getAllDataForAdminCached()`. Since Phase 0 Step B (2026-10-04, @343, `e1a0a11`) it no longer returns `admins` / `logs`; remaining exposure is questions + structure only.
+- ✅ Phase 0 Step B (2026-10-04, @343): `registerAdmin` / `resetPassword` removed; `getAdminList`, `getLogsPage`, `aiConfigStatus`, `setModelRpd` are DEVELOPER-only via the `developerActions` block in `router-doPost.gs` (`session_expired` without session, `forbidden` on wrong role — keep `forbidden` distinct, the dashboard logs out on `session_expired` / `token_expired`); GET `getLogsPage` / `aiConfigStatus` return `forbidden`; `updateAdminProfile` requires self or DEVELOPER.
 - 🟡 `generateSessionToken` uses `Math.random()` not `Utilities.getUuid()`.
 - Not independently re-verified: `getGeminiConfig()` double `SpreadsheetApp.openById` call and `Usage_Count` write-before-success ordering — check directly if touching Gemini quota logic.
 
