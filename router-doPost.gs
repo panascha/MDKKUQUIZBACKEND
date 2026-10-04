@@ -2065,6 +2065,14 @@ function doPost(e) {
             if (realSheetName === 'Questions') {
               var appended = 0, updated = 0;
               var toAppend = [];
+              // แถวเดิมของข้อที่ถูกเขียนทับด้วยเนื้อหาที่ต่างไป — เก็บลง Logs หลังเขียนเสร็จ (กู้คืนได้เมื่อ import ทับผิด)
+              var overwritten = [];
+              var rowChanged = function (oldRow, newRow) {
+                for (var c = 0; c < newRow.length; c++) {
+                  if (String(oldRow[c] == null ? '' : oldRow[c]) !== String(newRow[c] == null ? '' : newRow[c])) return true;
+                }
+                return false;
+              };
 
               // T2.4: หลีกเลี่ยง setValues ต่อแถวสำหรับข้อที่อัปเดต — อ่าน block เดียว แก้ใน memory แล้วเขียนกลับครั้งเดียว
               // เงื่อนไข: ทุกแถวนำเข้าต้องกว้างเท่ากัน (uniform) จึงเขียนเป็นบล็อกสี่เหลี่ยมได้อย่างปลอดภัย
@@ -2076,10 +2084,17 @@ function doPost(e) {
                 var block = lastRow > 1 ? targetSheet.getRange(2, 1, lastRow - 1, width).getValues() : [];
                 var idToIdx = {};
                 for (var bi = 0; bi < block.length; bi++) idToIdx[String(block[bi][0]).trim()] = bi;
+                var sheetRowCount = block.length; // index ตั้งแต่นี้ขึ้นไป = แถวที่เพิ่งเพิ่มจาก payload นี้ ไม่ใช่ของเดิมในชีท
+                var capturedIdx = {};
 
                 importData.forEach(function (row) {
                   var qId = String(row[0]).trim();
                   if (idToIdx.hasOwnProperty(qId)) {
+                    var bIdx = idToIdx[qId];
+                    if (bIdx < sheetRowCount && !capturedIdx[bIdx] && rowChanged(block[bIdx], row)) {
+                      capturedIdx[bIdx] = true;
+                      overwritten.push(block[bIdx]);
+                    }
                     block[idToIdx[qId]] = row; // อัปเดตใน memory
                     updated++;
                   } else {
@@ -2102,7 +2117,12 @@ function doPost(e) {
                   var qId = String(row[0]).trim();
                   var idx = existingIds.indexOf(qId);
                   if (idx >= 0) {
-                    targetSheet.getRange(idx + 2, 1, 1, row.length).setValues([row]);
+                    var rowRange = targetSheet.getRange(idx + 2, 1, 1, row.length);
+                    if (idx < existing.length) {
+                      var oldRow = rowRange.getValues()[0];
+                      if (rowChanged(oldRow, row)) overwritten.push(oldRow);
+                    }
+                    rowRange.setValues([row]);
                     updated++;
                   } else {
                     toAppend.push(row);
@@ -2120,6 +2140,7 @@ function doPost(e) {
               writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName,
                 "Upserted Questions: " + appended + " added, " + updated + " updated", "",
                 "Added " + appended + ", Updated " + updated, metadata);
+              if (overwritten.length > 0) logImportOverwrites_(user, userRole, overwritten, metadata);
               sbMirrorQuestionSheetRows_(importData); // แถวดิบคอลัมน์ 0..6, sbFlush_ แบ่งก้อนให้เอง
 
               // Delta-feed: log แถว group QUESTION พร้อม qid จริง (comma-joined) ให้ getChangedSince เห็นข้อที่ import

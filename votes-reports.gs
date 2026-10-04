@@ -11,6 +11,37 @@ function writelog(user, action, targetId, details) {
 }
 
 /**
+ * adminImport: เก็บ "แถวเดิม" ของข้อที่ถูกเขียนทับลง Logs เพื่อให้กู้คืนได้
+ * overwritten = [แถวเดิมทั้งแถว (คอลัมน์ 0 = questionId)]
+ * รวมหลายแถวต่อหนึ่ง log row (ไม่ appendRow ต่อข้อ — ทำงานใน admin lock) และตัดก้อนไม่ให้เกิน 50k ตัวอักษร/เซลล์ของ Sheets
+ * ActionGroup = "DATA" (ไม่ใช่ "QUESTION") เพื่อไม่ให้ getChangedSince อ่าน TargetID เป็นรายการ qid ซ้ำกับแถว QUESTION/IMPORT
+ */
+function logImportOverwrites_(user, role, overwritten, meta) {
+  var LIMIT = 45000;
+  var chunk = [], ids = [], size = 2;
+  var flush = function () {
+    if (chunk.length === 0) return;
+    writeAdminLog(user, role, "DATA", "IMPORT_OVERWRITE", ids.join(","),
+      "Overwrote " + chunk.length + " existing question rows (old rows in OldValue)",
+      JSON.stringify(chunk), "", meta);
+    chunk = []; ids = []; size = 2;
+  };
+  overwritten.forEach(function (row) {
+    var s = JSON.stringify(row);
+    if (s.length > LIMIT) { // แถวเดียวใหญ่เกินเซลล์ (เช่น SVG ยาว) — เก็บเท่าที่เก็บได้ ดีกว่าทำให้ appendRow ล้มทั้งก้อน
+      flush();
+      writeAdminLog(user, role, "DATA", "IMPORT_OVERWRITE", String(row[0]),
+        "Overwrote 1 existing question row (old row truncated to " + LIMIT + " chars)",
+        s.substring(0, LIMIT), "", meta);
+      return;
+    }
+    if (size + s.length + 1 > LIMIT) flush();
+    chunk.push(row); ids.push(String(row[0])); size += s.length + 1;
+  });
+  flush();
+}
+
+/**
  * ฟังก์ชันใหม่: บันทึก Log ของ Admin โดยละเอียด
  */
 function writeAdminLog(user, role, group, type, targetId, details, oldVal, newVal, meta) {
