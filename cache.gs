@@ -136,6 +136,11 @@ function getLargeCache(key) {
   return value;
 }
 
+// requestId ของ convertPdfBatch/getConvertedResult — client ส่ง crypto.randomUUID(); จำกัดชุดอักขระ+ความยาวก่อนใช้เป็น cache key
+function isValidConvRequestId_(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(id);
+}
+
 function getPriorYearAuditDataCached(startTime) {
   var v = getVersionCached();
   var cacheKey = "prior_year_audit_" + v;

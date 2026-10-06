@@ -392,6 +392,27 @@ function doPost(e) {
     //   ไฟล์ 90 ข้อ = 7 POST ดังนั้น 20/ชม. เหลือแค่ 2 ไฟล์/ชม. ซึ่งน้อยเกินใช้งานจริง
     // 2026-09-24: 40 → 80 — client ลดเหลือ ~10 ข้อ/ชุด (กัน 360s timeout) → ไฟล์ 90 ข้อ ≈ 9-10 POST
     // ----------------------------------------------------
+    // getConvertedResult — อ่านผล convertPdfBatch ที่ cache ไว้ด้วย requestId (pure read, lock-free; ไม่ยิง Gemini)
+    // auth เหมือน convertPdfBatch; miss = {result:'not_found'} (ไม่ใช่ error) ให้ client poll ต่อได้
+    if (action === 'getConvertedResult') {
+      var gcUser = null;
+      if (data.sessionToken) gcUser = verifyAnySession(data.sessionToken);
+      if (!gcUser && data.username) gcUser = verifyAdmin(data.username, data.adminPass);
+      if (!gcUser) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'session_expired'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      if (!isValidConvRequestId_(data.requestId)) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'requestId ไม่ถูกต้อง'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var gcCached = getLargeCache('conv_res_' + data.requestId);
+      return ContentService.createTextOutput(gcCached || JSON.stringify({ result: 'not_found' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
     if (action === 'convertPdfBatch') {
       // rate-limit ก่อน auth (กัน flood ด้วย garbage token — mirror saveProgress)
       var pcRlKey = data.sessionToken || data.username || data.clientId || 'anon';
@@ -431,14 +452,18 @@ function doPost(e) {
       }
       try {
         var pcRes = callGeminiConverter(pcPrompt, pcKeyInfo, pcPdf, pcImages);
-        return ContentService.createTextOutput(JSON.stringify({
+        var pcOut = JSON.stringify({
           result: 'success',
           raw: pcRes.raw,
           finishReason: pcRes.finishReason,
           servedModel: pcRes.model,
           usage: pcRes.usage || null, // token counts — ใช้แยกว่า "ข้อหาย" เพราะโมเดลออกไม่ครบ หรือคำตอบถูกตัด
           quota: (pcKeyInfo.usage + 1) + "/" + pcKeyInfo.limit
-        })).setMimeType(ContentService.MimeType.JSON);
+        });
+        // requestId recovery: เก็บ response JSON เดิมไว้ให้ getConvertedResult ดึงคืน กรณี Google ทำ response หายหลัง doPost จบ
+        // (ไม่มี requestId = พฤติกรรมเดิมทุกอย่าง) — putLargeCache กลืน error เอง ไม่ทำให้ batch ล้ม
+        if (isValidConvRequestId_(data.requestId)) putLargeCache('conv_res_' + data.requestId, pcOut, 600);
+        return ContentService.createTextOutput(pcOut).setMimeType(ContentService.MimeType.JSON);
       } catch (pcErr) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: pcErr.message
