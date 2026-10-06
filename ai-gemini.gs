@@ -792,12 +792,14 @@ function handleGemini429_(apiKeyInfo, model, body, headers) {
    ========================================================= */
 function _modelDownCacheKey_(model) { return "model_down:" + model; }
 function _modelDownStreakKey_(model) { return "model_down_streak:" + model; }
-function markModelUnavailable_(model) {
+// ttlSec (optional): ผู้เรียกกำหนดอายุ circuit เอง — converter ส่ง 600s เพราะ 503 ของมันตอบช้า (77-95s/โมเดล)
+// TTL ปกติ 48-144s หมดก่อนชุดถัดไปจะเริ่ม → ชุดถัดไปวนกลับไปชนโมเดลที่ล่มซ้ำ
+function markModelUnavailable_(model, ttlSec) {
   try {
     var cache = CacheService.getScriptCache();
     var streak = Math.min((parseInt(cache.get(_modelDownStreakKey_(model)), 10) || 0) + 1, 4);
     var base = Math.min(60 * Math.pow(2, streak - 1), 120);       // 60, 120, 120, 120...
-    var ttl = Math.floor(base * (0.8 + Math.random() * 0.4));      // ±20% jitter
+    var ttl = ttlSec || Math.floor(base * (0.8 + Math.random() * 0.4)); // ±20% jitter
     cache.put(_modelDownStreakKey_(model), String(streak), 600);   // จำ streak 10 นาที
     cache.put(_modelDownCacheKey_(model), "1", ttl);
   } catch (e) { console.warn("markModelUnavailable_ failed: " + e.message); }
@@ -1371,7 +1373,7 @@ function executeGeminiWithAutoFallback_(cfg) {
           // overloadFree (converter): 503 ตอบเร็ว + ไม่หักโควต้า → ไม่นับเป็น attempt แล้วข้ามไปโมเดลถัดไปทันที (ไม่ retry โมเดลเดิม)
           // เดิม 3 โมเดลติดสไปก์พร้อมกัน = ครบ maxAttempts ทั้งที่ยังเหลือ 3.8/2.5 ใน chain; ยังถูกคุมด้วย maxFetches
           if (cfg.overloadFree) attempts--;
-          markModelUnavailable_(model); break;
+          markModelUnavailable_(model, cfg.modelDownTtlSec); break;
         }
         if (r.quota) { handleGemini429_(cfg.apiKeyInfo, model, r.body, r.headers); break; } // perDay→zero, perMinute/unknown→cooldown
         if (r.nextModel) break;
@@ -1548,6 +1550,9 @@ var CONVERTER_MAX_START_ELAPSED_MS = 120000;
 // เพดานงานต่อ call — ดู comment ใน buildPayload ของ callGeminiConverter
 var CONVERTER_MAX_OUTPUT_TOKENS = 12288;
 var CONVERTER_THINKING_BUDGET = 1024;
+var CONVERTER_STABLE_FALLBACK_MODEL = "gemini-2.5-flash";
+// โมเดลที่ตอบ 503 ให้ converter → เปิด circuit 10 นาที ชุดถัดไปของไฟล์เดียวกันข้ามไปเลย ไม่เสียเวลารอ 503 ซ้ำ
+var CONVERTER_MODEL_DOWN_TTL_SEC = 600;
 // ต่อท้าย prompt เฉพาะตอน retry หลังโดน RECITATION — รอบแรกยังคัดลอกตรงตามต้นฉบับ (กฎข้อ 7 ของ prompt ฝั่ง client)
 var CONVERTER_RECITATION_NOTE = "\n\n**รอบนี้โดนตัวกรอง recitation:** ให้เรียบเรียงถ้อยคำของโจทย์ (vignette) ใหม่ด้วยภาษาเดิมของต้นฉบับ " +
   "โดยคงข้อเท็จจริงทางพยาธิสรีรวิทยา อาการ ค่า lab ตัวเลข หน่วย และเลขข้อไว้ครบถ้วนทุกตัว — ใช้แทนกฎข้อ 7 เฉพาะ problem เท่านั้น " +
@@ -1567,6 +1572,10 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     // converter ห้ามใช้ flash-lite เด็ดขาด — กรองทั้ง apiKeyInfo.model และ chain จากทะเบียน AI_Models
     // (ทะเบียนคืนโมเดล Active ทุกตัวรวม lite; โมดูลอื่น เช่น askAIExpert/IntelSphere ยังใช้ lite ได้ตามเดิม)
     .filter(function (m) { return !/flash-lite/i.test(m); });
+  // 2026-10-06: ดัน 2.5-flash ขึ้นมาเป็นตัวสำรองอันดับแรก (ต่อจากโมเดลที่ปักหมุด) — ตอน 3.5/3.6/3.7 ติด 503 พร้อมกัน
+  // 503 แต่ละตัวตอบช้า 77-95s จน maxStartElapsedMs หมดก่อนถึง 2.5-flash ทั้งที่เป็นตัวเดียวที่ใช้งานได้
+  var i25 = models.indexOf(CONVERTER_STABLE_FALLBACK_MODEL);
+  if (i25 > 1) { models.splice(i25, 1); models.splice(1, 0, CONVERTER_STABLE_FALLBACK_MODEL); }
   if (models.length === 0) {
     throw new Error("แปลงไม่สำเร็จ: โควต้าโมเดล flash เต็มแล้ว (ตัวแปลง PDF ไม่ใช้ flash-lite) กรุณาลองใหม่ภายหลัง");
   }
@@ -1608,6 +1617,7 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     maxFetches: CONVERTER_MAX_FETCHES,
     maxStartElapsedMs: CONVERTER_MAX_START_ELAPSED_MS,
     overloadFree: true,
+    modelDownTtlSec: CONVERTER_MODEL_DOWN_TTL_SEC,
     // RECITATION: ยืนยันจากการรันจริง 2 รอบว่าสลับ thinking variant ไม่ช่วย — bump temp + ให้เรียบเรียงใหม่ แล้วข้ามไปโมเดลถัดไปเลย
     onRecitation: function () { convTemp = 0.8; recited = true; }
   });
