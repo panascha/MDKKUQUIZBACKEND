@@ -745,7 +745,7 @@ function doPost(e) {
           result: 'error', message: 'session_expired'
         })).setMimeType(ContentService.MimeType.JSON);
       }
-      return getAdminSyncData(data.clientVer, data.since);
+      return getAdminSyncData(data.clientVer, data.since, data.skipQuestionDelta === true);
     }
 
     // ----------------------------------------------------

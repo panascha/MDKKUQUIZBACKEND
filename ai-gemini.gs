@@ -85,6 +85,7 @@ function getAIModelRegistry_(ss) {
 }
 
 // ล้าง cache ทะเบียนโมเดลทั้ง 3 ชั้น (in-process + registry + payload ของ getAIModels)
+// payload ของ getAIModels อยู่ได้ถึง 6 ชม. — จุดเขียน AI_Models ใหม่ที่ลืมเรียกตัวนี้ = badge/ตารางค้างค่าเก่านาน
 function invalidateAIModelsCache_() {
   _aiModelRegistryCache = null;
   try {
@@ -404,7 +405,9 @@ function getAIConfigStatus() {
 // คืน [{model, rpd, priority, status, notes}] ตรงจากชีต AI_Models (ไม่ sensitive → public เหมือน aiConfigStatus)
 function getAIModels() {
   function out(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
-  // cache payload เต็ม 5 นาที (แยกจาก registry cache — ต้องใช้ Status/Notes ดิบที่ registry ทิ้งไป)
+  // cache payload เต็ม 6 ชม. (แยกจาก registry cache — ต้องใช้ Status/Notes ดิบที่ registry ทิ้งไป)
+  // ความสดคุมด้วย invalidateAIModelsCache_() ทุกจุดที่เขียน AI_Models + onSheetEdit; TTL สั้นทำให้ miss บ่อย
+  // และ miss แต่ละครั้ง = เปิดสเปรดชีต 15-55s เพื่ออ่าน ~10 แถว
   try {
     var hit = CacheService.getScriptCache().get("ai_models_public");
     if (hit) return ContentService.createTextOutput(hit).setMimeType(ContentService.MimeType.JSON);
@@ -421,7 +424,7 @@ function getAIModels() {
                 status: String(data[i][3] || "").trim(), notes: String(data[i][4] || "") });
   }
   var payload = JSON.stringify({ result: 'success', models: rows });
-  try { CacheService.getScriptCache().put("ai_models_public", payload, 300); } catch (e) {}
+  try { CacheService.getScriptCache().put("ai_models_public", payload, 21600); } catch (e) {}
   return ContentService.createTextOutput(payload).setMimeType(ContentService.MimeType.JSON);
 }
 

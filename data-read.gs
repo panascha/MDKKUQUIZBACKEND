@@ -47,7 +47,10 @@ function getAllDataForAdmin(startTime) {
 
 // getAdminSync — combined delta-sync endpoint สำหรับแดชบอร์ดแอดมิน (ยิงจาก doPost lock-free tier, auth แล้ว)
 // clientVer ตรงกับเวอร์ชันปัจจุบัน ⇒ NOT_MODIFIED; ไม่ตรง ⇒ ส่ง small slices ทั้งก้อน + question delta (ไม่ส่ง questions เต็ม)
-function getAdminSyncData(clientVer, sinceStr) {
+// skipQuestionDelta=true ⇒ ไม่คำนวณ question delta เลย (client ดึง questions จาก Supabase แล้วทิ้ง delta ของ GAS อยู่ดี)
+//   จำเป็น: since ที่เก่ากว่า 1000 แถวท้ายของ Logs ทำให้ getChangedSinceTimestamp อ่าน Logs ทั้งชีต + Questions 24k แถว
+//   แล้ว putLargeCache ก้อนใหญ่ (>90s → 404 ฝั่ง client และดัน cache อายุสั้นตัวอื่นหลุด)
+function getAdminSyncData(clientVer, sinceStr, skipQuestionDelta) {
   // Stamp เวลา "ก่อน" อ่านทุกอย่าง — write ที่ landing ระหว่างประมวลผลจะถูกเก็บใน delta รอบถัดไปเสมอ (overlap = idempotent)
   var syncTime = new Date().getTime();
   var v = getVersionCached();
@@ -58,7 +61,9 @@ function getAdminSyncData(clientVer, sinceStr) {
   }
 
   // Question delta — เรียกแบบไม่ filter subject เพื่อให้ "id อยู่ใน changedIds แต่ไม่มีแถว" = ถูกลบ เสมอ
-  var delta = JSON.parse(getChangedSinceTimestamp(sinceStr, '').getContent());
+  var delta = skipQuestionDelta
+    ? { changed: [], changedIds: [] }
+    : JSON.parse(getChangedSinceTimestamp(sinceStr, '').getContent());
 
   // Small slices (ทุกอย่างยกเว้น questions ~1.6MB raw) — cache ผูกเวอร์ชัน TTL 1800 เหมือน getAllData
   // key "small2": blob รุ่นก่อน (admin_sync_small_) มี admins/logs ติดอยู่ — เปลี่ยนชื่อเพื่อไม่ให้ถูกเสิร์ฟหลัง deploy
