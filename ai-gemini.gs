@@ -1540,7 +1540,8 @@ function callGeminiForSlipOCR(dataUrl) {
 // ลำดับโมเดลตายตัวของ converter — callGeminiConverter กรองให้เหลือเฉพาะตัวที่ key ยังมีโควต้า (apiKeyInfo.fallbackModels)
 // 2026-10-07: full flash เหลือ 20 RPD/key และติด 503 บ่อย → ยอมให้ตกไป 3.5-flash-lite (500 RPD) เป็นตัวสุดท้าย
 // (เดิม 2026-08-09 ห้าม lite เพราะคุณภาพแปลงต่ำ — แลกคุณภาพกับการได้ผลลัพธ์); ตัด 2.5-flash ออก (404 กับ key ใหม่)
-var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"];
+// 2026-10-07: ต่อท้ายด้วย 3.1-flash-lite (500 RPD) — 3.5-flash-lite ก็ติด 503 ได้; 3.6-flash กับ 2.5-flash ยังไม่ใช้
+var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
 // เพดาน HTTP fetch รวมต่อ 1 POST — overload ไม่นับ attempt (ff8d350) แต่นับตัวนี้ → call เดียวเดิน chain ยาวจนเกิน 360s ไม่ได้
