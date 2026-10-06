@@ -1375,7 +1375,11 @@ function executeGeminiWithAutoFallback_(cfg) {
           if (cfg.overloadFree) attempts--;
           markModelUnavailable_(model, cfg.modelDownTtlSec); break;
         }
-        if (r.quota) { handleGemini429_(cfg.apiKeyInfo, model, r.body, r.headers); break; } // perDay→zero, perMinute/unknown→cooldown
+        if (r.quota) {
+          // overloadFree (converter): 429 ตอบเร็วเหมือน 503 → ไม่นับ attempt ไม่งั้น full flash 3 ตัวโควต้าหมด = ครบ maxAttempts ก่อนถึง lite
+          if (cfg.overloadFree) attempts--;
+          handleGemini429_(cfg.apiKeyInfo, model, r.body, r.headers); break; // perDay→zero, perMinute/unknown→cooldown
+        }
         if (r.nextModel) break;
         if (r.recitation) { if (cfg.onRecitation) cfg.onRecitation(); break; }
         // อื่นๆ (400/คำตอบว่าง/parse_fail) → variant ถัดไปของโมเดลเดิม; หมด variant → โมเดลถัดไป
@@ -1533,11 +1537,10 @@ function callGeminiForSlipOCR(dataUrl) {
    =========================================
 */
 
-// D13: fallback chain สำรองกรณีทะเบียน AI_Models อ่านไม่ได้ (ปกติ chain มาจาก apiKeyInfo.fallbackModels)
-// 2026-08-09: ตัด flash-lite ออกทั้งหมด — คุณภาพแปลงข้อสอบต่ำเกินรับได้
-// converter ใช้ full flash เท่านั้น (3.7 → 3.6 → 3.5 → 2.5); การกรองจริงอยู่ใน callGeminiConverter
-// เพราะ chain ที่ใช้จริงมาจากทะเบียน AI_Models ซึ่งยังมี lite อยู่ (โมดูลอื่นยังใช้ lite ได้ตามเดิม)
-var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"];
+// ลำดับโมเดลตายตัวของ converter — callGeminiConverter กรองให้เหลือเฉพาะตัวที่ key ยังมีโควต้า (apiKeyInfo.fallbackModels)
+// 2026-10-07: full flash เหลือ 20 RPD/key และติด 503 บ่อย → ยอมให้ตกไป 3.5-flash-lite (500 RPD) เป็นตัวสุดท้าย
+// (เดิม 2026-08-09 ห้าม lite เพราะคุณภาพแปลงต่ำ — แลกคุณภาพกับการได้ผลลัพธ์); ตัด 2.5-flash ออก (404 กับ key ใหม่)
+var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
 // เพดาน HTTP fetch รวมต่อ 1 POST — overload ไม่นับ attempt (ff8d350) แต่นับตัวนี้ → call เดียวเดิน chain ยาวจนเกิน 360s ไม่ได้
@@ -1550,7 +1553,6 @@ var CONVERTER_MAX_START_ELAPSED_MS = 120000;
 // เพดานงานต่อ call — ดู comment ใน buildPayload ของ callGeminiConverter
 var CONVERTER_MAX_OUTPUT_TOKENS = 12288;
 var CONVERTER_THINKING_BUDGET = 1024;
-var CONVERTER_STABLE_FALLBACK_MODEL = "gemini-2.5-flash";
 // โมเดลที่ตอบ 503 ให้ converter → เปิด circuit 10 นาที ชุดถัดไปของไฟล์เดียวกันข้ามไปเลย ไม่เสียเวลารอ 503 ซ้ำ
 var CONVERTER_MODEL_DOWN_TTL_SEC = 600;
 // ต่อท้าย prompt เฉพาะตอน retry หลังโดน RECITATION — รอบแรกยังคัดลอกตรงตามต้นฉบับ (กฎข้อ 7 ของ prompt ฝั่ง client)
@@ -1565,19 +1567,15 @@ var CONVERTER_RECITATION_NOTE = "\n\n**รอบนี้โดนตัวก�
  * คืน { raw, finishReason, model } — ฝั่ง client เป็นคน parse (มี recovery logic ครบอยู่แล้ว)
  */
 function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
-  var chain = (apiKeyInfo.fallbackModels && apiKeyInfo.fallbackModels.length)
-    ? apiKeyInfo.fallbackModels : CONVERTER_FALLBACK_MODELS;
-  var models = [apiKeyInfo.model].concat(chain)
-    .filter(function (m, i, arr) { return m && arr.indexOf(m) === i; })
-    // converter ห้ามใช้ flash-lite เด็ดขาด — กรองทั้ง apiKeyInfo.model และ chain จากทะเบียน AI_Models
-    // (ทะเบียนคืนโมเดล Active ทุกตัวรวม lite; โมดูลอื่น เช่น askAIExpert/IntelSphere ยังใช้ lite ได้ตามเดิม)
-    .filter(function (m) { return !/flash-lite/i.test(m); });
-  // 2026-10-06: ดัน 2.5-flash ขึ้นมาเป็นตัวสำรองอันดับแรก (ต่อจากโมเดลที่ปักหมุด) — ตอน 3.5/3.6/3.7 ติด 503 พร้อมกัน
-  // 503 แต่ละตัวตอบช้า 77-95s จน maxStartElapsedMs หมดก่อนถึง 2.5-flash ทั้งที่เป็นตัวเดียวที่ใช้งานได้
-  var i25 = models.indexOf(CONVERTER_STABLE_FALLBACK_MODEL);
-  if (i25 > 1) { models.splice(i25, 1); models.splice(1, 0, CONVERTER_STABLE_FALLBACK_MODEL); }
+  // ลำดับตายตัว CONVERTER_FALLBACK_MODELS (ไม่ตามโมเดลที่ปักหมุด/priority ในทะเบียน) — กรองเหลือเฉพาะโมเดลที่ key นี้ยังมีโควต้า
+  // ทะเบียนอ่านไม่ได้ (ไม่มี fallbackModels) → ใช้ทั้ง chain
+  var models = CONVERTER_FALLBACK_MODELS;
+  if (apiKeyInfo.fallbackModels && apiKeyInfo.fallbackModels.length) {
+    var avail = [apiKeyInfo.model].concat(apiKeyInfo.fallbackModels);
+    models = models.filter(function (m) { return avail.indexOf(m) >= 0; });
+  }
   if (models.length === 0) {
-    throw new Error("แปลงไม่สำเร็จ: โควต้าโมเดล flash เต็มแล้ว (ตัวแปลง PDF ไม่ใช้ flash-lite) กรุณาลองใหม่ภายหลัง");
+    throw new Error("แปลงไม่สำเร็จ: โควต้าโมเดลของตัวแปลง PDF เต็มแล้ว (" + CONVERTER_FALLBACK_MODELS.join(", ") + ") กรุณาลองใหม่ภายหลัง");
   }
 
   // parts เหมือนกันทุก attempt — ประกอบครั้งเดียว
@@ -1607,7 +1605,8 @@ function callGeminiConverter(prompt, apiKeyInfo, pdfB64, images) {
     // 12288 ไม่ใช่ 8192: ชุด 10 ข้อ + explain ≈ 7-8k token (splitter.js) — 8192 ชนเพดานพอดี; ถ้าเกินจริง client กู้ partial ได้
     buildPayload: function (model, disableThinking) {
       var genConfig = { "responseMimeType": "application/json", "temperature": convTemp, "maxOutputTokens": CONVERTER_MAX_OUTPUT_TOKENS };
-      genConfig.thinkingConfig = { "thinkingBudget": disableThinking ? 0 : CONVERTER_THINKING_BUDGET };
+      // flash-lite reject thinkingBudget:0 (400 INVALID_ARGUMENT) → ไม่ส่ง thinkingConfig เลย (แบบเดียวกับ search overview)
+      if (!/flash-lite/i.test(model)) genConfig.thinkingConfig = { "thinkingBudget": disableThinking ? 0 : CONVERTER_THINKING_BUDGET };
       var useParts = recited ? [{ "text": prompt + CONVERTER_RECITATION_NOTE }].concat(parts.slice(1)) : parts;
       return { "contents": [{ "parts": useParts }], "generationConfig": genConfig };
     },
