@@ -119,8 +119,30 @@ function createSession(email, userObj) {
   return token;
 }
 
+var SESSION_CACHE_TTL = 300; // seconds
+function sessionCacheGet_(prefix, token) {
+  try {
+    var raw = CacheService.getScriptCache().get(prefix + token);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+// ttl = min(300, seconds until expiry); skip if <=0. Never called with null user.
+function sessionCachePut_(prefix, token, user, expiry) {
+  try {
+    var secs = Math.floor((expiry.getTime() - Date.now()) / 1000);
+    var ttl = Math.min(SESSION_CACHE_TTL, secs);
+    if (!user || ttl < 1) return;
+    CacheService.getScriptCache().put(prefix + token, JSON.stringify(user), ttl);
+  } catch (e) {}
+}
+function sessionCacheRemove_(token) {
+  try { CacheService.getScriptCache().removeAll(['sess_admin_' + token, 'sess_any_' + token]); } catch (e) {}
+}
+
 function verifySessionToken(token) {
   if (!token) return null;
+  var hit = sessionCacheGet_('sess_admin_', token);
+  if (hit) return hit;
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName("Sessions");
   if (!sheet) return null;
@@ -138,7 +160,9 @@ function verifySessionToken(token) {
       if (!lastUsed || isNaN(lastUsed.getTime()) || (now.getTime() - lastUsed.getTime()) > 3600000) {
         sheet.getRange(i + 1, 5).setValue(now.toISOString());
       }
-      return findAdminByEmail(data[i][1]);
+      var u = findAdminByEmail(data[i][1]);
+      if (u) sessionCachePut_('sess_admin_', token, u, expiry);
+      return u;
     }
   }
   return null;
@@ -149,6 +173,8 @@ function verifySessionToken(token) {
 // ห้ามใช้แทน verifySessionToken ใน action ฝั่งแอดมิน: token ของ Student ต้องผ่านไม่ได้
 function verifyAnySession(token) {
   if (!token) return null;
+  var hit = sessionCacheGet_('sess_any_', token);
+  if (hit) return hit;
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName("Sessions");
   if (!sheet) return null;
@@ -168,8 +194,9 @@ function verifyAnySession(token) {
       }
       var email = data[i][1];
       var adminUser = findAdminByEmail(email);
-      if (adminUser) return adminUser;
-      return { email: email, role: "Student", displayName: String(email).split("@")[0] };
+      var u = adminUser || { email: email, role: "Student", displayName: String(email).split("@")[0] };
+      sessionCachePut_('sess_any_', token, u, expiry);
+      return u;
     }
   }
   return null;
@@ -180,11 +207,13 @@ function capSessionsByEmail(sheet, email, keep) {
   var data = sheet.getDataRange().getValues();
   var rows = [];
   for (var i = 1; i < data.length; i++) {
-    if (data[i][1] === email) rows.push({ row: i + 1, createdAt: new Date(data[i][2]).getTime() || 0 });
+    if (data[i][1] === email) rows.push({ row: i + 1, token: data[i][0], createdAt: new Date(data[i][2]).getTime() || 0 });
   }
   if (rows.length <= keep) return;
   rows.sort(function (a, b) { return a.createdAt - b.createdAt; }); // เก่าสุดก่อน
-  var toDelete = rows.slice(0, rows.length - keep).map(function (r) { return r.row; });
+  var evicted = rows.slice(0, rows.length - keep);
+  evicted.forEach(function (r) { sessionCacheRemove_(r.token); });
+  var toDelete = evicted.map(function (r) { return r.row; });
   toDelete.sort(function (a, b) { return b - a; }); // ลบจากล่างขึ้นบน กัน index เลื่อน
   toDelete.forEach(function (rowIdx) { sheet.deleteRow(rowIdx); });
 }
@@ -204,7 +233,10 @@ function getOrCreateProgressSheet(ss) {
 function cleanupSessionsByEmail(sheet, email) {
   var data = sheet.getDataRange().getValues();
   for (var i = data.length - 1; i >= 1; i--) {
-    if (data[i][1] === email) sheet.deleteRow(i + 1);
+    if (data[i][1] === email) {
+      sessionCacheRemove_(data[i][0]);
+      sheet.deleteRow(i + 1);
+    }
   }
 }
 

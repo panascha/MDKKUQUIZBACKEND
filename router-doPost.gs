@@ -1272,6 +1272,7 @@ function doPost(e) {
         if (action === 'deleteSession') {
           var token = data.sessionToken;
           if (token) {
+            sessionCacheRemove_(token);
             var ss = SpreadsheetApp.openById(SHEET_ID);
             var sheet = ss.getSheetByName("Sessions");
             if (sheet) {
@@ -1317,6 +1318,7 @@ function doPost(e) {
             return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'ไม่พบบัญชีของคุณในระบบ' })).setMimeType(ContentService.MimeType.JSON);
           }
           adminsSheet.getRange(myRow, 9).setValue(newSid); // col 9 = StudentID (index 8)
+          sessionCacheRemove_(data.sessionToken);
           updateVersion();
           writeAdminLog(sidUser.displayName || myEmail, sidUser.role || "", "AUTH", "VERIFY_SID", "Admins", "ยืนยันตัวตนด้วยรหัสนักศึกษา", "", "", "");
           return ContentService.createTextOutput(JSON.stringify({ 'result': 'success', 'studentId': newSid })).setMimeType(ContentService.MimeType.JSON);
