@@ -78,6 +78,7 @@ Questions use `///` as a multi-value separator (`img`, `choices` columns); `cate
 - **`doPost` lock tiers are load-bearing** — don't add a new write action without picking lock-free/localized/admin deliberately (see Architecture above).
 - **`VOTE_THRESHOLD_CONFIRM` (2) and `REPORT_VOTE_THRESHOLD` (5) are independent constants** — don't conflate them when touching vote or report logic.
 - **`///` is the data delimiter** for multi-value fields.
+- **Session cache (`sessions.gs`, GAS @350)**: `verifySessionToken` / `verifyAnySession` cache the verified user in `CacheService` under `sess_admin_<token>` / `sess_any_<token>`, TTL min(300s, time until `ExpiresAt`); misses are never cached. Any code that deletes a Sessions row or changes what a session resolves to must call `sessionCacheRemove_(token)` — currently `deleteSession` and `saveStudentId` (`router-doPost.gs`), `capSessionsByEmail` and `cleanupSessionsByEmail` (`sessions.gs`). Role changes in the Admins sheet stay stale up to 5 min (accepted).
 - Community report-vote auto-apply flow (`processReports()` → `applyReportCorrection()` → Gemini-generated explanation) strips raw Drive image URLs / `<svg` choices to `[รูปภาพ]` before sending to Gemini — don't remove that sanitization, it prevents leaking binary data into the prompt.
 
 ## Known Open Issues (this repo)
