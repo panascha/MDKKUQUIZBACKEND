@@ -265,6 +265,12 @@ function sbMirrorQuestionDeleted_(questionId) {
   sbQueue_('soft_delete_questions', [String(questionId)]);
 }
 
+/** หลายข้อพร้อมกัน — bulkDeleteQuestions (<=100 id, ยิง RPC เดียว) */
+function sbMirrorQuestionsDeleted_(ids) {
+  if (!sbEnabled_() || !ids || !ids.length) return;
+  sbQueue_('soft_delete_questions', ids.map(String));
+}
+
 /** โหวตหนึ่งแถวที่ "เขียนค่าสุดท้ายแล้ว" — ไม่ใช่ delta (§9.11 หมายเหตุ upsert_votes_batch) */
 function sbMirrorVoteRow_(row) {
   if (!sbEnabled_() || !row) return;

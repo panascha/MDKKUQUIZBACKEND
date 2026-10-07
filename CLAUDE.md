@@ -28,7 +28,7 @@ Get `<deploymentId>` from `clasp deployments` (it's the ID embedded in `window.A
 
 ## Architecture
 
-Source split into 13 `.gs` files (GAS loads alphabetically into shared global scope — function order irrelevant, all top-level `var`s are literals):
+Source split into 14 `.gs` files (GAS loads alphabetically into shared global scope — function order irrelevant, all top-level `var`s are literals):
 
 | File | Contents |
 |------|----------|
@@ -44,6 +44,7 @@ Source split into 13 `.gs` files (GAS loads alphabetically into shared global sc
 | `admin.gs` | Auth functions: `hashPasswordInternal`, `verifyAdmin`, `verifyGoogleToken`, `findAdminByEmail`, `verifyUser`, `uploadToDrive`, `getPendingReportCount` |
 | `maintenance.gs` | One-off admin utils: split-category, migrations, sort, verification reports, staging cleanup |
 | `intelsphere.gs` | IntelSphere key pool, model catalog, rate limits, agentQuery, chatbot, key seeding, donor credits |
+| `bulk-questions.gs` | `bulkDeleteQuestionsCore_` (move rows to lazy `Questions_Trash` sheet, then delete bottom-up; **restore is manual** — copy the row back in the sheet, drop `DeletedAt`/`DeletedBy`) and `bulkSetQuestionCategoriesCore_` (replace whole category list, validated against `Category` sheet). Cap 100 ids/call. Router only does auth/role/dispatch |
 | `study-backend.gs` | AI_Feedback, question relations, KB chunks, glossary, high-yield, keyword index |
 
 Code.js is an empty placeholder pushed to GAS to overwrite the old monolithic file.
@@ -61,7 +62,7 @@ Key constants in `config.gs`:
 **`doPost(e)`** (~line 896) uses a **3-tier lock model**, not one global lock:
 1. **Lock-free group** — `verifySession`, `askAIExpert`. No `LockService` call at all.
 2. **Localized lock group** — `submitVote`, `submitReport`, `voteOnReport`, `deleteSession`, `batchLog`. 15s `tryLock`.
-3. **Admin lock group** — question/category/subject/announcement CRUD (`editQuestion`, `deleteQuestion`, `addCategory`, `adminImport`, `updateReportStatus`, `deleteCategory`, `updateCategory`, `deleteGroup`, `updateAccordionGroup`, `addSubject`, `updateSubject`, `deleteSubject`, `addAnnouncement`, `editAnnouncement`, `deleteAnnouncement`). 25s `tryLock`, requires a valid session/admin auth.
+3. **Admin lock group** — question/category/subject/announcement CRUD (`editQuestion`, `deleteQuestion`, `addCategory`, `adminImport`, `updateReportStatus`, `deleteCategory`, `updateCategory`, `deleteGroup`, `updateAccordionGroup`, `addSubject`, `updateSubject`, `deleteSubject`, `addAnnouncement`, `editAnnouncement`, `deleteAnnouncement`, `bulkAddQuestionCategories`, `bulkSetQuestionCategories`, `bulkDeleteQuestions` — the last is DEVELOPER-only, role failure returns `forbidden`). 25s `tryLock`, requires a valid session/admin auth.
 
 **When adding a new POST action, place it in the correct tier deliberately**: lock-free for pure reads, localized for high-frequency small writes, admin for schema/data-mutating writes that need auth. Putting a write in the lock-free group risks races under concurrent load; putting a read in a locked group adds needless contention.
 

@@ -1774,7 +1774,7 @@ function doPost(e) {
         }
       }
 
-      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual', 'bulkAddQuestionCategories', 'indexSlideFolder'];
+      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual', 'bulkAddQuestionCategories', 'bulkSetQuestionCategories', 'bulkDeleteQuestions', 'indexSlideFolder'];
       if (adminActions.indexOf(action) > -1) {
         var userObj = null;
         if (data.sessionToken) {
@@ -2032,6 +2032,20 @@ function doPost(e) {
           return ContentService.createTextOutput(JSON.stringify({
             'result': 'success', 'applied': applied, 'skipped': skipped
           })).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        if (action === 'bulkSetQuestionCategories') {
+          var bsRes = bulkSetQuestionCategoriesCore_(doc, data.data && data.data.ids, data.data && data.data.categoryIds, user, userRole, metadata);
+          return ContentService.createTextOutput(JSON.stringify(bsRes)).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        // DEVELOPER เท่านั้น (plan master-architecture-report.md:122,336) — role fail = 'forbidden' ห้ามใช้ token_expired
+        if (action === 'bulkDeleteQuestions') {
+          if (!requireRole_(userObj, 'DEVELOPER')) {
+            return ContentService.createTextOutput(JSON.stringify({ 'result': 'error', 'message': 'forbidden' })).setMimeType(ContentService.MimeType.JSON);
+          }
+          var bdRes = bulkDeleteQuestionsCore_(doc, data.data && data.data.ids, user, userRole, metadata);
+          return ContentService.createTextOutput(JSON.stringify(bdRes)).setMimeType(ContentService.MimeType.JSON);
         }
 
         if (action === 'deleteQuestion') {
