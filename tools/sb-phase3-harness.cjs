@@ -98,4 +98,84 @@ assert.strictEqual(c.calls.length, 1);
 c.sbMirrorDiscussionStatus_(undefined, 'pinned');
 assert.strictEqual(c.calls.length, 1);
 
+// 8. stored pgId: used directly, no heuristic lookup
+c = makeCtx(true, () => ok({ ok: true }));
+c.sbMirrorDiscussionDelete_(Object.assign({}, pg, { pgId: 'uuid-1' }), 'e', false);
+assert.strictEqual(c.calls.length, 1);
+assert.ok(c.calls[0].url.endsWith('/rpc/soft_delete_discussion_comment'));
+assert.strictEqual(JSON.parse(c.calls[0].opts.payload).p_id, 'uuid-1');
+c.sbMirrorDiscussionStatus_(Object.assign({}, pg, { pgId: 'uuid-1' }), 'pinned');
+assert.strictEqual(JSON.parse(c.calls[1].opts.payload).p_id, 'uuid-1');
+// 'none' (post mirror failed) -> no lookup, no rpc
+c = makeCtx(true, () => { throw new Error('should not fetch'); });
+c.sbMirrorDiscussionDelete_(Object.assign({}, pg, { pgId: 'none' }), 'e', true);
+c.sbMirrorDiscussionStatus_(Object.assign({}, pg, { pgId: 'none' }), 'pinned');
+assert.strictEqual(c.calls.length, 0);
+// empty pgId (old row) -> heuristic fallback
+c = makeCtx(true, (url) => url.includes('/rest/v1/discussions') ? ok([{ id: 'h1' }]) : ok({ ok: true }));
+c.sbMirrorDiscussionDelete_(Object.assign({}, pg, { pgId: '' }), 'e', false);
+assert.strictEqual(c.calls.length, 2);
+assert.strictEqual(JSON.parse(c.calls[1].opts.payload).p_id, 'h1');
+
+// 9. PropertiesService throw never surfaces
+c = makeCtx(true, () => { throw new Error('no fetch'); });
+c.PropertiesService.getScriptProperties = () => { throw new Error('props down'); };
+assert.doesNotThrow(() => c.sbMirrorDiscussionPost_('q', 'e', 'n', 't', 'x'));
+assert.doesNotThrow(() => c.sbMirrorDiscussionDelete_(pg, 'e', true));
+assert.doesNotThrow(() => c.sbMirrorProgress_('a', 's', 1, {}));
+assert.strictEqual(c.calls.length, 0);
+
+// 10. discussion.gs: header add, rowNum, recordDiscussionPgId_, pgId in pg
+function makeSheetCtx(rows) { // rows: array of arrays incl. header
+  const sheet = {
+    getLastRow: () => rows.length,
+    getRange: (r, col, nr, nc) => ({
+      getValue: () => (rows[r - 1] || [])[col - 1] || '',
+      setValue(v) { (rows[r - 1] = rows[r - 1] || [])[col - 1] = v; return this; },
+      getValues: () => [(rows[r - 1] || []).slice(col - 1, col - 1 + nc)],
+      setValues: v => { rows[r - 1] = v[0].slice(); },
+      setFontWeight() { return this; }, setBackground() { return this; }
+    }),
+    getDataRange: () => ({ getValues: () => rows.map(r => r.slice()) }),
+    appendRow: r => { rows.push(r); }, setFrozenRows() {}
+  };
+  const x = {
+    console, SHEET_ID: 'x', DISCUSSION_SHEET_NAME: 'Discussion', DISCUSSION_MAX_COMMENTS: 100,
+    SpreadsheetApp: { openById: () => ({ getSheetByName: () => sheet, insertSheet: () => sheet }) },
+    CacheService: { getScriptCache: () => ({ remove() {} }) },
+    Utilities: { computeDigest: () => [1], DigestAlgorithm: { SHA_256: 1 } }
+  };
+  vm.createContext(x);
+  vm.runInContext(fs.readFileSync(path.join(root, 'discussion.gs'), 'utf8'), x);
+  return x;
+}
+let rows = [['Timestamp', 'QuestionID', 'Email', 'Nickname', 'Tag', 'Text', 'Status'],
+  [new Date('2026-01-01T00:00:00Z'), 'q9', 'old@x', 'n', 't', 'old', 'visible']];
+let d = makeSheetCtx(rows);
+rows[1][0] = vm.runInContext("new Date('2026-01-01T00:00:00Z')", d); // Date must come from the vm realm for instanceof
+d.setupDiscussionSheet();
+assert.strictEqual(rows[0][7], 'PgId');                // legacy sheet gets H header
+assert.strictEqual(rows[0].length, 8);
+assert.strictEqual(rows[1].length, 7);                 // old row untouched
+const pr = d.postDiscussionCommentLocked_('q1', 'a@x', 'nick', 'hello');
+assert.strictEqual(pr.rowNum, 3);
+assert.strictEqual(rows[2].length, 7);                 // post itself writes A-G only
+d.recordDiscussionPgId_(pr.rowNum, 'q1', pr.comment.timestamp, { ok: true, id: 'u-1' });
+assert.strictEqual(rows[2][7], 'u-1');
+// null result (mirror off) -> nothing; failure -> 'none'; mismatch -> nothing
+d.recordDiscussionPgId_(2, 'q9', rows[1][0].toISOString(), null);
+assert.strictEqual(rows[1][7], undefined);
+d.recordDiscussionPgId_(2, 'q9', rows[1][0].toISOString(), { error: 'x' });
+assert.strictEqual(rows[1][7], 'none');
+d.recordDiscussionPgId_(2, 'other', rows[1][0].toISOString(), { ok: true, id: 'zzz' });
+assert.strictEqual(rows[1][7], 'none');
+// delete/status return pgId
+const dr = d.deleteDiscussionCommentLocked_('q1', pr.comment.timestamp, 'a@x', false);
+assert.strictEqual(dr.pg.pgId, 'u-1');
+const sr = d.setDiscussionCommentStatusLocked_('q9', rows[1][0].toISOString(), 'pinned');
+assert.strictEqual(sr.pg.pgId, 'none');
+// old row with no H -> ''
+rows[1].length = 7;
+assert.strictEqual(d.setDiscussionCommentStatusLocked_('q9', rows[1][0].toISOString(), 'visible').pg.pgId, '');
+
 console.log('sb-phase3-harness: all assertions passed');

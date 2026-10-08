@@ -53,12 +53,18 @@ var SB_DIRTY_SHEETS_ = {};
 var SB_CFG_CACHED_;
 function sbConfig_() {
   if (SB_CFG_CACHED_ === undefined) {
-    var props = PropertiesService.getScriptProperties();
-    var url = props.getProperty('SUPABASE_URL');
-    var key = props.getProperty('SUPABASE_SERVICE_KEY');
-    SB_CFG_CACHED_ = (url && key)
-      ? { url: String(url).replace(/\/+$/, ''), key: String(key) }
-      : null;
+    // PropertiesService throw ต้องไม่หลุดไปถึงเส้นทางเขียนชีต — ถือว่า mirror ปิดสำหรับ execution นี้
+    try {
+      var props = PropertiesService.getScriptProperties();
+      var url = props.getProperty('SUPABASE_URL');
+      var key = props.getProperty('SUPABASE_SERVICE_KEY');
+      SB_CFG_CACHED_ = (url && key)
+        ? { url: String(url).replace(/\/+$/, ''), key: String(key) }
+        : null;
+    } catch (e) {
+      console.error('sbConfig_: ' + e.message);
+      SB_CFG_CACHED_ = null;
+    }
   }
   return SB_CFG_CACHED_;
 }
@@ -302,10 +308,22 @@ function sbFindDiscussionId_(pg) {
   }
 }
 
-/** deleteComment — pg = {qid,email,text,ts} ของแถวชีตที่เพิ่งลบ */
+/**
+ * uuid ของคอมเมนต์ใน PG: ใช้ที่เก็บไว้ในชีต (pg.pgId) ก่อน
+ * 'none' = ตอนโพสต์ mirror ล้มเหลว ⇒ PG ไม่มีแถวนี้ ห้ามเดา (heuristic อาจไปโดนคอมเมนต์ข้อความเดียวกันตัวอื่น)
+ * ว่าง = แถวเก่าก่อนมีคอลัมน์ PgId ⇒ fallback heuristic
+ */
+function sbResolveDiscussionId_(pg) {
+  if (!pg) return null;
+  if (pg.pgId === 'none') return null;
+  if (pg.pgId) return pg.pgId;
+  return sbFindDiscussionId_(pg);
+}
+
+/** deleteComment — pg = {qid,email,text,ts,pgId} ของแถวชีตที่เพิ่งลบ */
 function sbMirrorDiscussionDelete_(pg, requestorEmail, isAdmin) {
   if (!sbEnabled_()) return null;
-  var id = sbFindDiscussionId_(pg);
+  var id = sbResolveDiscussionId_(pg);
   if (!id) return null;
   return sbWriteNow_('soft_delete_discussion_comment', {
     p_id: id, p_requestor_email: String(requestorEmail || ''), p_is_admin: !!isAdmin
@@ -315,7 +333,7 @@ function sbMirrorDiscussionDelete_(pg, requestorEmail, isAdmin) {
 /** setCommentStatus — gate admin อยู่ที่ router แล้ว (verifySessionToken/verifyAdmin เท่านั้น) */
 function sbMirrorDiscussionStatus_(pg, newStatus) {
   if (!sbEnabled_()) return null;
-  var id = sbFindDiscussionId_(pg);
+  var id = sbResolveDiscussionId_(pg);
   if (!id) return null;
   return sbWriteNow_('set_discussion_comment_status', {
     p_id: id, p_status: String(newStatus), p_is_admin: true

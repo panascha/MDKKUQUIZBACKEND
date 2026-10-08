@@ -1,0 +1,11 @@
+# clasp default allow-list, written out so tools/ can be excluded from `clasp push`
+# (a .js/.json under tools/ would otherwise be pushed to GAS; node-only code breaks every request at load)
+**/**
+!appsscript.json
+!**/*.gs
+!**/*.js
+!**/*.ts
+!**/*.html
+node_modules/**
+.git/**
+tools/**

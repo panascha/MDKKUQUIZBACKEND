@@ -972,7 +972,10 @@ function doPost(e) {
       if (!pcRes.ok) {
         return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: pcRes.message })).setMimeType(ContentService.MimeType.JSON);
       }
-      sbMirrorDiscussionPost_(pcQid, pcUser2.email, pcNick, pcRes.comment.tag, pcText); // dual-write Postgres — นอก lock, กลืน error
+      var pcPg = sbMirrorDiscussionPost_(pcQid, pcUser2.email, pcNick, pcRes.comment.tag, pcText); // dual-write Postgres — นอก lock, กลืน error
+      try { // เก็บ uuid ลงชีต H (เขียนเซลล์เดียวนอก lock, ยืนยันแถวก่อน) — ล้มเหลวต้องไม่กระทบ response
+        recordDiscussionPgId_(pcRes.rowNum, pcQid, pcRes.comment.timestamp, pcPg);
+      } catch (pcE) { console.error('recordDiscussionPgId_: ' + pcE.message); }
       return ContentService.createTextOutput(JSON.stringify({ result: 'success', comment: pcRes.comment })).setMimeType(ContentService.MimeType.JSON);
     }
 

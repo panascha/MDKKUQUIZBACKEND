@@ -5,17 +5,26 @@
    ต่อ qid ในเรียกเดียว, cache disc_<qid> 5 นาที (DISCUSSION_CACHE_TTL_SEC)
    ========================================================================= */
 
+var DISCUSSION_PGID_COL = 8; // คอลัมน์ H
+
 // idempotent: สร้างชีต Discussion ถ้ายังไม่มี (mirror setupAiFeedbackSheet)
 function setupDiscussionSheet() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var sheet = ss.getSheetByName(DISCUSSION_SHEET_NAME);
   if (!sheet) sheet = ss.insertSheet(DISCUSSION_SHEET_NAME);
 
-  var headers = ["Timestamp", "QuestionID", "Email", "Nickname", "Tag", "Text", "Status"];
+  // คอลัมน์ H "PgId" = uuid ของคอมเมนต์ใน Postgres (ต่อท้ายสุด — index A–G ที่ reader ใช้ไม่ขยับ)
+  var headers = ["Timestamp", "QuestionID", "Email", "Nickname", "Tag", "Text", "Status", "PgId"];
   if (!sheet.getRange(1, 1).getValue()) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#e6f7ff");
     sheet.setFrozenRows(1);
+  } else if (!sheet.getRange(1, DISCUSSION_PGID_COL).getValue()) {
+    // ชีตจริงที่มีอยู่แล้ว: เติมหัวคอลัมน์ H ครั้งเดียว (แถวเก่าปล่อยว่าง = ใช้ heuristic fallback)
+    // ห้ามให้การเติมหัวคอลัมน์ล้มแล้วทำให้โพสต์ล้ม (setupDiscussionSheet อยู่ในเส้นทางเขียนชีตใต้ lock)
+    try {
+      sheet.getRange(1, DISCUSSION_PGID_COL).setValue("PgId").setFontWeight("bold").setBackground("#e6f7ff");
+    } catch (e) { console.error('setupDiscussionSheet PgId header: ' + e.message); }
   }
   return sheet;
 }
@@ -181,8 +190,24 @@ function postDiscussionCommentLocked_(qid, email, nickname, text) {
   var tag = computeEmailTag_(email);
   var now = new Date();
   sheet.appendRow([now, qid, email, nickname, tag, text, "visible"]);
+  var rowNum = sheet.getLastRow();
   CacheService.getScriptCache().remove("disc_" + qid);
-  return { ok: true, comment: { timestamp: now.toISOString(), nickname: nickname, tag: tag, text: text } };
+  return { ok: true, rowNum: rowNum, comment: { timestamp: now.toISOString(), nickname: nickname, tag: tag, text: text } };
+}
+
+// เรียก "นอก lock" หลัง mirror โพสต์ — ไม่ถือ lock โดยตั้งใจ (ห้ามถือ lock ระหว่างรอ PG; ที่นี่ไม่มี network แล้ว)
+// เขียนเซลล์ H เซลล์เดียวของแถวที่ตัวเองเพิ่งต่อท้าย: ไม่ชนกับการเขียนคอลัมน์อื่น และยืนยันแถวด้วย ts+qid ก่อนเขียน
+// (แถว Discussion ไม่เคยถูกลบ/เรียงใหม่โดยโค้ด — soft delete เท่านั้น) · ไม่ตรง = ข้าม ปล่อยให้ fallback heuristic
+// pgRes: null = mirror ปิด (ไม่เขียนอะไร) · {ok:true,id} = เก็บ uuid · อย่างอื่น = เก็บ 'none' (PG ไม่มีแถวนี้)
+function recordDiscussionPgId_(rowNum, qid, tsIso, pgRes) {
+  if (pgRes === null || pgRes === undefined || !rowNum) return;
+  var id = (pgRes && pgRes.ok === true && pgRes.id) ? String(pgRes.id) : "none";
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(DISCUSSION_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < rowNum) return;
+  var ab = sheet.getRange(rowNum, 1, 1, 2).getValues()[0];
+  var rowTs = ab[0] instanceof Date ? ab[0].toISOString() : String(ab[0]);
+  if (rowTs !== tsIso || String(ab[1]).trim() !== qid) return;
+  sheet.getRange(rowNum, DISCUSSION_PGID_COL).setValue(id);
 }
 
 // เรียกใต้ localized-15s lock เท่านั้น — self-delete (email ตรง) หรือ admin (isAdmin=true)
@@ -202,7 +227,7 @@ function deleteDiscussionCommentLocked_(qid, timestamp, requestorEmail, isAdmin)
     // purge ด้วย qid ที่ trim แล้ว ให้ตรง cacheKey ของ getDiscussionData ("disc_"+qid.trim()) — ไม่งั้น
     // ถ้า cell มี whitespace/coerce เป็น Number, purge key เพี้ยน → REAL เห็น comment ที่ลบไปอีก 5 นาที
     CacheService.getScriptCache().remove("disc_" + String(rows[i][1]).trim());
-    return { ok: true, pg: { qid: qid, email: String(rows[i][2]), text: String(rows[i][5]), ts: rowTs } };
+    return { ok: true, pg: { qid: qid, email: String(rows[i][2]), text: String(rows[i][5]), ts: rowTs, pgId: String(rows[i][7] || "") } };
   }
   return { ok: false, message: "ไม่พบความคิดเห็น" };
 }
@@ -233,7 +258,7 @@ function setDiscussionCommentStatusLocked_(qid, timestamp, newStatus) {
   sheet.getRange(target + 1, 7).setValue(newStatus);
   // purge ด้วย qid จากแถวจริง (เหตุผลเดียวกับ deleteDiscussionCommentLocked_)
   CacheService.getScriptCache().remove("disc_" + String(rows[target][1]).trim());
-  return { ok: true, pg: { qid: qid, email: String(rows[target][2]), text: String(rows[target][5]), ts: timestamp } };
+  return { ok: true, pg: { qid: qid, email: String(rows[target][2]), text: String(rows[target][5]), ts: timestamp, pgId: String(rows[target][7] || "") } };
 }
 
 // อ่านทุกแถว Discussion (รวม deleted + email) สำหรับหน้า moderation ฝั่ง DATABASE — admin เท่านั้น (มี PII)
