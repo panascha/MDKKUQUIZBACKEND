@@ -202,7 +202,7 @@ function deleteDiscussionCommentLocked_(qid, timestamp, requestorEmail, isAdmin)
     // purge ด้วย qid ที่ trim แล้ว ให้ตรง cacheKey ของ getDiscussionData ("disc_"+qid.trim()) — ไม่งั้น
     // ถ้า cell มี whitespace/coerce เป็น Number, purge key เพี้ยน → REAL เห็น comment ที่ลบไปอีก 5 นาที
     CacheService.getScriptCache().remove("disc_" + String(rows[i][1]).trim());
-    return { ok: true };
+    return { ok: true, pg: { qid: qid, email: String(rows[i][2]), text: String(rows[i][5]), ts: rowTs } };
   }
   return { ok: false, message: "ไม่พบความคิดเห็น" };
 }
@@ -233,7 +233,7 @@ function setDiscussionCommentStatusLocked_(qid, timestamp, newStatus) {
   sheet.getRange(target + 1, 7).setValue(newStatus);
   // purge ด้วย qid จากแถวจริง (เหตุผลเดียวกับ deleteDiscussionCommentLocked_)
   CacheService.getScriptCache().remove("disc_" + String(rows[target][1]).trim());
-  return { ok: true };
+  return { ok: true, pg: { qid: qid, email: String(rows[target][2]), text: String(rows[target][5]), ts: timestamp } };
 }
 
 // อ่านทุกแถว Discussion (รวม deleted + email) สำหรับหน้า moderation ฝั่ง DATABASE — admin เท่านั้น (มี PII)

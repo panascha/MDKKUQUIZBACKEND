@@ -66,6 +66,7 @@ function doPost(e) {
                 result: 'error', message: 'corrupt progress blob'
               })).setMimeType(ContentService.MimeType.JSON);
             }
+            sbBackfillProgress_(gpUser.email, gpSubject, Number(gpKeys[gpI][2]) || 0, gpState); // lazy backfill ชีต→Postgres (flag 6 ชม.), กลืน error
             return ContentService.createTextOutput(JSON.stringify({
               result: 'success', timestamp: Number(gpKeys[gpI][2]) || 0, state: gpState
             })).setMimeType(ContentService.MimeType.JSON);
@@ -133,10 +134,12 @@ function doPost(e) {
         } else {
           spSheet.appendRow([spUser.email, spSubject, spTs].concat(spChunks));
         }
-        return ContentService.createTextOutput(JSON.stringify({ result: 'success', timestamp: spTs })).setMimeType(ContentService.MimeType.JSON);
       } finally {
         spLock.releaseLock();
       }
+      // dual-write Postgres — นอก lock (D14), กลืน error; stale/ล้มเหลวฝั่ง PG ไม่กระทบผลลัพธ์ของชีต
+      sbMirrorProgress_(spUser.email, spSubject, spTs, spState);
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success', timestamp: spTs })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // บริจาค/อัปเดต IntelSphere key หนึ่งใบ (idempotent by API_Key) — public donation form, lock-free
@@ -616,6 +619,8 @@ function doPost(e) {
           result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
         })).setMimeType(ContentService.MimeType.JSON);
       }
+      var fbClientId = String(data.clientId || '').slice(0, 64);
+      var fbContext = String(data.context || '').slice(0, 2000);
       try {
         var fbSheet = setupFeedbackSheet(); // lazy-create ครั้งแรก
         fbSheet.appendRow([
@@ -623,17 +628,18 @@ function doPost(e) {
           fbType,
           fbDesc.slice(0, 5000),
           fbEmail,
-          String(data.clientId || '').slice(0, 64),
-          String(data.context || '').slice(0, 2000),
+          fbClientId,
+          fbContext,
           fbUrls.join('///'),
           'New',
           ''
         ]);
-        return ContentService.createTextOutput(JSON.stringify({ result: 'success' }))
-          .setMimeType(ContentService.MimeType.JSON);
       } finally {
         fbLock.releaseLock();
       }
+      sbMirrorFeedback_(fbType, fbDesc.slice(0, 5000), fbEmail, fbClientId, fbContext, fbUrls); // dual-write Postgres — นอก lock, กลืน error
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success' }))
+        .setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------
@@ -957,15 +963,17 @@ function doPost(e) {
           result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
         })).setMimeType(ContentService.MimeType.JSON);
       }
+      var pcRes;
       try {
-        var pcRes = postDiscussionCommentLocked_(pcQid, pcUser2.email, pcNick, pcText);
-        if (!pcRes.ok) {
-          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: pcRes.message })).setMimeType(ContentService.MimeType.JSON);
-        }
-        return ContentService.createTextOutput(JSON.stringify({ result: 'success', comment: pcRes.comment })).setMimeType(ContentService.MimeType.JSON);
+        pcRes = postDiscussionCommentLocked_(pcQid, pcUser2.email, pcNick, pcText);
       } finally {
         pcLock.releaseLock();
       }
+      if (!pcRes.ok) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: pcRes.message })).setMimeType(ContentService.MimeType.JSON);
+      }
+      sbMirrorDiscussionPost_(pcQid, pcUser2.email, pcNick, pcRes.comment.tag, pcText); // dual-write Postgres — นอก lock, กลืน error
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success', comment: pcRes.comment })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------
@@ -998,15 +1006,17 @@ function doPost(e) {
           result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
         })).setMimeType(ContentService.MimeType.JSON);
       }
+      var dcRes;
       try {
-        var dcRes = deleteDiscussionCommentLocked_(dcQid, dcTs, dcUser.email, dcIsAdmin);
-        if (!dcRes.ok) {
-          return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: dcRes.message })).setMimeType(ContentService.MimeType.JSON);
-        }
-        return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
+        dcRes = deleteDiscussionCommentLocked_(dcQid, dcTs, dcUser.email, dcIsAdmin);
       } finally {
         dcLock.releaseLock();
       }
+      if (!dcRes.ok) {
+        return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: dcRes.message })).setMimeType(ContentService.MimeType.JSON);
+      }
+      sbMirrorDiscussionDelete_(dcRes.pg, dcUser.email, dcIsAdmin); // dual-write Postgres — นอก lock, กลืน error
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------
@@ -1059,15 +1069,17 @@ function doPost(e) {
           result: 'error', message: 'เซิร์ฟเวอร์ไม่ตอบสนองเนื่องจากโหลดสูง (Lock Timeout)'
         })).setMimeType(ContentService.MimeType.JSON);
       }
+      var scsRes;
       try {
-        var scsRes = setDiscussionCommentStatusLocked_(scsQid, scsTs, scsStatus);
+        scsRes = setDiscussionCommentStatusLocked_(scsQid, scsTs, scsStatus);
         if (!scsRes.ok) {
           return ContentService.createTextOutput(JSON.stringify({ result: 'error', message: scsRes.message })).setMimeType(ContentService.MimeType.JSON);
         }
-        return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
       } finally {
         scsLock.releaseLock();
       }
+      sbMirrorDiscussionStatus_(scsRes.pg, scsStatus); // dual-write Postgres — นอก lock, กลืน error
+      return ContentService.createTextOutput(JSON.stringify({ result: 'success' })).setMimeType(ContentService.MimeType.JSON);
     }
 
     // ----------------------------------------------------

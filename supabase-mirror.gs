@@ -203,6 +203,135 @@ function sbCallNow_(fn, body) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Phase 3 step 3 — write RPC (006) แบบ named-arg ผ่าน sbCallNow_
+// เรียก "หลัง releaseLock() เสมอ" (D14) · ชีตคือ source of truth · ล้มเหลวแล้วแค่ log ไม่ throw
+// ────────────────────────────────────────────────────────────────────────────
+
+/** เรียก RPC ตรงๆ แล้วกลืนทุก error — คืนผลลัพธ์ (หรือ {error}) / null ถ้าไม่มีคีย์ */
+function sbWriteNow_(fn, body) {
+  if (!sbEnabled_()) return null;
+  try {
+    var res = sbCallNow_(fn, body);
+    if (res && res.error) sbLogWriteFail_(fn, res.error);
+    return res;
+  } catch (e) {
+    sbLogWriteFail_(fn, e.message);
+    return { error: e.message };
+  }
+}
+
+function sbLogWriteFail_(fn, msg) {
+  try {
+    writeAdminLog('SYSTEM', 'MIRROR', 'SYSTEM', 'POSTGRES_MIRROR_FAIL',
+                  '', '1 rpc call(s) failed', '', (fn + ': ' + msg).slice(0, 4000), '');
+  } catch (e) { console.error('POSTGRES_MIRROR_FAIL log failed: ' + e.message); }
+}
+
+/** saveProgress — guard เดิม (client clock) อยู่ใน save_progress เอง · stale = ฝั่ง PG มีใหม่กว่า/เท่า ไม่ใช่ error */
+function sbMirrorProgress_(email, subject, ts, state) {
+  if (!sbEnabled_()) return null;
+  return sbWriteNow_('save_progress', {
+    p_email: String(email), p_subject: String(subject), p_ts: Number(ts), p_state: state
+  });
+}
+
+/**
+ * getProgress — backfill แถวจากชีตเข้า PG แบบ lazy ผ่าน save_progress (ห้ามใช้ upsert_progress_batch: ไม่มี guard)
+ * flag ใน CacheService (6 ชม.) กันยิง PG ทุกครั้งที่อ่าน; ตั้งเมื่อ call สำเร็จเท่านั้น
+ */
+function sbBackfillProgress_(email, subject, ts, state) {
+  if (!sbEnabled_()) return;
+  try {
+    var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, email + '|' + subject + '|' + ts);
+    var key = 'sbpg_' + Utilities.base64EncodeWebSafe(digest);
+    var cache = CacheService.getScriptCache();
+    if (cache.get(key)) return;
+    var res = sbMirrorProgress_(email, subject, ts, state);
+    if (res && !res.error && res.result !== 'error') cache.put(key, '1', 21600);
+  } catch (e) {
+    console.error('sbBackfillProgress_: ' + e.message);
+  }
+}
+
+/** postComment — คืน {id,timestamp} ของแถว PG หรือ null */
+function sbMirrorDiscussionPost_(qid, email, nickname, tag, text) {
+  if (!sbEnabled_()) return null;
+  return sbWriteNow_('post_discussion_comment', {
+    p_question_id: String(qid), p_email: String(email), p_nickname: String(nickname),
+    p_tag: String(tag), p_content: String(text), p_tags: [], p_references: null
+  });
+}
+
+/**
+ * ชีตใช้ (qid, timestamp ISO) แต่ PG ใช้ uuid และ created_at ของ PG ≠ Timestamp ของชีต (คนละนาฬิกา)
+ * ⇒ หา uuid จาก qid + email + content + created_at ในช่วง ±120 วินาทีของ timestamp ชีต
+ * (โพสต์ซ้ำข้อความเดียวกันของคนเดียวกันใน 4 นาที = เลือกแถวที่ใกล้ที่สุด)
+ */
+function sbFindDiscussionId_(pg) {
+  var cfg = sbConfig_();
+  if (!cfg || !pg) return null;
+  try {
+    var t = new Date(pg.ts).getTime();
+    if (isNaN(t)) return null;
+    var url = cfg.url + '/rest/v1/discussions?select=id,created_at'
+      + '&question_id=eq.' + encodeURIComponent(pg.qid)
+      + '&user_email=eq.' + encodeURIComponent(pg.email)
+      + '&content=eq.' + encodeURIComponent(pg.text)
+      + '&deleted_at=is.null'
+      + '&created_at=gte.' + encodeURIComponent(new Date(t - 120000).toISOString())
+      + '&created_at=lte.' + encodeURIComponent(new Date(t + 120000).toISOString());
+    var res = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: { 'apikey': cfg.key, 'Authorization': 'Bearer ' + cfg.key },
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() >= 300) {
+      sbLogWriteFail_('discussions lookup', 'HTTP ' + res.getResponseCode());
+      return null;
+    }
+    var rows = JSON.parse(res.getContentText() || '[]');
+    // กำกวม (>1 แถวตรงเงื่อนไข) = ไม่เดา: ข้อความซ้ำของคนเดียวกันใน 4 นาที ถ้าเลือกผิดจะลบ/ปักหมุดคอมเมนต์ผิดตัวใน PG
+    if (rows.length > 1) {
+      sbLogWriteFail_('discussions lookup', 'ambiguous ' + rows.length + ' rows for qid=' + pg.qid);
+      return null;
+    }
+    return rows.length === 1 ? rows[0].id : null;
+  } catch (e) {
+    sbLogWriteFail_('discussions lookup', e.message);
+    return null;
+  }
+}
+
+/** deleteComment — pg = {qid,email,text,ts} ของแถวชีตที่เพิ่งลบ */
+function sbMirrorDiscussionDelete_(pg, requestorEmail, isAdmin) {
+  if (!sbEnabled_()) return null;
+  var id = sbFindDiscussionId_(pg);
+  if (!id) return null;
+  return sbWriteNow_('soft_delete_discussion_comment', {
+    p_id: id, p_requestor_email: String(requestorEmail || ''), p_is_admin: !!isAdmin
+  });
+}
+
+/** setCommentStatus — gate admin อยู่ที่ router แล้ว (verifySessionToken/verifyAdmin เท่านั้น) */
+function sbMirrorDiscussionStatus_(pg, newStatus) {
+  if (!sbEnabled_()) return null;
+  var id = sbFindDiscussionId_(pg);
+  if (!id) return null;
+  return sbWriteNow_('set_discussion_comment_status', {
+    p_id: id, p_status: String(newStatus), p_is_admin: true
+  });
+}
+
+/** submitFeedback — append-only */
+function sbMirrorFeedback_(type, description, email, clientId, context, images) {
+  if (!sbEnabled_()) return null;
+  return sbWriteNow_('submit_feedback', {
+    p_type: type, p_description: description, p_email: email,
+    p_client_id: clientId, p_context: context, p_images: images || []
+  });
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // ทางเข้าระดับ handler — ทุกตัวเป็น no-op เมื่อไม่มีคีย์
 // ────────────────────────────────────────────────────────────────────────────
 
