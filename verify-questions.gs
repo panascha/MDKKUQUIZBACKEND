@@ -108,7 +108,26 @@ function verifyQuestionBatch(questions, adminUser) {
       }
 
       if (!judgeRes) {
-        // arbiter ไม่ได้ตัดสิน = ยังไม่ verified. verifiedAnswer คืนเฉลยเดิมใน DB ไว้เป็น
+        // A===B ≠ DB + judge ล่ม → เชื่อ solver consensus (ทั้งคู่เห็นตรงกัน) ไม่ fallback ไป DB ที่โมเดลปฏิเสธ
+        // frontend: confidence นี้ขึ้น badge เหลือง + เปิดปุ่ม Apply (admin ยังต้องกดยืนยัน)
+        if (solveA.choice === solveB.choice && solveA.choice !== dbAnswer) {
+          verified.push({
+            qid: q.qid,
+            verifiedAnswer: solveA.choice,
+            confidence: 'solver-consensus-unjudged',
+            judgeError: judgeError,
+            models: [VERIFY_SOLVER_A, VERIFY_SOLVER_B],
+            judgeModel: VERIFY_JUDGE,
+            judgeUsed: false,
+            solvers: [
+              { model: VERIFY_SOLVER_A, choice: solveA.choice, rationale: solveA.rationale },
+              { model: VERIFY_SOLVER_B, choice: solveB.choice, rationale: solveB.rationale }
+            ],
+            rationale: solveA.rationale || solveB.rationale || ''
+          });
+          continue;
+        }
+        // A≠B + judge ล่ม = ยังไม่ verified. verifiedAnswer คืนเฉลยเดิมใน DB ไว้เป็น
         // placeholder ให้ frontend เรนเดอร์ได้เท่านั้น ห้ามตีความว่าผ่านการตรวจ
         // (frontend ต้องอ่าน confidence นี้แล้วขึ้น badge เตือน + ซ่อนปุ่ม Apply)
         verified.push({
@@ -153,17 +172,54 @@ function verifyQuestionBatch(questions, adminUser) {
 }
 
 /**
+ * Parse LLM JSON tolerantly — strip ```json fences, grab first {...},
+ * and if truncated, still pull verifiedAnswer/choice via regex.
+ * Mirrors parseGlossaryJson / geminiFetchOnce_ expectJson recovery.
+ * @returns {Object|null}
+ */
+function parseVerifyJson_(raw) {
+  if (raw == null) return null;
+  var text = String(raw).replace(/```json/gi, '').replace(/```/g, '').trim();
+  // Drop leading prose before first { (some models preamble then JSON)
+  var start = text.indexOf('{');
+  var end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    try { return JSON.parse(text.slice(start, end + 1)); } catch (e) { /* fall through */ }
+  }
+  // Truncated JSON — recover the fields we must have for a decision
+  var out = null;
+  var mAns = text.match(/"verifiedAnswer"\s*:\s*(\d+)/);
+  var mChoice = text.match(/"choice"\s*:\s*(\d+|"[A-Za-z]"|"\d+")/);
+  var mRat = text.match(/"correctRationale"\s*:\s*"((?:[^"\\]|\\.)*)"/) ||
+             text.match(/"rationale"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  var mConf = text.match(/"confidence"\s*:\s*"(high|moderate)"/i);
+  if (mAns || mChoice) {
+    out = {};
+    if (mAns) out.verifiedAnswer = Number(mAns[1]);
+    if (mChoice) {
+      var c = mChoice[1];
+      out.choice = (c.charAt(0) === '"') ? c.slice(1, -1) : Number(c);
+    }
+    if (mRat) {
+      try { out.correctRationale = out.rationale = JSON.parse('"' + mRat[1] + '"'); }
+      catch (e2) { out.correctRationale = out.rationale = mRat[1]; }
+    }
+    if (mConf) out.confidence = mConf[1].toLowerCase();
+    out.distractors = {};
+  }
+  return out;
+}
+
+/**
  * Call one solver model via IntelSphere executeChatbotQuery
  * @returns {Object} {choice: N, rationale: "..."}
  */
 function solveWithModel_(q, model) {
   var prompt = buildVerifyPrompt_(q);
   var raw = executeChatbotQuery(prompt, model, 1); // attempt=1
-  var parsed;
-  try {
-    parsed = JSON.parse(raw.content);
-  } catch (e) {
-    throw new Error('Solver ' + model + ' returned non-JSON: ' + raw.content.slice(0, 200));
+  var parsed = parseVerifyJson_(raw.content);
+  if (!parsed) {
+    throw new Error('Solver ' + model + ' returned non-JSON: ' + String(raw.content || '').slice(0, 200));
   }
   var idx = normalizeChoiceIndex_(parsed.choice, q.choices.length);
   if (idx === null) {
@@ -211,18 +267,21 @@ function judgeDisagreement_(q, solveA, solveB) {
   var keyInfo = getAvailableAIKey("Gemini", VERIFY_JUDGE);
   if (!keyInfo) throw new Error('โควต้า Gemini หมดแล้วสำหรับวันนี้');
   var raw = callGeminiAI(prompt, keyInfo, null);
-  var parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error('Judge returned non-JSON: ' + raw.slice(0, 200));
+  var parsed = parseVerifyJson_(raw);
+  if (!parsed) {
+    throw new Error('Judge returned non-JSON: ' + String(raw || '').slice(0, 200));
   }
-  if (typeof parsed.verifiedAnswer !== 'number') {
-    throw new Error('Judge returned invalid verifiedAnswer');
+  // รับ number หรือ string ("4"/"E") — ผ่าน normalize เดียวกับ solver
+  var ans = normalizeChoiceIndex_(
+    (typeof parsed.verifiedAnswer !== 'undefined') ? parsed.verifiedAnswer : parsed.choice,
+    q.choices.length
+  );
+  if (ans === null) {
+    throw new Error('Judge returned invalid verifiedAnswer: ' + parsed.verifiedAnswer);
   }
   return {
-    verifiedAnswer: parsed.verifiedAnswer,
-    correctRationale: parsed.correctRationale || '',
+    verifiedAnswer: ans,
+    correctRationale: parsed.correctRationale || parsed.rationale || '',
     distractors: parsed.distractors || {},
     confidence: parsed.confidence || 'moderate'
   };
@@ -255,11 +314,11 @@ function buildVerifyPrompt_(q) {
   }
   lines.push('');
   lines.push('Provide:');
-  lines.push('1. Your answer (choice number only).');
-  lines.push('2. Clinical rationale (pathophysiology, differential diagnosis, guideline references).');
+  lines.push('1. Your answer (choice number, 0-based).');
+  lines.push('2. Clinical rationale (pathophysiology, differential, guidelines) — max 5 sentences.');
   lines.push('');
-  lines.push('Write all rationales and explanations in Thai mixed with English medical terminology in a single continuous paragraph (no bullet points or newlines).');
-  lines.push('Format as JSON: {"choice": N, "rationale": "..."}');
+  lines.push('Write all rationales in Thai mixed with English medical terminology in a single continuous paragraph (no bullet points or newlines).');
+  lines.push('CRITICAL: Return ONLY raw JSON. No markdown fences. No prose. Schema: {"choice":N,"rationale":"..."}');
   return lines.join('\n');
 }
 
@@ -290,18 +349,17 @@ function buildJudgePrompt_(q, solveA, solveB) {
   }
   lines.push('');
   lines.push('Which answer is clinically correct? Provide:');
-  lines.push('1. Verified answer (choice number).');
-  lines.push('2. Why the correct answer is right (causal mechanism).');
-  lines.push('3. Why each wrong choice is a distractor (trap, edge case, outdated guideline).');
+  lines.push('1. Verified answer (choice number, 0-based).');
+  lines.push('2. Why the correct answer is right (causal mechanism) — max 4 sentences.');
+  lines.push('3. Why each wrong choice is a distractor — one short sentence each.');
   lines.push('4. Confidence: "high" (clear guideline) or "moderate" (clinical judgment call).');
   lines.push('');
-  lines.push('Write all rationales and explanations in Thai mixed with English medical terminology in a single continuous paragraph (no bullet points or newlines).');
-  lines.push('Format as JSON:');
-  lines.push('{');
-  lines.push('  "verifiedAnswer": N,');
-  lines.push('  "correctRationale": "...",');
-  lines.push('  "distractors": {"0": "...", "1": "...", ...},');
-  lines.push('  "confidence": "high" | "moderate"');
-  lines.push('}');
+  lines.push('Write all rationales in Thai mixed with English medical terminology in a single continuous paragraph (no bullet points or newlines).');
+  lines.push('CRITICAL OUTPUT RULES:');
+  lines.push('- Return ONLY a raw JSON object. No markdown. No ``` fences. No prose before/after.');
+  lines.push('- Keep correctRationale under 600 characters and each distractor under 200 characters.');
+  lines.push('- verifiedAnswer MUST be a bare number (e.g. 4), never a string.');
+  lines.push('Schema:');
+  lines.push('{"verifiedAnswer":N,"correctRationale":"...","distractors":{"0":"...","1":"..."},"confidence":"high"|"moderate"}');
   return lines.join('\n');
 }
