@@ -13,7 +13,7 @@
 // ไฟล์นี้ตามไปเอง ไม่ต้องแก้สองที่. maintenance.gs โหลดก่อน verify-questions.gs (เรียงตามชื่อไฟล์)
 // และ var hoisting ทำให้ typeof guard ปลอดภัยแม้ลำดับโหลดเปลี่ยน — ตกไปใช้ literal เดิม
 var VERIFY_SOLVER_A = (typeof PROVIDER_MODEL_MAP !== 'undefined' && PROVIDER_MODEL_MAP && PROVIDER_MODEL_MAP["Deepseek"]) || "deepseek-v4-pro";
-var VERIFY_SOLVER_B = (typeof PROVIDER_MODEL_MAP !== 'undefined' && PROVIDER_MODEL_MAP && PROVIDER_MODEL_MAP["Claude"]) || "claude-sonnet-4.5";
+var VERIFY_SOLVER_B = (typeof PROVIDER_MODEL_MAP !== 'undefined' && PROVIDER_MODEL_MAP && PROVIDER_MODEL_MAP["Claude"]) || "claude-sonnet-5.5";
 // judge ไม่ derive จาก map โดยตั้งใจ — PROVIDER_MODEL_MAP.Gemini คือ 3.6-flash แต่หมายเหตุ
 // Grounding OFF ผูกกับ 3.5-flash ตัวนี้โดยเฉพาะ
 var VERIFY_JUDGE = "gemini-3.5-flash"; // cheap, high RPD; Grounding OFF (commented at ai-gemini.gs:1212)

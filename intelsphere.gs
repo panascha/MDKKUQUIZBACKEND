@@ -84,8 +84,10 @@ function getIntelSphereModelCatalog() {
     if (Object.keys(catalog).length === 0) throw new Error("catalog parsed but empty — check response shape assumption");
 
   } catch (e) {
-    console.warn("[IntelSphere] Live catalog fetch failed (" + e.message + ") — using fallback list");
-    catalog = PROVIDER_MODELS_FALLBACK;
+    console.warn("[IntelSphere] Live catalog fetch failed (" + e.message + ") — using fallback snapshot");
+    var props = PropertiesService.getScriptProperties();
+    var snap = props.getProperty("INTELSPHERE_CATALOG_SNAPSHOT");
+    catalog = snap ? JSON.parse(snap) : PROVIDER_MODELS_FALLBACK;
   }
 
   cache.put("intelsphere_catalog", JSON.stringify(catalog), 21600);
@@ -188,7 +190,90 @@ function installKeySweepTrigger() {
 // แถว Active ที่ Last_Reset_Date ไม่ตรงวันนี้ (Asia/Bangkok) → เติม {Provider}_Remaining
 // กลับเป็น INTELSPHERE_LIMITS แล้วเซ็ต Last_Reset_Date = วันนี้ แถวที่ reset ไปแล้ว (จาก cron
 // หรือจาก traffic จริง) ถูกข้าม — เกณฑ์คือ Last_Reset_Date ไม่ใช่ว่าฟังก์ชันไหนเป็นคนรัน
+// ── IntelSphere model auto-sync (§intelsphere-sync) ──
+// ดึง /models → diff กับ snapshot เดิมใน PropertiesService → เซฟ snapshot ล่าสุด + อัปเดต cache
+// รันจาก runIntelSphereDailyReset ก่อน daily quota reset — ล้มได้ไม่ block (ลองใหม่พรุ่งนี้)
+function syncIntelSphereModels() {
+  var anyKey = getAnyActiveIntelSphereKeyForCatalogFetch();
+  if (!anyKey) {
+    console.warn("[IntelSphereSync] ไม่มี active key สำหรับดึง models");
+    return { ok: false, error: "no_active_key" };
+  }
+
+  var response;
+  try {
+    response = UrlFetchApp.fetch("https://gen.ai.kku.ac.th/api/v1/models", {
+      method: "get",
+      headers: { "Authorization": "Bearer " + anyKey },
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    console.warn("[IntelSphereSync] Network fail: " + e.message);
+    return { ok: false, error: e.message };
+  }
+
+  if (response.getResponseCode() !== 200) {
+    console.warn("[IntelSphereSync] HTTP " + response.getResponseCode());
+    return { ok: false, error: "HTTP " + response.getResponseCode() };
+  }
+
+  var body = JSON.parse(response.getContentText());
+  var liveList = body.data || [];
+  var newCatalog = {};
+  var allModelIds = [];
+
+  liveList.forEach(function(m) {
+    var modelId = String(m.id || "").trim();
+    if (!modelId) return;
+    allModelIds.push(modelId);
+    var provider = inferProviderFromModel(modelId);
+    if (!provider) return;
+    if (!newCatalog[provider]) newCatalog[provider] = [];
+    newCatalog[provider].push(modelId);
+  });
+
+  // อ่าน snapshot เดิมใน PropertiesService มาหา diff
+  var props = PropertiesService.getScriptProperties();
+  var prevSnapshotJson = props.getProperty("INTELSPHERE_CATALOG_SNAPSHOT");
+  var prevCatalog = prevSnapshotJson ? JSON.parse(prevSnapshotJson) : {};
+
+  var added = [];
+  var removed = [];
+  var prevAllIds = [];
+  Object.keys(prevCatalog).forEach(function(p) {
+    prevAllIds = prevAllIds.concat(prevCatalog[p]);
+  });
+
+  allModelIds.forEach(function(id) {
+    if (prevAllIds.indexOf(id) < 0) added.push(id);
+  });
+  prevAllIds.forEach(function(id) {
+    if (allModelIds.indexOf(id) < 0) removed.push(id);
+  });
+
+  // บันทึก snapshot ล่าสุด + อัปเดต cache ทันที
+  props.setProperty("INTELSPHERE_CATALOG_SNAPSHOT", JSON.stringify(newCatalog));
+  props.setProperty("INTELSPHERE_MODELS_LAST_SYNC", new Date().toISOString());
+  CacheService.getScriptCache().put("intelsphere_catalog", JSON.stringify(newCatalog), 21600);
+
+  if (added.length > 0 || removed.length > 0) {
+    console.log("[IntelSphereSync] โมเดลเปลี่ยน! เพิ่ม: [" + added.join(", ") + "] | ตัดออก: [" + removed.join(", ") + "]");
+    try {
+      writeAdminLog("SYSTEM", "SYSTEM", "AI", "INTELSPHERE_MODEL_SYNC", "IntelSphere",
+        "Sync models: +" + added.length + " / -" + removed.length,
+        removed.join(","), added.join(","), "");
+    } catch (logErr) {}
+  } else {
+    console.log("[IntelSphereSync] Models เหมือนเดิม ไม่มีการเปลี่ยนแปลง (รวม " + allModelIds.length + " ตัว)");
+  }
+
+  return { ok: true, count: allModelIds.length, added: added, removed: removed, catalog: newCatalog };
+}
+
 function runIntelSphereDailyReset() {
+  // 1. Sync models ก่อน reset quota — ล้มแล้วไม่ block
+  try { syncIntelSphereModels(); } catch (e) { console.warn("[IntelSphereReset] model sync fail: " + e.message); }
+
   var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
   if (!sheet) { console.warn("[intelSphereReset] ไม่พบ sheet " + INTELSPHERE_SHEET_NAME); return { checked: 0, reset: 0 }; }
 
