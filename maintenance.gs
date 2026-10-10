@@ -928,3 +928,24 @@ var PROVIDER_MODELS_FALLBACK = {
   "xAI":        ["grok-4.5"]
 };
 
+// ── PropertiesService audit (read-only) ──
+// ดูทุก key + ขนาดรวมเทียบ quota 500 KB — รันมือจาก GAS editor เท่านั้น ไม่แก้ไขข้อมูล
+// 500 KB = total per script (Google quota); per-value limit 9 KB ดู flag ⚠️ รายคีย์
+function inspectScriptProperties() {
+  var props = PropertiesService.getScriptProperties().getProperties();
+  var totalChars = 0;
+  var count = 0;
+
+  console.log("=== SCRIPT PROPERTIES USAGE ===");
+  for (var key in props) {
+    count++;
+    var valLen = (props[key] || "").length;
+    totalChars += valLen + key.length;
+    console.log(key + " : " + valLen + " chars" + (valLen > 4000 ? " ⚠️ (ใหญ่)" : ""));
+  }
+
+  var kbUsed = (totalChars / 1024).toFixed(2);
+  console.log("-------------------------------");
+  console.log("Total: " + count + " keys | " + kbUsed + " KB / 500 KB (ใช้ไป " + ((kbUsed / 500) * 100).toFixed(2) + "%)");
+}
+
