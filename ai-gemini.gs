@@ -1314,7 +1314,9 @@ function geminiFetchOnce_(model, apiKey, payload, expectJson) {
     // deprecated/retired model (เช่น "models/gemini-2.5-flash is no longer available to new users")
     // ข้ามทันทีไม่ retry ซ้ำ — cooldown ระดับ key กัน call ถัดไปบน key เดิมชนโมเดลนี้อีกทั้งวัน
     if (code === 404 || /no longer available|not available to new users|deprecated|not supported for this api|not found/i.test(msg)) {
-      markModelUnavailable_(model);
+      // circuit 6 ชม. (ทุก key) — ค่า default 48-144s ทำให้ทุก call หลังหมดอายุยิง 404 ซ้ำ (2026-10-13: 2.5-flash ยัง Active ในชีต)
+      // ถาวรจริง = runGeminiToolProbe รายสัปดาห์ flip เป็น Deprecated ในชีต
+      markModelUnavailable_(model, 21600);
       setModelCooldown_(apiKey, model, 86400);
       return { ok: false, error: msg, nextModel: true, modelUnavailable: true };
     }
@@ -1366,7 +1368,8 @@ function executeGeminiWithAutoFallback_(cfg) {
           try { updateAIUsage(cfg.apiKeyInfo, model); } catch (ue) { console.warn("updateAIUsage failed: " + ue.message); }
           return { ok: true, text: r.text, json: r.json, finishReason: r.finishReason, usage: r.usage, model: model, trail: trail };
         }
-        lastErr = model + ": " + r.error;
+        // โมเดลที่เลิกให้บริการ (404) ไม่ใช่สาเหตุจริง — ถ้ามี error ก่อนหน้า (เช่น overload) เก็บอันนั้นไว้ให้ผู้ใช้เห็น; trail ยังบันทึกครบ
+        if (!(r.modelUnavailable && lastErr)) lastErr = model + ": " + r.error;
         note_(model + (variants[vi] ? "" : "/think") + ": " + String(r.error).substring(0, 80));
         if (r.fatal) return { ok: false, error: lastErr, reason: 'fatal', trail: trail };
         if (r.overloaded) {
@@ -1452,6 +1455,9 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
     // ต่อท้ายด้วย full flash ที่ converter ไม่ใช้ (ตอนนี้ 3.6/2.5-flash) เพื่อไม่แย่ง 20 RPD/key ของ converter
     // ถึงได้เฉพาะเมื่อ lite ทุกตัว overload/circuit-open/quota — lite ok = ไม่แตะ
     var emergency = chain.filter(function (m) { return !/flash-lite/i.test(m) && CONVERTER_FALLBACK_MODELS.indexOf(m) < 0; });
+    // last resort (2026-10-13): 2.5-flash เลิกให้บริการ → emergency เหลือ 3.6-flash ตัวเดียว
+    // ยอมกิน 3.5-flash ของ converter 1 ครั้งเป็นตัวสุดท้าย ดีกว่า hard-fail (อยู่ใน chain เฉพาะเมื่อ key นี้ยังมีโควต้า)
+    if (chain.indexOf(GEMINI_LAST_RESORT_MODEL) >= 0) emergency.push(GEMINI_LAST_RESORT_MODEL);
     chain = chain.filter(function (m) { return /flash-lite/i.test(m); }).concat(emergency);
   }
   var r = executeGeminiWithAutoFallback_({
@@ -1479,7 +1485,7 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
     maxAttempts: 3, // chatbot มีผู้ใช้รอสด — เพดานต่ำ; execBudgetExhausted_ เป็น backstop
     // 503/429 ตอบเร็ว ไม่หักโควต้า → ไม่นับ attempt ให้ไปถึง emergency tier ได้; maxFetches คุมจำนวน HTTP จริงแทน
     overloadFree: true,
-    maxFetches: 5
+    maxFetches: 6 // lite×2 + 3.6 + 2.5 (404 ครั้งแรกก่อน circuit 6 ชม.) + 3.5 last resort + 1 สำรอง variant 400
   });
   if (!r.ok) {
     console.warn("callGeminiAI failed (" + r.reason + ") trail: " + (r.trail || []).join(" | "));
@@ -1553,6 +1559,8 @@ function callGeminiForSlipOCR(dataUrl) {
 // 2026-10-07: full flash เหลือ 20 RPD/key และติด 503 บ่อย → ยอมให้ตกไป 3.5-flash-lite (500 RPD) เป็นตัวสุดท้าย
 // (เดิม 2026-08-09 ห้าม lite เพราะคุณภาพแปลงต่ำ — แลกคุณภาพกับการได้ผลลัพธ์); ตัด 2.5-flash ออก (404 กับ key ใหม่)
 // 2026-10-07: ต่อท้ายด้วย 3.1-flash-lite (500 RPD) — 3.5-flash-lite ก็ติด 503 ได้; 3.6-flash กับ 2.5-flash ยังไม่ใช้
+// callGeminiAI lite chain: ตัวสุดท้ายหลัง lite + emergency ล้มหมด — ต้องอยู่ใน CONVERTER_FALLBACK_MODELS ไม่งั้นซ้ำกับ emergency
+var GEMINI_LAST_RESORT_MODEL = "gemini-3.5-flash";
 var CONVERTER_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 // กันชน 6-min execution limit: จำกัดจำนวนครั้งที่ยิง Gemini จริงต่อ 1 POST
 var CONVERTER_MAX_ATTEMPTS = 3;
