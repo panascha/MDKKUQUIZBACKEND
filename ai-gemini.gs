@@ -1447,7 +1447,13 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
   var chain = [apiKeyInfo.model].concat(apiKeyInfo.fallbackModels || []);
   // ผู้เรียกปักหมุด flash-lite (chatbot ปริมาณสูง) → fallback อยู่ใน tier lite เท่านั้น
   // ไม่ไหลไปกินโควต้า full flash (20 RPD/key) ที่ converter ต้องใช้
-  if (/flash-lite/i.test(apiKeyInfo.model)) chain = chain.filter(function (m) { return /flash-lite/i.test(m); });
+  if (/flash-lite/i.test(apiKeyInfo.model)) {
+    // emergency tier: lite มีแค่ 2 ตัว (3.5/3.1) — สไปก์ 503 พร้อมกัน = chain-end ทันที (2026-10-13)
+    // ต่อท้ายด้วย full flash ที่ converter ไม่ใช้ (ตอนนี้ 3.6/2.5-flash) เพื่อไม่แย่ง 20 RPD/key ของ converter
+    // ถึงได้เฉพาะเมื่อ lite ทุกตัว overload/circuit-open/quota — lite ok = ไม่แตะ
+    var emergency = chain.filter(function (m) { return !/flash-lite/i.test(m) && CONVERTER_FALLBACK_MODELS.indexOf(m) < 0; });
+    chain = chain.filter(function (m) { return /flash-lite/i.test(m); }).concat(emergency);
+  }
   var r = executeGeminiWithAutoFallback_({
     apiKeyInfo: apiKeyInfo,
     modelChain: chain,
@@ -1470,9 +1476,15 @@ function callGeminiAI(prompt, apiKeyInfo, images) {
     },
     tryThinkingVariants: true,
     expectJson: false,
-    maxAttempts: 3 // chatbot มีผู้ใช้รอสด — เพดานต่ำ; execBudgetExhausted_ เป็น backstop
+    maxAttempts: 3, // chatbot มีผู้ใช้รอสด — เพดานต่ำ; execBudgetExhausted_ เป็น backstop
+    // 503/429 ตอบเร็ว ไม่หักโควต้า → ไม่นับ attempt ให้ไปถึง emergency tier ได้; maxFetches คุมจำนวน HTTP จริงแทน
+    overloadFree: true,
+    maxFetches: 5
   });
-  if (!r.ok) throw new Error("AI Assistant Error: " + r.error);
+  if (!r.ok) {
+    console.warn("callGeminiAI failed (" + r.reason + ") trail: " + (r.trail || []).join(" | "));
+    throw new Error("AI Assistant Error: " + r.error);
+  }
   return r.text.trim();
 }
 
