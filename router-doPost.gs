@@ -498,6 +498,17 @@ function doPost(e) {
       }
     }
 
+    // verifyQuestionStudent — student qid-only wrapper (verify-student.gs). Lock-free: CacheService writes only.
+    if (action === 'verifyQuestionStudent') {
+      try {
+        return ContentService.createTextOutput(JSON.stringify(verifyQuestionStudent(data))).setMimeType(ContentService.MimeType.JSON);
+      } catch (vsErr) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: 'error', message: 'ai_failed', detail: String(vsErr.message || vsErr).slice(0, 200)
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
     // ----------------------------------------------------
     // logUserInteraction — ระบบ log ใหม่ (แทน batchLog/UserActivity เดิมที่ถูกถอดออก)
     // เขียนลงไฟล์ audit แยก (getAuditSheetId) → overflow ไม่แตะคลังข้อสอบ (SHEET_ID)

@@ -45,6 +45,7 @@ Source split into 14 `.gs` files (GAS loads alphabetically into shared global sc
 | `maintenance.gs` | One-off admin utils: split-category, migrations, sort, verification reports, staging cleanup |
 | `intelsphere.gs` | IntelSphere key pool, model catalog, rate limits, agentQuery, chatbot, key seeding, donor credits |
 | `bulk-questions.gs` | `bulkDeleteQuestionsCore_` (move rows to lazy `Questions_Trash` sheet, then delete bottom-up; **restore is manual** — copy the row back in the sheet, drop `DeletedAt`/`DeletedBy`) and `bulkSetQuestionCategoriesCore_` (replace whole category list, validated against `Category` sheet). Cap 100 ids/call. Router only does auth/role/dispatch |
+| `verify-student.gs` | `verifyQuestionStudent(data)` — new lock-free student action (qid-only, `verifyAnySession`); wraps `verifyQuestionBatch` with CacheService verdict cache (6h, content-hash key), per-email 5 misses/hr, daily budget 150 |
 | `study-backend.gs` | AI_Feedback, question relations, KB chunks, glossary, high-yield, keyword index |
 
 Code.js is an empty placeholder pushed to GAS to overwrite the old monolithic file.
