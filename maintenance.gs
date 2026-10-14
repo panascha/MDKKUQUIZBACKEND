@@ -1,4 +1,5 @@
 function autoCreateSplitCategories(questionId, categories, skipSort, knownRowIndex) {
+  return { splitCatId: null, finalCategories: categories, sheetsChanged: false }; // KILL SWITCH — โค้ดด้านล่างตั้งใจคงไว้ (ไม่ถูกเรียก)
   if (!categories || categories.length < 2) return;
 
   // 1. กรอง "by AI" ออก และตรวจสอบว่ามาจาก Subject เดียวกันหรือไม่
