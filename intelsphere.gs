@@ -594,7 +594,7 @@ var AGENT_QUERY_TOOL_INCAPABLE_PROVIDERS = { "Meta": true };
 // (slug เดียวกับ chatbot นิสิต, verified live). ใส่ override กลับได้เมื่อยืนยัน devstral slug ที่ IntelSphere รับจริง
 // Gemini: 3.5-flash → 3.6-flash 2026-07-26 (live catalog ยืนยันว่ารับทั้งคู่) — tier นี้ถือโควต้าเหลือมากสุด
 // (~4.87M) แต่ serve 0 req; override ตัวนี้คือค่าที่ pickAgentModel ใช้จริง ไม่ใช่ PROVIDER_MODEL_MAP.Gemini
-var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-3.7-flash", "xAI": "grok-4.5" };
+var AGENT_QUERY_MODEL_OVERRIDE = { "Gemini": "gemini-4-argon", "xAI": "grok-4.5" };
 // จอง key ไว้สำหรับผู้ใช้สาธารณะ — agentQuery (owner proxy) จะไม่ใช้ key ที่มีโควต้าคงเหลือรวมมากที่สุด N อันดับแรก
 // (key = 1 API_Key ใช้ได้ทุก provider → reserve ทั้ง key ไม่ใช่แยก provider)
 var AGENT_QUERY_KEY_RESERVE_COUNT = 1;
