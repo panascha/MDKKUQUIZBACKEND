@@ -670,9 +670,11 @@ function migrateSubjectImages(subjectPrefix, yearFolder) {
       var yearType = parts[1].trim();
       var pathNames = ["MD", yearFolder, subjectPrefix];
 
-      if (/^\d{2}/.test(yearType)) {
-        pathNames.push(yearType.substring(0, 2)); // Year
-        pathNames.push(yearType.substring(2) || "General"); // Type
+      // ปี ค.ศ. 4 หลัก (NL2_2025R1) ต้องเช็คก่อน 2 หลัก — ตรงกับ images.gs
+      var yearLen = /^\d{4}/.test(yearType) ? 4 : (/^\d{2}/.test(yearType) ? 2 : 0);
+      if (yearLen) {
+        pathNames.push(yearType.substring(0, yearLen)); // Year
+        pathNames.push(yearType.substring(yearLen) || "General"); // Type
       } else {
         pathNames.push(yearType);
       }
@@ -918,7 +920,7 @@ var PROVIDER_MODEL_MAP = {
 var PROVIDER_MODELS_FALLBACK = {
   "Claude":     ["claude-sonnet-5.5", "claude-sonnet-5"],
   "Deepseek":   ["deepseek-v4-pro", "deepseek-v4-flash"],
-  "Gemini":     ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite"],
+  "Gemini":     ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite"],
   "Meta":       ["llama-4-scout", "llama-4-maverick"],
   "MiniMax":    ["minimax-m3"],
   "Mistral":    ["mistral-large-2512", "mistral-medium-3", "mistral-small-2603"],

@@ -109,9 +109,11 @@ function uploadQuestionImageToDrive(base64Data, questionId, typeIdentifier, subj
         var parts = questionId.split('_');
         if (parts.length >= 2) {
           var yearType = parts[1].trim();
-          if (/^\d{2}/.test(yearType)) {
-            var examYear = yearType.substring(0, 2);
-            var examGroup = yearType.substring(2) || "General";
+          // ปี ค.ศ. 4 หลัก (NL2_2025R1) ต้องเช็คก่อน 2 หลัก ไม่งั้นแตกเป็น 20/25R1
+          var yearLen = /^\d{4}/.test(yearType) ? 4 : (/^\d{2}/.test(yearType) ? 2 : 0);
+          if (yearLen) {
+            var examYear = yearType.substring(0, yearLen);
+            var examGroup = yearType.substring(yearLen) || "General";
             var examYearFolder = getOrCreateFolder(targetFolder, examYear, folderCache);
             targetFolder = getOrCreateFolder(examYearFolder, examGroup, folderCache);
           } else {
