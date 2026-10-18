@@ -2248,6 +2248,7 @@ function doPost(e) {
               if (finalData.length > 0) {
                 targetSheet.getRange(lastRow + 1, 1, finalData.length, finalData[0].length).setValues(finalData);
                 updateVersion();
+                if (realSheetName === 'Category') updateCategoryVersion(); // cache Category ผูก v_cat ไม่ใช่ v — ไม่ bump = getStructure เห็นหมวดเก่าได้ถึง 30 นาที
                 writeAdminLog(user, userRole, "DATA", "IMPORT", realSheetName, "Imported " + finalData.length + " new rows (Skipped " + (importData.length - finalData.length) + " duplicates)", "", "Added " + finalData.length + " rows", metadata);
                 sbMarkSheet_(realSheetName); // Structure / Category → replace ทั้ง slice
 
