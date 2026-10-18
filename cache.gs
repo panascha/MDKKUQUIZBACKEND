@@ -160,7 +160,8 @@ function getPriorYearAuditDataCached(startTime) {
 function getStructureDataCached(filterSubject, startTime) {
   var v = getVersionCached();
   var cleanFilter = filterSubject ? String(filterSubject).trim().toUpperCase() : "all";
-  var cacheKey = "struct_" + v + "_" + cleanFilter;
+  // ผูก v_cat ด้วย — adminImport Category bump แค่ v_cat ไม่งั้น getStructure&subject=X เห็นหมวดเก่าได้ถึง 30 นาที
+  var cacheKey = "struct_" + v + "_" + getCategoryVersionCached() + "_" + cleanFilter;
   
   var cachedStr = getLargeCache(cacheKey);
   if (cachedStr != null) {
