@@ -419,7 +419,11 @@ function doPost(e) {
     if (action === 'convertPdfBatch') {
       // rate-limit ก่อน auth (กัน flood ด้วย garbage token — mirror saveProgress)
       var pcRlKey = data.sessionToken || data.username || data.clientId || 'anon';
-      if (!checkActionRateLimit('rl_pdfconv_', pcRlKey, 80)) {
+      // เกิน 80/ชม. → DEVELOPER (ตรวจ session จริง, cache 300s) ได้เพดานแยก 600/ชม. สำหรับ batch ingest
+      // token มั่ว/Student ยังโดน 80 เหมือนเดิม — ตัวจำกัดจริงของ DEVELOPER คือโควต้ารายวันของ Gemini pool
+      if (!checkActionRateLimit('rl_pdfconv_', pcRlKey, 80) &&
+          !(data.sessionToken && requireRole_(verifySessionToken(data.sessionToken), 'DEVELOPER') &&
+            checkActionRateLimit('rl_pdfconv_dev_', data.sessionToken, 600))) {
         return ContentService.createTextOutput(JSON.stringify({
           result: 'error', message: 'แปลง PDF บ่อยเกินไป (จำกัดต่อชั่วโมง) กรุณาลองใหม่ภายหลัง'
         })).setMimeType(ContentService.MimeType.JSON);
