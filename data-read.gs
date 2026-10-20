@@ -405,7 +405,9 @@ function getStructureData(filterSubject, startTime) {
       categoryId: catRows[i][0],
       subjectRef: catRows[i][1],
       accordionGroup: catRows[i][2],
-      categoryName: catRows[i][3]
+      categoryName: catRows[i][3],
+      sourceExamDriveId: String(catRows[i][4] || ''),
+      sourceKeyDriveId: String(catRows[i][5] || '')
     });
   }
 

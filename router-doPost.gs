@@ -1804,7 +1804,7 @@ function doPost(e) {
         }
       }
 
-      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual', 'bulkAddQuestionCategories', 'bulkSetQuestionCategories', 'bulkDeleteQuestions', 'indexSlideFolder'];
+      var adminActions = ['editQuestion', 'deleteQuestion', 'addCategory', 'adminImport', 'updateReportStatus', 'deleteCategory', 'updateCategory', 'deleteGroup', 'setCategorySourcePdf', 'updateAccordionGroup', 'addSubject', 'updateSubject', 'deleteSubject', 'addAnnouncement', 'editAnnouncement', 'deleteAnnouncement', 'runRelationsBatchManual', 'runGlossaryBatchManual', 'runHighYieldBatchManual', 'runKeywordIndexBatchManual', 'bulkAddQuestionCategories', 'bulkSetQuestionCategories', 'bulkDeleteQuestions', 'indexSlideFolder'];
       if (adminActions.indexOf(action) > -1) {
         var userObj = null;
         if (data.sessionToken) {
@@ -2355,6 +2355,17 @@ function doPost(e) {
               })).setMimeType(ContentService.MimeType.JSON);
             }
           }
+        }
+
+        if (action === 'setCategorySourcePdf') {
+          var spRes = setCategorySourcePdfData(doc, data.data);
+          if (spRes.result === 'success' && spRes.updated > 0) {
+            updateVersion();
+            updateCategoryVersion();
+            writeAdminLog(user, userRole, "CATEGORY", "SOURCE_PDF", "batch", "Set category source PDF", "", spRes.updated + " updated / " + spRes.missing.length + " missing", metadata);
+            sbMarkSheet_('Category');
+          }
+          return ContentService.createTextOutput(JSON.stringify(spRes)).setMimeType(ContentService.MimeType.JSON);
         }
 
         if (action === 'deleteGroup') {

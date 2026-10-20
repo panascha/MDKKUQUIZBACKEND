@@ -324,7 +324,9 @@ function sortCategorySheet(ss) {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return;
 
-  var range = sheet.getRange(2, 1, lastRow - 1, 4);
+  // กว้างตามจริง (≥4) — คอลัมน์ E/F (Source_*_Drive_ID) ต้องถูกเขียนกลับพร้อมแถวที่เรียงใหม่ ไม่งั้นลิงก์ PDF หลุดจากหมวด
+  var width = Math.max(sheet.getLastColumn(), 4);
+  var range = sheet.getRange(2, 1, lastRow - 1, width);
   var data = range.getValues();
   // ลำดับ CategoryID ก่อนเรียง — ใช้เทียบท้ายฟังก์ชันว่าแถวขยับจริงไหม
   // ถ้าไม่ขยับ = เนื้อหาชีตเท่าเดิม ⇒ ห้าม bump v_cat (แก้ข้อสอบเรียกทางนี้บ่อย ผ่าน autoCreateSplitCategories)
@@ -407,6 +409,74 @@ function sortCategorySheet(ss) {
     updateCategoryVersion();
   }
 }
+// setCategorySourcePdf: เขียนคอลัมน์ Source_Exam_Drive_ID / Source_Key_Drive_ID ของชีท Category ตาม CategoryID
+// items = [{CategoryID, exam?, key?}]; ค่า = Drive ID คั่นด้วย '///'; ไม่ส่ง = ไม่แตะ, '' = ล้าง
+// คืน {result, updated, missing, dupes} หรือ {result:'error', message} — caller (router) จัดการ lock / version / mirror / log
+function setCategorySourcePdfData(ss, items) {
+  var err = function (m) { return { result: 'error', message: m }; };
+  if (!Array.isArray(items) || items.length === 0) return err('data ต้องเป็น array ที่ไม่ว่าง');
+  var ID_RE = /^[A-Za-z0-9_-]{25,}$/;
+  var FIELDS = [{ prop: 'exam', header: 'Source_Exam_Drive_ID' }, { prop: 'key', header: 'Source_Key_Drive_ID' }];
+  var byId = {}, order = [], used = {};
+  for (var n = 0; n < items.length; n++) {
+    var it = items[n];
+    var cid = it && it.CategoryID != null ? String(it.CategoryID).trim() : '';
+    if (!cid) return err('item ' + n + ': ไม่มี CategoryID');
+    var rec = byId[cid];
+    if (!rec) { rec = byId[cid] = {}; order.push(cid); }
+    for (var f = 0; f < FIELDS.length; f++) {
+      var p = FIELDS[f].prop;
+      if (it[p] === undefined) continue;
+      if (typeof it[p] !== 'string') return err(cid + ': ' + p + ' ต้องเป็น string');
+      var v = it[p].trim();
+      if (v !== '') {
+        var ids = v.split('///');
+        for (var k = 0; k < ids.length; k++) {
+          if (!ID_RE.test(ids[k].trim())) return err(cid + ': Drive ID ไม่ถูกต้อง (' + p + ')');
+          ids[k] = ids[k].trim();
+        }
+        v = ids.join('///');
+      }
+      rec[p] = v;
+      used[p] = true;
+    }
+  }
+  var sheet = ss.getSheetByName('Category');
+  if (!sheet) return err('ไม่พบชีท Category');
+  var lastRow = sheet.getLastRow();
+  var headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  var colIdx = {};
+  for (var f2 = 0; f2 < FIELDS.length; f2++) {
+    if (!used[FIELDS[f2].prop]) continue;
+    var hi = headers.map(function (h) { return String(h).trim(); }).indexOf(FIELDS[f2].header);
+    if (hi < 0) return err('ไม่พบหัวคอลัมน์ ' + FIELDS[f2].header + ' ในชีท Category');
+    colIdx[FIELDS[f2].prop] = hi;
+  }
+  var ids2 = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
+  var rowsOf = {};
+  for (var r = 0; r < ids2.length; r++) {
+    var rid = String(ids2[r][0]).trim();
+    if (byId[rid]) (rowsOf[rid] = rowsOf[rid] || []).push(r);
+  }
+  var cols = {};
+  for (var prop in colIdx) cols[prop] = sheet.getRange(2, colIdx[prop] + 1, lastRow - 1, 1).getValues();
+  var updated = 0, missing = [], dupes = [];
+  for (var o = 0; o < order.length; o++) {
+    var id = order[o], hits = rowsOf[id];
+    if (!hits) { missing.push(id); continue; }
+    updated++;
+    if (hits.length > 1) dupes.push(id);
+    for (var prop2 in colIdx) {
+      if (byId[id][prop2] === undefined) continue;
+      for (var h2 = 0; h2 < hits.length; h2++) cols[prop2][hits[h2]][0] = byId[id][prop2];
+    }
+  }
+  for (var prop3 in colIdx) {
+    if (updated > 0) sheet.getRange(2, colIdx[prop3] + 1, lastRow - 1, 1).setValues(cols[prop3]);
+  }
+  return { result: 'success', updated: updated, missing: missing, dupes: dupes };
+}
+
 function verifyAllSingleCategoryVotes() {
   var ss = SpreadsheetApp.openById(SHEET_ID);
   var voteSheet = ss.getSheetByName("Votes");
