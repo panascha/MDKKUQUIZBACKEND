@@ -9,6 +9,8 @@ function inferProviderFromModel(modelId) {
   if (/^kimi/i.test(modelId))                              return "MoonshotAI";
   if (/^nova-/i.test(modelId))                             return "Nova";
   if (/^gpt-/i.test(modelId))                              return "OpenAI";
+  // KKU Local LLM (self-hosted): qwen3.8-27b + gemma4-* / medgemma* — ต้องอยู่ก่อนกฎ ^qwen (cloud qwen3.7-* ยังเป็น "Qwen")
+  if (/^qwen3\.8-27b$/i.test(modelId) || /^(med)?gemma\d/i.test(modelId)) return "KKULocal";
   if (/^qwen/i.test(modelId))                              return "Qwen";
   if (/^grok-/i.test(modelId))                             return "xAI";
   if (/^sonar-/i.test(modelId))                            return "Perplexity"; // classified for display only — still excluded from rotation
@@ -577,10 +579,10 @@ function generateAgentQueryOwnerSecret() {
 }
 
 // Priority สำหรับ Agent Query: ดัน Gemini ขึ้นมาเป็นอันดับแรกสุดเพื่อให้ถูกใช้งานก่อนตัวอื่น
-var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "MiniMax", "MoonshotAI", "Meta", "Mistral"];
+var AGENT_QUERY_PROVIDER_PRIORITY = ["Claude", "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "MiniMax", "MoonshotAI", "Meta", "Mistral", "KKULocal"];
 var AGENT_QUERY_MAX_OUTPUT_TOKENS = 8192; // Claude Code ส่ง max_tokens สูง (เช่น 32000) — clamp กัน 400 จาก provider ที่ cap ต่ำกว่า
 // Context window โดยประมาณ (tokens) ของ flagship ต่อ provider — ตัวเลข conservative, ปรับเมื่อ KKU เปลี่ยนรุ่น
-var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Gemini": 1000000, "Nova": 200000, "xAI": 256000, "Qwen": 131072, "OpenAI": 128000, "MiniMax": 128000, "MoonshotAI": 128000, "Meta": 128000, "Mistral": 128000 };
+var AGENT_PROVIDER_CONTEXT = { "Claude": 200000, "Deepseek": 128000, "Gemini": 1000000, "Nova": 200000, "xAI": 256000, "Qwen": 131072, "OpenAI": 128000, "MiniMax": 128000, "MoonshotAI": 128000, "Meta": 128000, "Mistral": 128000, "KKULocal": 131072 };
 // Overflow tier: เอา Gemini ออกจากกลุ่ม Overflow เพื่อไม่ให้ระบบมองว่าเป็นแค่ตัวสำรองท้ายแถว
 var AGENT_QUERY_OVERFLOW_PROVIDERS = { "xAI": true, "Nova": true, "MiniMax": true };
 // เจ้าที่ hand-write pseudo tool call เป็น plain text (เช่น "[terminal(command=...)]") แทนที่จะ emit
@@ -941,7 +943,7 @@ function setupIntelSphereSheet() {
     "Timestamp", "Donor_Name", "API_Key", "Status", "Last_Used", "Last_Reset_Date",
     "Deepseek_Remaining", "Gemini_Remaining", "Meta_Remaining", "Nova_Remaining",
     "xAI_Remaining", "Qwen_Remaining", "OpenAI_Remaining", "Claude_Remaining",
-    "Mistral_Remaining", "MiniMax_Remaining", "MoonshotAI_Remaining", "Notes"
+    "Mistral_Remaining", "MiniMax_Remaining", "MoonshotAI_Remaining", "KKULocal_Remaining", "Notes"
   ];
 
   // เขียน headers เฉพาะเมื่อแถว 1 ยังว่าง (ไม่ทับของเดิม)
@@ -969,6 +971,35 @@ function setupIntelSphereSheet() {
     headersWritten: headersWritten,
     missingProviderColumns: missing
   })).setMimeType(ContentService.MimeType.JSON);
+}
+
+// One-off (รันมือจาก editor): เติมคอลัมน์ {Provider}_Remaining ที่ยังไม่มีใน IntelSphere_Keys (append-only ที่ getLastColumn()+1)
+// แล้ว prefill INTELSPHERE_LIMITS[p] ให้แถว Status=Active — idempotent (ไม่มีคอลัมน์ขาด = ไม่เขียนอะไร)
+function ensureIntelSphereProviderColumns() {
+  var sheet = SpreadsheetApp.openById(SHEET_ID).getSheetByName(INTELSPHERE_SHEET_NAME);
+  if (!sheet) return { result: 'error', message: 'sheet not found' };
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(String);
+  var statusCol = headers.indexOf("Status");
+  var lastRow = sheet.getLastRow();
+  var statuses = (statusCol >= 0 && lastRow > 1)
+    ? sheet.getRange(2, statusCol + 1, lastRow - 1, 1).getValues() : [];
+  var added = [], prefilled = {};
+  for (var i = 0; i < INTELSPHERE_PROVIDER_PRIORITY.length; i++) {
+    var p = INTELSPHERE_PROVIDER_PRIORITY[i];
+    var h = p + "_Remaining";
+    if (headers.indexOf(h) >= 0) continue;
+    var col = sheet.getLastColumn() + 1;
+    sheet.getRange(1, col).setValue(h).setFontWeight("bold").setBackground("#e6f7ff");
+    var vals = statuses.map(function(r) { return [String(r[0]) === "Active" ? INTELSPHERE_LIMITS[p] : ""]; });
+    if (vals.length) sheet.getRange(2, col, vals.length, 1).setValues(vals);
+    headers.push(h);
+    added.push(h);
+    prefilled[h] = vals.filter(function(v) { return v[0] !== ""; }).length;
+  }
+  SpreadsheetApp.flush();
+  var out = { result: 'success', added: added, prefilledActiveRows: prefilled };
+  Logger.log(JSON.stringify(out));
+  return out;
 }
 
 // Seed/อัปเดต key หนึ่งใบใน IntelSphere_Keys — idempotent by API_Key, prefill remaining เต็มโควต้า, Status=Active

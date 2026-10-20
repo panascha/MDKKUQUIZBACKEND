@@ -897,12 +897,13 @@ var INTELSPHERE_QUOTA_FLOOR = 0.05; // skip a provider whose remaining < 5% of i
 var INTELSPHERE_LIMITS = {
   "Deepseek": 1000000, "Gemini": 350000, "Nova": 200000, "xAI": 100000,
   "Qwen": 100000, "OpenAI": 200000, "Claude": 200000, "MiniMax": 100000,
-  "MoonshotAI": 100000, "Meta": 100000, "Mistral": 100000
+  "MoonshotAI": 100000, "Meta": 100000, "Mistral": 100000,
+  "KKULocal": 1000000 // KKU Local LLM — one shared 1M tokens/day bucket per key across all its models
   // Perplexity intentionally excluded — no published model ID
 };
 
 var INTELSPHERE_PROVIDER_PRIORITY = [
-  "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "MiniMax", "MoonshotAI", "Meta", "Mistral"
+  "Deepseek", "Gemini", "Nova", "xAI", "Qwen", "OpenAI", "Claude", "MiniMax", "MoonshotAI", "Meta", "Mistral", "KKULocal"
 ];
 
 // One flagship model per provider — used ONLY when rotation moves to a provider
@@ -912,7 +913,8 @@ var PROVIDER_MODEL_MAP = {
   "Nova":     "nova-pro-v1",       "xAI":    "grok-4.5",           "Qwen": "qwen3.7-max",
   "OpenAI":   "gpt-5.6-luna",      "Claude": "claude-sonnet-5.5",
   "MiniMax":  "minimax-m3",        "MoonshotAI": "kimi-k3",
-  "Meta":     "llama-4-scout",     "Mistral": "mistral-medium-3"
+  "Meta":     "llama-4-scout",     "Mistral": "mistral-medium-3",
+  "KKULocal": "qwen3.8-27b"
 };
 
 // Hardcoded fallback catalog — used ONLY when the live GET /models fetch AND the PropertiesService snapshot both fail.
@@ -921,6 +923,7 @@ var PROVIDER_MODELS_FALLBACK = {
   "Claude":     ["claude-sonnet-5.5", "claude-sonnet-5"],
   "Deepseek":   ["deepseek-v4-pro", "deepseek-v4-flash"],
   "Gemini":     ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite"],
+  "KKULocal":   ["gemma4-e4b", "gemma4-12b", "gemma4-26b", "qwen3.8-27b", "medgemma1.5-4b"],
   "Meta":       ["llama-4-scout", "llama-4-maverick"],
   "MiniMax":    ["minimax-m3"],
   "Mistral":    ["mistral-large-2512", "mistral-medium-3", "mistral-small-2603"],
