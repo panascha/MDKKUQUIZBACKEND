@@ -869,32 +869,12 @@ function extractIdFromUrl(url) {
   return (match && match[1]) ? match[1] : null;
 }
 
-// ลบแถวใน Questions ที่มี img = "require_img" (placeholder ที่ไม่ถูก patch ก่อน import)
-// ตั้ง Time Trigger รันทุกวัน 3-4 AM จาก Apps Script console
+// DISABLED (no-op): เดิมลบแถวใน Questions ที่ img = "require_img"
+// แต่ "require_img" เป็นสถานะจริงของข้อสอบที่ live (ข้อที่ต้องมีรูปแต่ยังไม่ได้แนบ) ไม่ใช่ staging ขยะ
+// การรันจะลบข้อสอบจริงทิ้ง (snapshot 2026-10-21 มี 954 ข้อ) — ห้ามตั้ง Time Trigger / ห้ามรันมือ
+// เก็บชื่อฟังก์ชันไว้เพื่อให้ trigger เก่าที่ค้างอยู่ (ถ้ามี) เรียกแล้วไม่ทำอะไร
 function cleanupStaging() {
-  var doc = SpreadsheetApp.openById(SHEET_ID);
-  var sheet = doc.getSheetByName('Questions');
-  if (!sheet) return;
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return;
-  var colC = sheet.getRange(2, 3, lastRow - 1, 1).getValues();
-  var hits = [];
-  for (var i = 0; i < colC.length; i++) {
-    if (String(colC[i][0]).trim() === 'require_img') hits.push(i + 2);
-  }
-  if (!hits.length) { console.log('cleanupStaging: deleted 0 require_img rows'); return; }
-  var deleted = 0;
-  // ลบจากล่างขึ้นบน (เป็นช่วงต่อเนื่อง) เพื่อไม่ให้เลขแถวเลื่อน
-  var runEnd = hits.length - 1;
-  while (runEnd >= 0) {
-    var runStart = runEnd;
-    while (runStart > 0 && hits[runStart - 1] === hits[runStart] - 1) runStart--;
-    var cnt = runEnd - runStart + 1;
-    sheet.deleteRows(hits[runStart], cnt);
-    deleted += cnt;
-    runEnd = runStart - 1;
-  }
-  console.log('cleanupStaging: deleted ' + deleted + ' require_img rows');
+  console.warn('cleanupStaging: DISABLED — require_img เป็นสถานะ live ที่ถูกต้อง ไม่ลบแถวใดๆ');
 }
 
 /*
