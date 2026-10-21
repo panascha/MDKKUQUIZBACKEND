@@ -1213,3 +1213,79 @@ function repairSupabaseCatDrift_(apply) {
   console.log('ส่งแล้ว — รัน checkSupabaseMirror() ซ้ำเพื่อยืนยัน');
   return rows.length;
 }
+
+/**
+ * กู้ ENT4_50MCQ_ROTC_1..80 ที่ถูกลบอ่อนใน postgres (2026-10-20 07:01Z) แต่ยังอยู่ในชีท
+ * ⇒ คนอ่านผ่าน Supabase เห็นแค่ 23/103 ข้อ
+ * เลือกเฉพาะ id ที่ "ลบอ่อนใน pg และยังอยู่ในชีท" แล้ว upsert ทั้งแถวจากชีทด้วย p_restore=true
+ * (ล้าง deleted_at — ทางเดียวที่ 003 เปิดไว้) · p_autocreate=false ⇒ ไม่ปั้นหมวดใหม่
+ *
+ * รันจาก editor: repairEnt50SoftDeleteDryRun() ก่อน แล้ว repairEnt50SoftDeleteApply()
+ * แล้ว checkSupabaseMirror() — หวังผล Questions "ตรงกัน" (ไม่มี "+ ลบอ่อน 80")
+ */
+function repairEnt50SoftDeleteDryRun() { return repairEnt50SoftDelete_(false); }
+function repairEnt50SoftDeleteApply() { return repairEnt50SoftDelete_(true); }
+
+function repairEnt50SoftDelete_(apply) {
+  EXEC_START_MS = Date.now();   // รันจาก editor ⇒ ไม่ได้ผ่าน doPost ที่ reset ให้
+  if (!sbEnabled_()) { console.log('mirror ปิดอยู่ (ไม่มีคีย์)'); return; }
+  var re = /^ENT4_50MCQ_ROTC_\d+$/;
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) { console.log('ไม่ได้ lock — มี admin กำลังเขียนอยู่ ลองใหม่ทีหลัง'); return; }
+  var sheetRows = [];
+  try {
+    var qSh = SpreadsheetApp.openById(SHEET_ID).getSheetByName('Questions');
+    var qLast = qSh ? qSh.getLastRow() : 0;
+    if (qLast > 1) {
+      var vals = qSh.getRange(2, 1, qLast - 1, 7).getValues();
+      for (var i = 0; i < vals.length; i++) if (re.test(String(vals[i][0]).trim())) sheetRows.push(vals[i]);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+
+  var del = sbReadAllNow_('questions', 'question_id', 'question_id',
+                          'deleted_at=not.is.null&question_id=like.ENT4_50MCQ_ROTC_*');
+  if (del.error) { console.log('อ่านข้อที่ลบอ่อนไม่ได้ — ' + del.error); return; }
+  var delSet = {}, j;
+  for (j = 0; j < del.length; j++) if (re.test(del[j].question_id)) delSet['k:' + del[j].question_id] = true;
+
+  var seen = {}, rows = [], bad = [];
+  for (j = 0; j < sheetRows.length; j++) {
+    var qid = String(sheetRows[j][0]).trim();
+    seen['k:' + qid] = (seen['k:' + qid] || 0) + 1;
+  }
+  for (j = 0; j < sheetRows.length; j++) {
+    var r = sheetRows[j], id = String(r[0]).trim();
+    if (!delSet['k:' + id]) continue;
+    var nChoices = String(r[3] || '').split('///').filter(function (s) { return s.trim(); }).length;
+    var why = [];
+    if (seen['k:' + id] > 1) why.push('id ซ้ำในชีท');
+    if (!String(r[1] || '').trim()) why.push('โจทย์ว่าง');
+    if (nChoices < 2) why.push('ตัวเลือก ' + nChoices);
+    if (!String(r[4] || '').trim()) why.push('ไม่มีเฉลย');
+    if (sbParseCatCell_(r[6]) === null) why.push('หมวด parse ไม่ได้');
+    if (why.length) bad.push(id + ' — ' + why.join(', '));
+    rows.push({ questionId: id, problem: r[1], img: r[2], choices: r[3], answer: r[4], explain: r[5], category: r[6] });
+  }
+
+  console.log('ชีทมี ENT4_50MCQ_ROTC ' + sheetRows.length + ' ข้อ / ลบอ่อนใน pg ' + del.length +
+              ' / จะกู้ ' + rows.length + ' ข้อ' + (apply ? '' : ' — dry run ไม่เขียน'));
+  for (j = 0; j < Math.min(rows.length, 5); j++) {
+    console.log('  ' + rows[j].questionId + '  ' + String(rows[j].problem).slice(0, 70).replace(/\s+/g, ' ') +
+                '  | ' + JSON.stringify(rows[j].category));
+  }
+  if (bad.length) {
+    console.log('⚠️ แถวน่าสงสัย ' + bad.length + ' ข้อ (Apply จะไม่ทำจนกว่าจะแก้):');
+    for (j = 0; j < Math.min(bad.length, 20); j++) console.log('  ' + bad[j]);
+  }
+  if (!apply || !rows.length) return rows.length;
+  if (bad.length) { console.log('หยุด — มีแถวน่าสงสัย'); return; }
+
+  var res = sbCallNow_('upsert_questions_batch', { p_rows: rows, p_autocreate: false, p_restore: true });
+  if (!res || res.error) { console.log('upsert ล้ม — ' + (res && res.error)); return; }
+  console.log('กู้แล้ว — ' + JSON.stringify(res).slice(0, 500));
+  console.log('รัน checkSupabaseMirror() ซ้ำเพื่อยืนยัน');
+  return rows.length;
+}
