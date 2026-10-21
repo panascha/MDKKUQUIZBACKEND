@@ -877,14 +877,22 @@ function cleanupStaging() {
   if (!sheet) return;
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return;
+  var colC = sheet.getRange(2, 3, lastRow - 1, 1).getValues();
+  var hits = [];
+  for (var i = 0; i < colC.length; i++) {
+    if (String(colC[i][0]).trim() === 'require_img') hits.push(i + 2);
+  }
+  if (!hits.length) { console.log('cleanupStaging: deleted 0 require_img rows'); return; }
   var deleted = 0;
-  // วนลูปจากล่างขึ้นบนเพื่อไม่ให้ index เลื่อน
-  for (var i = lastRow; i >= 2; i--) {
-    var imgVal = String(sheet.getRange(i, 3).getValue()).trim();
-    if (imgVal === 'require_img') {
-      sheet.deleteRow(i);
-      deleted++;
-    }
+  // ลบจากล่างขึ้นบน (เป็นช่วงต่อเนื่อง) เพื่อไม่ให้เลขแถวเลื่อน
+  var runEnd = hits.length - 1;
+  while (runEnd >= 0) {
+    var runStart = runEnd;
+    while (runStart > 0 && hits[runStart - 1] === hits[runStart] - 1) runStart--;
+    var cnt = runEnd - runStart + 1;
+    sheet.deleteRows(hits[runStart], cnt);
+    deleted += cnt;
+    runEnd = runStart - 1;
   }
   console.log('cleanupStaging: deleted ' + deleted + ' require_img rows');
 }

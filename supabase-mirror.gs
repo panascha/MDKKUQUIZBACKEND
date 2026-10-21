@@ -581,17 +581,34 @@ function sbSweepRead_(cursorMs) {
   if (touchedIds.length) {
     var qSheet = ss.getSheetByName('Questions');
     if (qSheet && qSheet.getLastRow() > 1) {
-      var qVals = qSheet.getRange(2, 1, qSheet.getLastRow() - 1, 7).getValues();
+      var qLast = qSheet.getLastRow();
       var want = {};
       for (var t = 0; t < touchedIds.length; t++) want[touchedIds[t]] = true;
-      for (var j = 0; j < qVals.length; j++) {
-        var id = String(qVals[j][0] || '').trim();
-        if (!id || !want[id]) continue;
+      var pushQRow = function (id, rv) {
         questionRows.push({
-          questionId: id, problem: qVals[j][1], img: qVals[j][2], choices: qVals[j][3],
-          answer: qVals[j][4], explain: qVals[j][5], category: qVals[j][6]
+          questionId: id, problem: rv[1], img: rv[2], choices: rv[3],
+          answer: rv[4], explain: rv[5], category: rv[6]
         });
-        delete want[id];
+      };
+      if (touchedIds.length > 50) {
+        var qVals = qSheet.getRange(2, 1, qLast - 1, 7).getValues();
+        for (var j = 0; j < qVals.length; j++) {
+          var id = String(qVals[j][0] || '').trim();
+          if (!id || !want[id]) continue;
+          pushQRow(id, qVals[j]);
+          delete want[id];
+        }
+      } else {
+        // touched น้อย → อ่านแค่คอลัมน์ A แล้วดึงเฉพาะแถวที่ตรง แทนการอ่านทั้งชีท
+        var idCol = qSheet.getRange(2, 1, qLast - 1, 1).getValues();
+        var wantLeft = touchedIds.length;
+        for (var j = 0; j < idCol.length && wantLeft > 0; j++) {
+          var id = String(idCol[j][0] || '').trim();
+          if (!id || !want[id]) continue;
+          pushQRow(id, qSheet.getRange(j + 2, 1, 1, 7).getValues()[0]);
+          delete want[id];
+          wantLeft--;
+        }
       }
       // qid ที่ log บอกว่าเปลี่ยนแต่หาไม่เจอในชีท = ถูกลบไปแล้วโดยไม่มี log DELETE (เช่นลบด้วยมือ)
       for (var missing in want) deleted[missing] = true;

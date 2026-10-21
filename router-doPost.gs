@@ -1732,18 +1732,22 @@ function doPost(e) {
           var fileId = match[1];
 
           var qSheet = doc.getSheetByName("Questions");
-          var qData = qSheet.getDataRange().getValues();
+          var diLastRow = qSheet.getLastRow();
           var otherUsages = [];
 
-          for (var i = 1; i < qData.length; i++) {
-            var qid = String(qData[i][0]).trim();
-            if (qid === currentQid) continue;
+          if (diLastRow >= 2) {
+            var diIdCol = qSheet.getRange(2, 1, diLastRow - 1, 1).getValues();
+            var diCDCol = qSheet.getRange(2, 3, diLastRow - 1, 2).getValues();
+            for (var i = 0; i < diIdCol.length; i++) {
+              var qid = String(diIdCol[i][0]).trim();
+              if (qid === currentQid) continue;
 
-            var imgCol = String(qData[i][2]);
-            var choiceCol = String(qData[i][3]);
+              var imgCol = String(diCDCol[i][0]);
+              var choiceCol = String(diCDCol[i][1]);
 
-            if (imgCol.indexOf(fileId) !== -1 || choiceCol.indexOf(fileId) !== -1) {
-              otherUsages.push({ qid: qid, type: imgCol.indexOf(fileId) !== -1 ? 'Main' : 'Choice' });
+              if (imgCol.indexOf(fileId) !== -1 || choiceCol.indexOf(fileId) !== -1) {
+                otherUsages.push({ qid: qid, type: imgCol.indexOf(fileId) !== -1 ? 'Main' : 'Choice' });
+              }
             }
           }
 
@@ -2009,9 +2013,14 @@ function doPost(e) {
           }
 
           sheet = doc.getSheetByName("Questions");
-          var qData = sheet.getDataRange().getValues();
+          var baLastRow = sheet.getLastRow();
           var qIdMap = {};
-          for (var i = 1; i < qData.length; i++) qIdMap[qData[i][0]] = i + 1;
+          var baCatCol = [];
+          if (baLastRow >= 2) {
+            var baIdCol = sheet.getRange(2, 1, baLastRow - 1, 1).getValues();
+            baCatCol = sheet.getRange(2, 7, baLastRow - 1, 1).getValues();
+            for (var i = 0; i < baIdCol.length; i++) qIdMap[baIdCol[i][0]] = i + 2;
+          }
 
           var applied = 0, skipped = 0;
           var appliedIds = []; // qid จริงสำหรับ delta-feed (getChangedSince split ด้วย comma)
@@ -2022,7 +2031,7 @@ function doPost(e) {
             var rowIdx = qIdMap[upd.id];
             if (!rowIdx || !upd.categoryId) { skipped++; continue; }
 
-            var rawCat = String(qData[rowIdx - 1][6] || '');
+            var rawCat = String(baCatCol[rowIdx - 2][0] || '');
             var cats = [];
             try { cats = rawCat ? JSON.parse(rawCat.replace(/'/g, '"')) : []; }
             catch (e) { cats = rawCat ? [rawCat] : []; }
@@ -2080,17 +2089,22 @@ function doPost(e) {
 
         if (action === 'deleteQuestion') {
           sheet = doc.getSheetByName("Questions");
-          var rows = sheet.getDataRange().getValues();
-          var headers = rows[0];
+          var dqLastRow = sheet.getLastRow();
 
-          for (var i = 1; i < rows.length; i++) {
-            if (rows[i][0] == data.data.id) {
+          if (dqLastRow >= 2) {
+            var dqIdCol = sheet.getRange(2, 1, dqLastRow - 1, 1).getValues();
+            for (var i = 0; i < dqIdCol.length; i++) {
+              if (dqIdCol[i][0] == data.data.id) {
+              var dqRow = i + 2;
+              var dqLastCol = sheet.getLastColumn();
+              var dqHeaders = sheet.getRange(1, 1, 1, dqLastCol).getValues()[0];
+              var dqRowVals = sheet.getRange(dqRow, 1, 1, dqLastCol).getValues()[0];
               var oldRowData = {};
-              for (var k = 0; k < headers.length; k++) {
-                oldRowData[headers[k]] = rows[i][k];
+              for (var k = 0; k < dqHeaders.length; k++) {
+                oldRowData[dqHeaders[k]] = dqRowVals[k];
               }
 
-              sheet.deleteRow(i + 1);
+              sheet.deleteRow(dqRow);
               updateVersion();
               writeAdminLog(user, userRole, "QUESTION", "DELETE", data.data.id, "Question Deleted", oldRowData, "DELETED", metadata);
               // แถวในชีทหายไปแล้ว ⇒ sweep มองไม่เห็นจาก "สภาพปัจจุบัน" ได้อีก
@@ -2100,6 +2114,7 @@ function doPost(e) {
               return ContentService.createTextOutput(JSON.stringify({
                 'result': 'success'
               })).setMimeType(ContentService.MimeType.JSON);
+              }
             }
           }
         }

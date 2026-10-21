@@ -193,9 +193,18 @@ function processReports(doc) {
     var qSheet = doc.getSheetByName("Questions");
     if (!reportSheet || !qSheet) return;
     var rv = reportSheet.getDataRange().getValues();
-    var qv = qSheet.getDataRange().getValues();
+    // Early exit (defense-in-depth): nothing at threshold → never touch Questions
+    var rptNeeds = false;
+    for (var r0 = 1; r0 < rv.length; r0++) {
+        if (String(rv[r0][9]).trim() === "Pending" && (parseInt(rv[r0][13]) || 0) >= REPORT_VOTE_THRESHOLD) { rptNeeds = true; break; }
+    }
+    if (!rptNeeds) return;
     var qIdMap = {};
-    for (var i = 1; i < qv.length; i++) qIdMap[qv[i][0]] = i + 1;
+    var qLastRow = qSheet.getLastRow();
+    if (qLastRow >= 2) {
+        var qIds = qSheet.getRange(2, 1, qLastRow - 1, 1).getValues();
+        for (var j = 0; j < qIds.length; j++) qIdMap[qIds[j][0]] = j + 2;
+    }
 
     var changed = false;
     for (var i = 1; i < rv.length; i++) {
@@ -208,12 +217,13 @@ function processReports(doc) {
         var suggestedExplain = String(rv[i][12] || "").trim();
         var qRowIndex = qIdMap[qId];
         if (!qRowIndex) continue;
+        var qRow = qSheet.getRange(qRowIndex, 1, 1, 4).getValues()[0];
 
         // Safety: suggestedChoice must exactly match an existing choice (no free-text)
-        var choicesArray = String(qv[qRowIndex-1][3] || "").split("///").map(function(s){return s.trim();}).filter(Boolean);
+        var choicesArray = String(qRow[3] || "").split("///").map(function(s){return s.trim();}).filter(Boolean);
         if (choicesArray.indexOf(suggestedAns) === -1) continue;
 
-        var questionText = String(qv[qRowIndex-1][1] || "");
+        var questionText = String(qRow[1] || "");
         applyReportCorrection(qSheet, qRowIndex, suggestedAns, suggestedExplain, questionText, choicesArray, qId);
 
         // Status(10) + AdminNote(11) + Done(12) — Done ต้องเป็น TRUE ด้วย ไม่งั้นแดชบอร์ดยังนับเป็น pending
