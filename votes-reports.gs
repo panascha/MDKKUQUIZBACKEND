@@ -134,13 +134,30 @@ function processVotes() {
     if (!voteSheet || !qSheet) return;
 
     var voteValues = voteSheet.getDataRange().getValues();
-    var qValues = qSheet.getDataRange().getValues();
+
+    // Early exit: same two conditions the loop below acts on. Avoids reading the huge Questions sheet when nothing to do.
+    var needsAction = false;
+    for (var k = 1; k < voteValues.length; k++) {
+        var vc = parseInt(voteValues[k][3]) || 0;
+        var st = String(voteValues[k][5]).trim();
+        if ((vc >= VOTE_THRESHOLD_CONFIRM && st !== "Verified") || (vc >= 1 && (st === "Pending" || st === ""))) {
+            needsAction = true;
+            break;
+        }
+    }
+    if (!needsAction) return;
+
+    // Column A only (qId -> sheet row); data starts at row 2
     var qIdMap = {};
-    for (var i = 1; i < qValues.length; i++) {
-        qIdMap[qValues[i][0]] = i + 1;
+    var qLastRow = qSheet.getLastRow();
+    if (qLastRow >= 2) {
+        var qIds = qSheet.getRange(2, 1, qLastRow - 1, 1).getValues();
+        for (var j = 0; j < qIds.length; j++) {
+            qIdMap[qIds[j][0]] = j + 2;
+        }
     }
 
-    var hasChanged = false; 
+    var hasChanged = false;
 
     for (var i = 1; i < voteValues.length; i++) {
         var voteCount = parseInt(voteValues[i][3]) || 0;
