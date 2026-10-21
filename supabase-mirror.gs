@@ -1143,3 +1143,73 @@ function checkSupabaseMirror() {
   console.log('');
   console.log(bad === 0 ? 'sum: OK - all slices match' : 'sum: WARN - ' + bad + ' issue(s)');
 }
+
+/**
+ * ซ่อม "หมวดต่อข้อ" ที่ checkSupabaseMirror รายงานว่าเพี้ยน — upsert {questionId, category} ของข้อพวกนั้นใหม่
+ * (รูปแบบเดียวกับ bulkSetQuestionCategories ⇒ คอลัมน์อื่นใน postgres ไม่ถูกแตะ)
+ * ทำไมเพี้ยนได้: ข้อถูก mirror ไปก่อนหมวดจะมีใน postgres ⇒ RPC ข้ามลิงก์นั้น แล้ว sweep ไม่ย้อนมาเก็บ
+ *
+ * รันจาก editor: repairSupabaseCatDriftDryRun() ก่อน (ไม่เขียน) แล้วค่อย repairSupabaseCatDriftApply()
+ * แล้วรัน checkSupabaseMirror() ซ้ำ — หวังผล "หมวดต่อข้อ ... ตรงกัน"
+ * อ่านชีทใต้ script lock แล้วปลดก่อนยิง HTTP (D14: ห้าม UrlFetchApp ใต้ lock)
+ */
+function repairSupabaseCatDriftDryRun() { return repairSupabaseCatDrift_(false); }
+function repairSupabaseCatDriftApply() { return repairSupabaseCatDrift_(true); }
+
+function repairSupabaseCatDrift_(apply) {
+  EXEC_START_MS = Date.now();   // รันจาก editor ⇒ ไม่ได้ผ่าน doPost ที่ reset ให้
+  if (!sbEnabled_()) { console.log('mirror ปิดอยู่ (ไม่มีคีย์)'); return; }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) { console.log('ไม่ได้ lock — มี admin กำลังเขียนอยู่ ลองใหม่ทีหลัง'); return; }
+  var qKeys = [], gCells = [];
+  try {
+    var qSh = SpreadsheetApp.openById(SHEET_ID).getSheetByName('Questions');
+    var qLast = qSh ? qSh.getLastRow() : 0;
+    if (qLast > 1) {
+      var aCol = qSh.getRange(2, 1, qLast - 1, 1).getValues();
+      var gCol = qSh.getRange(2, 7, qLast - 1, 1).getValues();
+      for (var i = 0; i < aCol.length; i++) { qKeys.push(sbJoinKey_([aCol[i][0]])); gCells.push(gCol[i][0]); }
+    }
+  } finally {
+    lock.releaseLock();
+  }
+
+  var pgQ = sbReadAllNow_('v_questions_delta', 'questionId,category', 'questionId');
+  if (pgQ.error) { console.log('อ่าน v_questions_delta ไม่ได้ — ' + pgQ.error); return; }
+  var pgTotal = sbCountNow_('v_questions_delta');
+  if (pgTotal !== pgQ.length) { console.log('อ่านได้ ' + pgQ.length + ' จาก ' + pgTotal + ' แถว (อ่านไม่ครบ) — หยุด'); return; }
+  var pgC = sbReadAllNow_('v_categories', 'CategoryID', 'CategoryID');
+  if (pgC.error) { console.log('อ่าน v_categories ไม่ได้ — ' + pgC.error); return; }
+
+  var catSet = {}, pg = {}, seen = {}, j;
+  for (j = 0; j < pgC.length; j++) catSet['k:' + pgC[j].CategoryID] = true;
+  for (j = 0; j < pgQ.length; j++) pg['k:' + pgQ[j].questionId] = pgQ[j].category || [];
+  for (j = 0; j < qKeys.length; j++) if (qKeys[j]) seen['k:' + qKeys[j]] = (seen['k:' + qKeys[j]] || 0) + 1;
+
+  // เกณฑ์เดียวกับ sbCatDrift_: เทียบเฉพาะหมวดที่มีใน postgres, ข้ามข้อ id ซ้ำ / ไม่มีใน pg / parse ไม่ได้
+  var rows = [];
+  for (var n = 0; n < qKeys.length; n++) {
+    var id = qKeys[n];
+    if (!id || seen['k:' + id] > 1) continue;
+    var pgCats = pg['k:' + id];
+    if (!pgCats) continue;
+    var cats = sbParseCatCell_(gCells[n]);
+    if (cats === null) continue;
+    var want = {}, have = {}, drift = false, w;
+    for (j = 0; j < cats.length; j++) if (catSet['k:' + cats[j]]) want['k:' + cats[j]] = true;
+    for (j = 0; j < pgCats.length; j++) have['k:' + pgCats[j]] = true;
+    for (w in want) if (!have[w]) drift = true;
+    for (w in have) if (!want[w]) drift = true;
+    if (drift) rows.push({ questionId: id, category: cats });
+  }
+
+  console.log('เพี้ยน ' + rows.length + ' ข้อ' + (apply ? ' — กำลัง upsert' : ' — dry run ไม่เขียน'));
+  for (j = 0; j < Math.min(rows.length, 15); j++) console.log('  ' + rows[j].questionId + '  ' + JSON.stringify(rows[j].category));
+  if (!apply || !rows.length) return rows.length;
+
+  sbMirrorQuestionRows_(rows);
+  sbFlush_();   // ล้มเหลว ⇒ POSTGRES_MIRROR_FAIL ใน Logs (sbFlush_ กลืน error เอง)
+  console.log('ส่งแล้ว — รัน checkSupabaseMirror() ซ้ำเพื่อยืนยัน');
+  return rows.length;
+}
